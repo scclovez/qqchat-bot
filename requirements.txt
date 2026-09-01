@@ -1,6 +1,12 @@
+# AI 电子女友（小晚）· Python 依赖清单
+# 适用：Python 3.10+（开发推荐 3.14）
+# SnowLuma（QQ 协议运行时）为 Node.js 程序，不在本清单内，获取方式见 README 与第三方组件说明。
+#
+# 说明：GUI 已迁移到 PySide6（晚晚/界面/gui_qt.py）。
+# 旧 customtkinter 版（晚晚/界面/gui.py）已不再作为入口，其依赖（customtkinter / pydantic）已移除。
+
 openai>=1.0.0
 websockets>=13.0
 python-dotenv>=1.0.0
-pydantic>=2.0.0
 httpx>=0.25.0
-customtkinter>=5.2.0
+PySide6>=6.5.0
