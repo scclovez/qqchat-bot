@@ -1,0 +1,51 @@
+# ============ Python 缓存 ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ============ 个人数据 / 密钥（绝不入库） ============
+# API Key 等敏感配置（模板 .env.example 保留）
+晚晚/配置/.env
+# 运行时生成的人设 / 提供商配置
+晚晚/配置/.runtime_config.json
+晚晚/配置/llm_providers.json
+
+# ============ 运行时数据 ============
+# 记忆 / 成长数据库
+晚晚/数据/
+# Token 用量统计
+晚晚/用量/usage_stats.json
+# 语音缓存（wav）
+晚晚/语音/语音缓存/
+# 生成的图片
+晚晚/图片/生成图片/
+# 个人表情包
+晚晚/图片/表情包/
+# 外貌参考图 / 外貌总结
+晚晚/外貌/外貌设定/
+
+# ============ SnowLuma 运行数据 ============
+# QQ 配置（含 token / 密码哈希）
+snowluma/config/
+# 消息 / 媒体数据库
+snowluma/data/
+# 运行日志
+snowluma/logs/
+
+# ============ 打包产物 ============
+dist/
+build/
+*.spec.bak
+_tmp/
+_MEI*
+
+# ============ 单实例锁 ============
+*.lock
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
