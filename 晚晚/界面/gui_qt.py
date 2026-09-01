@@ -629,7 +629,7 @@ class MainWindow(QMainWindow):
         self._ml_lay.setContentsMargins(0, 0, 0, 0)
         self._ml_lay.setSpacing(6)
         outer.addWidget(self._models_list_frame)
-        outer.addWidget(_btn("添加提供商", "Primary", self._open_provider_dialog),
+        outer.addWidget(_btn("添加提供商", "Primary", lambda _c=False: self._open_provider_dialog()),
                         alignment=Qt.AlignmentFlag.AlignLeft)
 
         # ---- 模块分派 ----
@@ -900,11 +900,11 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         pid = p.get("id")
         if not p.get("active"):
-            head.addWidget(_btn("设为当前", "Soft", lambda x=pid: self._provider_action(x, "activate")))
-        head.addWidget(_btn("获取模型", "Soft", lambda x=pid: self._provider_action(x, "fetch_models")))
-        head.addWidget(_btn("测试", "Soft", lambda x=pid: self._provider_action(x, "test")))
-        head.addWidget(_btn("编辑", "Soft", lambda x=pid: self._provider_action(x, "edit")))
-        head.addWidget(_btn("删除", "SoftRed", lambda x=pid: self._provider_action(x, "remove")))
+            head.addWidget(_btn("设为当前", "Soft", lambda _c=False, x=pid: self._provider_action(x, "activate")))
+        head.addWidget(_btn("获取模型", "Soft", lambda _c=False, x=pid: self._provider_action(x, "fetch_models")))
+        head.addWidget(_btn("测试", "Soft", lambda _c=False, x=pid: self._provider_action(x, "test")))
+        head.addWidget(_btn("编辑", "Soft", lambda _c=False, x=pid: self._provider_action(x, "edit")))
+        head.addWidget(_btn("删除", "SoftRed", lambda _c=False, x=pid: self._provider_action(x, "remove")))
         lay.addLayout(head)
         info = ""
         if p.get("type") == "deepseek":
