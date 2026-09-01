@@ -77,6 +77,112 @@ python main.py
 
 ---
 
+## 🚀 从零部署：拿到别人给的开发版怎么跑起来
+
+> 你拿到的是一个**纯净开发版**（不含任何人的 API Key / QQ 账号 / 运行数据）。
+> 下面让使用者用**自己的 QQ 账号**和**自己的 Key**跑起来。
+
+### 0️⃣ 先认清这文件夹里有什么
+
+| 内容 | 说明 |
+|---|---|
+| `晚晚/` | 机器人业务代码（Python） |
+| `snowluma/` | QQ 协议运行时（Node.js，负责连 QQ） |
+| `晚晚/配置/.env` | 各平台 API Key 配置（**需自己填**；模板为 `.env.example`） |
+| `晚晚/数据/`、`晚晚/配置/*.json`、`snowluma/config`、`snowluma/data`、`snowluma/logs` | 运行数据（全新拷贝里没有，**运行后自动生成**） |
+
+### 1️⃣ 装运行环境（一次性）
+
+1. **Python 3.10+**（推荐 3.14）：安装时勾选 **Add Python to PATH**。
+   验证：`python --version`；要能用 `1.vbs` 双击启动，还需要 `pythonw`（一般随 Python 一起装）。
+2. **Node.js 22.13+**（SnowLuma 必需）：验证 `node --version`。
+   版本不够时，GUI 点「启动 SNOWLUMA」会提示 *请先安装 Node.js 22+*。
+3. （可选）**Git**，以后方便拉取更新。
+4. （可选）若要用 ComfyUI 本地生图，最好有 **NVIDIA 显卡 + CUDA**。
+
+### 2️⃣ 安装 Python 依赖
+
+在含 `requirements.txt` 的项目根目录执行：
+
+```bash
+pip install -r requirements.txt
+```
+
+> 若提示 `pip` 找不到，改用：`py -m pip install -r requirements.txt`。
+
+### 3️⃣ 创建你自己的 `.env`（填自己的 Key）
+
+把 `晚晚/配置/.env.example` **复制一份** 为 `晚晚/配置/.env`，至少填：
+
+```ini
+DEEPSEEK_API_KEY=sk-你的DeepSeek密钥     # 必填
+```
+
+其余按需（缺了就少对应功能）：
+```ini
+DASHSCOPE_API_KEY=你的百炼Key            # 图片生成（可选）
+MIMO_API_KEY=你的小米MiMoKey             # 语音 TTS/ASR（可选）
+ONEBOT_WS_URL=ws://localhost:3001       # 第 5 步再对齐
+ONEBOT_ACCESS_TOKEN=
+```
+
+> 不知道去哪申请这些 Key？见下文「申请 API / 工具详细指南」。**务必用自己的账号申请**，别用别人给的 Key。
+
+### 4️⃣ 启动控制面板
+
+```bash
+python main.py --gui
+```
+或双击 `1.vbs`。看到主界面即成功；否则先看命令行报错。
+
+### 5️⃣ 配置并启动 SNOWLUMA（连 QQ）
+
+在 GUI **首页**点「**启动 SNOWLUMA**」：
+
+- 若提示缺 Node.js → 回第 1 步装 Node 22+；
+- 首次运行会弹出 **SnowLuma 自己的配置 / 登录界面**，请：
+  1. 用**你的 QQ** 登录（机器人要挂的号）；
+  2. 把 **OneBot（正向 WebSocket）** 服务端口设为 **3001**（默认）；
+  3. 设一个 **Access Token** 并记下来。
+- 回 GUI「模型与连接」，把 `OneBot WS 地址 = ws://localhost:3001`、`Access Token = 上面记的` 填成一致（也应同步进 `.env`）。
+
+### 6️⃣ 启动 bot（开始聊天）
+
+GUI 首页点「**启动 bot**」。成功时按钮变“运行中”，日志页能看到进程信息；此时**用你的 QQ 给机器人发消息**就有反应了。
+
+### 7️⃣ 人设与参数（可选）
+
+GUI 里把「人设」「API 参数」「互动」「用量」各页按喜好配好（保存到 `晚晚/配置/.runtime_config.json`）。
+
+### 8️⃣ 高级能力（可选，按需）
+
+- **图片生成**：用阿里云百炼（填 `DASHSCOPE_API_KEY`）或本地 ComfyUI（GUI「模型与连接 → 图生成」）；
+- **语音回复 / 听懂语音**：用小米 MiMo（填 `MIMO_API_KEY`）；
+- 对应申请步骤见下文「申请 API / 工具详细指南」。
+
+---
+
+### 🔍 常见问题排查
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| 双击 `1.vbs` 没反应 | 没装 `pythonw`，或 PATH 里缺 python。直接 `python main.py --gui` 也能开 |
+| 点「启动 SNOWLUMA」提示 Node 版本不够 | 安装 Node.js 22.13+ 后重试 |
+| SNOWLUMA 起不来 / 连不上 QQ | QQ 未登录 / 端口被占 / OneBot 端口或 Token 与 `.env` 不一致 |
+| 启动 bot 提示缺 `DEEPSEEK_API_KEY` | 没建 `.env` 或没填 Key |
+| 机器人不回复 | OneBot WS 地址 / Token 两边不一致，或 SNOWLUMA 没跑起来 |
+| 图片 / 语音 / QQ 空间没反应 | 没配对应 API Key，功能自动降级（看日志） |
+
+### ⚠️ 给使用者的提醒（授权 & 隐私）
+
+- 这份代码（`晚晚/` 及入口）是 **MIT** 许可，可自由修改、使用、再分发。
+- 随附的 **SnowLuma**（连 QQ 的运行时）是第三方**非商业许可**，使用前请读 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)；若想商用或再分发其二进制，需先取得 SnowLuma 作者书面授权。
+- 你的 **API Key / QQ 账号属于隐私**，只留在各自本机 `.env` 里，**不要提交或外传**（`.gitignore` 已屏蔽）。
+
+---
+
+
+
 ## ⚙️ 配置说明
 
 开发版不带任何个人配置。首次运行前，从模板复制：
