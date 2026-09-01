@@ -103,6 +103,91 @@ copy 晚晚\配置\.env.example 晚晚\配置\.env
 
 ---
 
+## 🔑 申请 API / 工具详细指南
+
+本机器人要"全能"跑起来，需要用到以下几家的能力。**按需申请**：缺哪个就少哪个功能——未配置对应 Key 时会**自动降级，只在日志提示、不会崩溃**。下面一步步教你怎么申请、以及把 Key 填到哪。
+
+| 能力 | 用在哪 | 是否必需 | 官方申请入口 |
+|---|---|---|---|
+| **DeepSeek 大模型** | 对话 / 主动消息 / 成长日记 等所有"她说的话" | **必填** | [DeepSeek 开放平台](https://platform.deepseek.com/) |
+| **阿里云百炼（通义/千问）** | 图片生成、外貌总结、视觉评论 | 可选 | [阿里云百炼控制台](https://bailian.console.aliyun.com/) |
+| **小米 MiMo** | 语音回复（TTS）+ 语音识别（ASR） | 可选 | [小米 MiMo 开放平台](https://mimo.mi.com/) |
+| **ComfyUI（本地图生）** | 本地、离线、免费的图片生成 | 可选 | [ComfyUI 官网](https://www.comfy.org/) |
+
+> 习惯命令行 / 不想开 GUI？所有 Key 也可直接写进开发板根目录的 `晚晚/配置/.env`（模板见 [`.env.example`](晚晚/配置/.env.example)）。填写变量见上文「配置说明」表。
+
+<br>
+
+### 🥇 1️⃣ DeepSeek API（必填，聊天核心）
+
+1. 打开 [DeepSeek 开放平台](https://platform.deepseek.com/)（标题即 *DeepSeek Platform*）。
+2. 用**手机号 / 邮箱注册并登录**（国内手机号即可）。
+3. 新账户通常赠送**体验额度**，用于先测试；正式用再按需充值。
+4. 进「**API Keys**」页面 → 点「**创建 API Key**」→ 起个名字 → 生成以 `sk-` 开头的 Key。
+5. **立即复制保存**（该值通常只完整显示一次）。
+6. 回本项目把 Key 填入以下任一处：
+   - 源码版：`晚晚/配置/.env` 的 `DEEPSEEK_API_KEY`；
+   - 或 GUI「模型与连接 → 大模型兜底（DeepSeek .env）」的 API Key 框。
+   - 模型名 `DEEPSEEK_MODEL` 用 DeepSeek 官方模型名；API 地址默认 `https://api.deepseek.com`，一般无需改动。
+
+<br>
+
+### 🥈 2️⃣ 阿里云百炼 / 通义千问（可选，图片生成）
+
+用于"**画一张图 / 发自拍 / 说说配图 / 外貌总结**"等视觉能力：
+
+1. 打开 [阿里云百炼控制台](https://bailian.console.aliyun.com/)（大模型服务平台·百炼）。
+2. 用**阿里云账号**登录；没有则先注册阿里云账号并完成**实名认证**。
+3. 首次进入会引导**开通百炼服务**，通常有**新用户免费额度**。
+4. 在控制台「**API-KEY 管理**」页面创建 **API Key**。
+5. 复制后填入：
+   - `晚晚/配置/.env` 的 `DASHSCOPE_API_KEY`；
+   - 或 GUI「模型与连接 → 图生成」的「百炼 API Key」框。
+6. 图片生成模型 `DASHSCOPE_IMAGE_MODEL` 填 `qwen-image-3.0-pro`（或 `wanx2.1-t2i-turbo` 等，已在 GUI 下拉中）。
+   API 地址默认 `https://dashscope.aliyuncs.com`。
+
+> 说明：阿里云已把大模型统一收进「百炼（Bailian）」，旧版 DashScope 入口同样兼容；**申请 Key 以百炼控制台为准**。
+
+<br>
+
+### 🥉 3️⃣ 小米 MiMo（可选，语音 TTS + ASR）
+
+用于**语音回复**（她把话读成语音条）与**听懂你发的语音**（ASR）。走的是**小米 MiMo 大模型**：
+
+1. 打开 [小米 MiMo API 开放平台](https://mimo.mi.com/)（页面标题即 *Xiaomi MiMo API 开放平台*）。
+2. 用**小米账号**登录 / 注册。
+3. 新用户有**免费额度**（TTS 模型全档位套餐**限时免费**，以官网活动为准）。
+4. 在控制台「**创建 / 获取 API Key**」生成一个 Key。
+5. 复制后填入：
+   - `晚晚/配置/.env` 的 `MIMO_API_KEY`；
+   - 或 GUI「模型与连接 → 语音（小米 MiMo）」的「小米语音 API Key」框。
+6. 模型名（一般不动）：TTS = `mimo-v2.5-tts-voicedesign`（`TTS_MODEL`）、ASR = `mimo-v2.5-asr`（`ASR_MODEL`）。
+   API 地址默认 `https://api.xiaomimimo.com/v1`（`MIMO_API_BASE_URL`）。
+7. 想让对方 **每次回复都带语音**，把「语音回复概率」调高（GUI「设置 → API 参数」的 `TTS_PROBABILITY`，或写 `TTS_PROBABILITY=0.6` 等）。
+
+<br>
+
+### 🔧 4️⃣ ComfyUI（可选，本地免费图生）
+
+不依赖云端、**完全本地跑**（免费、可离线、数据不出本机），适合不想购买百炼额度或更看重隐私的情况：
+
+1. 到 [ComfyUI 官网](https://www.comfy.org/)（官方文档 [docs.comfy.org](https://docs.comfy.org/) ｜ 源码 [github.com/comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI)）。
+2. 下载**桌面版 / 便携版**并解压运行。
+3. **硬件建议**：有 NVIDIA 显卡 + CUDA 生成快；只有 CPU 也能跑，但一张图要等很久。
+4. 启动 ComfyUI 后，它的网页服务默认地址是 **http://127.0.0.1:8188**。
+5. 本项目 GUI「模型与连接 → 图生成」里设置：
+   - 「图片后端」选 **本地 ComfyUI**；
+   - 「ComfyUI 地址」填 `http://127.0.0.1:8188`；
+   - 「工作流文件」填 `comfy_workflow.json`（随项目自带，位于 `晚晚/图片/comfy_workflow.json`）。
+6. ⚠️ ComfyUI 需**提前就绪**：工作流里引用的大模型 / 采样器 / LoRA 等都要已下载，否则生图会失败。
+7. 配好后在 GUI「模型与连接」的「图片后端」切到 ComfyUI，重启 bot 生效。
+
+> ComfyUI 是本地程序，**不联网、不采集、不上传**任何数据，适合注重隐私与成本可控的用户。
+
+---
+
+
+
 ## 🧪 测试
 
 综合测试（一键跑 5 组）：
