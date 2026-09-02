@@ -1654,7 +1654,7 @@ class MainWindow(QMainWindow):
             boyfriend = str(_rt.PROACTIVE_ONLY_USER_ID or "").strip()
             # 状态：她此刻在做什么（剧情优先 + 时段兜底）
             vals["state"] = live_info.current_activity_for(boyfriend)
-            # 关系温度 / 能量状态 / 事件痕迹（基于持久化数据，重启不丢）
+            # 关系温度 / 能量状态 / 生活细节（从今日聊天与活跃度推导）
             vals["rel_hot"] = pstate.relationship_temperature()
             vals["energy"] = pstate.energy_state()
             vals["traces"] = pstate.event_traces(boyfriend)
