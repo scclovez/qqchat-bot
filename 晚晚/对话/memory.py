@@ -425,6 +425,7 @@ def _get_max_chat_id(user_id: str) -> int:
 # 注入 system prompt 时记忆的上限（防止记忆无限增长稀释人设约束）
 MEMORY_FACTS_LIMIT = 20
 MEMORY_PREFS_LIMIT = 20
+FIXED_FACTS_LIMIT = 20   # 固定事实上限（"必须遵守"的当前设定，高优先级注入）
 
 
 def build_system_prompt_with_memory(user_id: str, base_skill_prompt: str) -> str:
@@ -441,6 +442,13 @@ def build_system_prompt_with_memory(user_id: str, base_skill_prompt: str) -> str
 
     memory = get_user_memory(user_id)
     if memory:
+        # 固定事实（高优先级，必须遵守；非"不可信参考"，是已确立的剧情设定）
+        fixed = memory.get("fixed_facts", [])[:FIXED_FACTS_LIMIT]
+        if fixed:
+            parts.append("【必须遵守的当前事实/设定】以下是与你们当前剧情一致的既定事实，"
+                         "后续回复必须自然地保持连续，不要违背或推翻：")
+            for f in fixed:
+                parts.append(f"  - {f}")
         lines = ["\n**关于用户的重要信息：**"]
         name = memory.get("name", "")
         if name:
@@ -482,17 +490,22 @@ EXTRACT_PROMPT_TEMPLATE = """你是一个信息提炼助手。请从以下对话
 1. 用户的姓名或称呼
 2. 任何关于用户的事实信息（如年龄、职业、学校、爱好、家庭、宠物、重要经历等）
 3. 用户的偏好（如喜欢/不喜欢什么、习惯等）
+4. 当前必须遵守的"固定事实/安排/情境"（如"今天已请假、没课"、"只有你们俩"、"他帮我请了假"、
+   "我现在就在他身边/在他怀里/在床上"、"我们正在一起"等——这些是剧情关键设定，之后必须连续遵守、不能违背。
+   只列当前依然有效、值得一直遵守的，过时/已改变的不要列）
 
 注意事项：
 - 随机片段可能已过时，只提取仍然有效的重要内容；
 - 与已有记忆冲突时，以最近对话为准；
-- 已有记忆中已包含的内容无需重复提取。
+- 已有记忆中已包含的内容无需重复提取；
+- 固定事实（第4项）要尽量具体、少而精，是"你们之间已经说定、后续要守着"的那几条。
 
 输出严格 JSON，不要有任何解释文字，格式如下：
 {
   "name": "用户名字（可选，没提取到则为空字符串）",
   "facts": ["事实1", "事实2"],
-  "preferences": {"key": "value"}
+  "preferences": {"key": "value"},
+  "fixed_facts": ["固定事实1", "固定事实2"]
 }"""
 
 
@@ -580,6 +593,7 @@ def _extract_and_update_memory_impl(user_id: str, msgs: list[dict]) -> bool:
         "name": existing.get("name", ""),
         "facts": list(existing.get("facts", [])),
         "preferences": dict(existing.get("preferences", {})),
+        "fixed_facts": list(existing.get("fixed_facts", [])),
     }
 
     # name：新值非空则覆盖
@@ -600,6 +614,17 @@ def _extract_and_update_memory_impl(user_id: str, msgs: list[dict]) -> bool:
     new_prefs = extracted.get("preferences", {})
     if isinstance(new_prefs, dict):
         merged["preferences"].update(new_prefs)
+
+    # fixed_facts：当前固定事实（去重、限量），是"必须遵守"的剧情设定
+    new_fixed = extracted.get("fixed_facts", [])
+    if isinstance(new_fixed, list):
+        fd = list(merged["fixed_facts"])
+        fdset = set(fd)
+        for f in new_fixed:
+            if isinstance(f, str) and f.strip() and f.strip() not in fdset:
+                fd.append(f.strip())
+                fdset.add(f.strip())
+        merged["fixed_facts"] = fd[-FIXED_FACTS_LIMIT:]
 
     # facts 存储端上限（防止 JSON 无界膨胀；注入 system prompt 时仍只取前 20 条）
     if len(merged["facts"]) > 300:
