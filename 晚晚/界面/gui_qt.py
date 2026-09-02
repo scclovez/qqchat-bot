@@ -652,14 +652,21 @@ class MainWindow(QMainWindow):
                 cb.addItem(name, pid)
             cb.setFixedWidth(220)
             r.addWidget(cb)
-            mvar = QLineEdit()
-            mvar.setFixedWidth(190)
-            mvar.setPlaceholderText("模型留空=提供商默认")
+            # 模型：可从"获取模型"列表直接下拉选择，也可手输（留空 = 用提供商默认）
+            mvar = QComboBox()
+            mvar.setEditable(True)
+            mvar.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            mvar.setFixedWidth(220)
+            mvar.addItem("（提供商默认）", "")
             try:
-                mvar.setText(lp_ass(cat).get("model") or "")
+                saved = lp_ass(cat).get("model") or ""
+                if saved:
+                    mvar.setCurrentText(saved)
             except Exception:
                 pass
             r.addWidget(mvar)
+            r.addWidget(_btn("获取模型", "Soft",
+                             lambda _c=False, c=cat, cbs=cb, mv=mvar: self._fill_assign_models(c, cbs, mv)))
             r.addStretch(1)
             outer.addLayout(r)
             cur = ""
@@ -669,9 +676,10 @@ class MainWindow(QMainWindow):
                 pass
             idx = next((i for i, (n, pid) in enumerate(choices) if pid == cur), 0)
             cb.setCurrentIndex(idx)
+            # 更换提供商 → 清空该模块的模型列表（重新获取）
             cb.currentIndexChanged.connect(
-                lambda _i, c=cat, cbs=cb, mv=mvar: self._on_assign(c, cbs, mv))
-            mvar.textChanged.connect(
+                lambda _i, c=cat, cbs=cb, mv=mvar: self._on_assign_provider(c, cbs, mv))
+            mvar.currentTextChanged.connect(
                 lambda _t, c=cat, cbs=cb, mv=mvar: self._on_assign(c, cbs, mv))
             self._assign_vars[cat] = (cb, mvar)
 
@@ -687,9 +695,84 @@ class MainWindow(QMainWindow):
     def _on_assign(self, cat, cb, mv):
         try:
             from llm_providers import set_assignment
-            set_assignment(cat, cb.currentData() or "", mv.text().strip())
+            # 可编辑下拉：选中具体项/手输 = 模型名；"（提供商默认）"或空 = 留空（用提供商默认）
+            model = mv.currentText().strip()
+            if not model or model == "（提供商默认）":
+                model = ""
+            set_assignment(cat, cb.currentData() or "", model)
         except Exception:
             pass
+
+    def _on_assign_provider(self, cat, cb, mv):
+        """更换提供商：清空该模块的模型列表，回到"（提供商默认）"，并保存。"""
+        mv.blockSignals(True)
+        try:
+            mv.clear()
+            mv.addItem("（提供商默认）", "")
+        finally:
+            mv.blockSignals(False)
+        self._on_assign(cat, cb, mv)
+
+    def _fill_assign_models(self, cat, cb, mv):
+        """获取所选提供商 的模型列表，填充到该模块的模型下拉框。"""
+        from llm_providers import load_providers, get_active_provider
+        pid = cb.currentData() or ""
+        try:
+            providers = load_providers()
+            p = next((x for x in providers if x.get("id") == pid), None) if pid else None
+        except Exception:
+            p = None
+        if p is None:
+            try:
+                p = get_active_provider()
+            except Exception:
+                p = None
+        if p is None:
+            QMessageBox.warning(self, "获取模型", "请先添加/选择一个提供商")
+            return
+        name = p.get("name") or "?"
+        ptype = p.get("type")
+        api_key = p.get("api_key") or ""
+        base_url = p.get("base_url") or ""
+
+        def worker():
+            import asyncio
+            models, err = None, None
+            try:
+                if ptype == "deepseek":
+                    from deepseek_client import DeepSeekClient
+                    client = DeepSeekClient(api_key=api_key or None, base_url=base_url or None)
+                else:
+                    from openai_compat import OpenAICompatClient
+                    client = OpenAICompatClient(base_url=base_url or "", api_key=api_key or "sk-local")
+                async def _run():
+                    try:
+                        return await client.list_models()
+                    finally:
+                        await client.aclose()
+                models = asyncio.run(_run())
+            except Exception as e:
+                err = str(e)
+            self._safe_after(0, lambda: self._on_assign_models_loaded(mv, models, err, name))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_assign_models_loaded(self, mv, models, err, name):
+        if not models:
+            QMessageBox.warning(self, "获取模型", f"{name}：{err or '未返回任何模型'}")
+            return
+        cur = mv.currentText() or ""
+        mv.blockSignals(True)
+        try:
+            mv.clear()
+            mv.addItem("（提供商默认）", "")
+            for m in models:
+                mv.addItem(m, m)
+            if cur and cur in models:
+                mv.setCurrentText(cur)
+        finally:
+            mv.blockSignals(False)
+        QMessageBox.information(self, "模型列表", f"{name}：已获取 {len(models)} 个模型，可直接下拉选择")
 
     def _conn_row(self, label):
         """连接设置区一行：返回 (标签, 容器布局)。"""
