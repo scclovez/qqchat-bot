@@ -63,6 +63,38 @@ def current_activity() -> str:
     return text
 
 
+def current_activity_for(user_id: str = "") -> str:
+    """bot 此刻的状态（称呼→状态）：优先取最近对话里她自述的状态（剧情优先），
+    没有才按时段兜底（current_activity）。供机器人注入与 GUI「状态」网格共用。
+
+    剧情优先避免与前文冲突：明明在午睡却说在吃饭；只有她明确说过才引用，
+    避免"画室/吃饭"等概念被反复提起。
+    """
+    if not user_id:
+        return current_activity()
+    try:
+        import memory as longterm_memory
+        recent = longterm_memory.get_recent_history(user_id, 8)
+    except Exception:
+        recent = []
+    # 从最近的 assistant 消息里找她自述的状态（后出现的优先）
+    for m in reversed(recent):
+        if not (m or {}).get("role") == "assistant":
+            continue
+        content = (m.get("content") or "")
+        for pat, desc in (
+            (r"刚醒|睡醒|睡到现在|刚睡起来", "刚睡醒"),
+            (r"要睡了|该睡了|去睡了|想睡了|睡觉|午睡|睡个|眯一会|睡一觉|睡会儿", "正在午睡/休息"),
+            (r"在?吃饭|吃个饭|干饭|外卖|泡面|食堂|夜宵", "正在吃饭"),
+            (r"画室", "在画室"),
+            (r"宿舍|躺床|被窝|床上|躺着", "在宿舍/床上"),
+            (r"打游戏|上号|打瓦|打副本", "在打游戏"),
+        ):
+            if re.search(pat, content):
+                return desc
+    return current_activity()
+
+
 def _pick_activity(hour: int) -> str:
     """按小时从多套说法里随机挑一个（画室只占其中一小部分）。"""
     import random

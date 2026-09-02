@@ -746,10 +746,10 @@ class QQGirlfriendBot:
                     messages[0]["content"] += "\n（今天是他的生日！你要祝他生日快乐，语气甜甜的。）"
                 if len(raw_message) <= 4:
                     messages[0]["content"] += "\n（他这条回得很短，你也只回几个字，别发长消息。）"
-                # 称呼随性格阶段（礼貌试探→你 / 热情升温→宝 / 深度绑定→老公）
+                # 称呼 → 状态：在性格阶段/活人感里展示她此刻在做什么（剧情优先 + 时段兜底）
                 messages[0]["content"] += (
-                    f"\n（你习惯叫他：{liveness.nickname_for_stage(pstate.get_stage())}。"
-                    "聊天时自然地用这个称呼，不要解释称呼规则。）"
+                    f"\n（你此刻的状态：{self._current_activity(user_id)}。"
+                    "自然地让这个状态体现在你的言行、语气和回复节奏里，不要解释这段提示。）"
                 )
                 # 纪念日：在一起第 N 天（他问起时间/在一起多久时准确回答）
                 _days = liveness.days_together()
@@ -1935,35 +1935,8 @@ class QQGirlfriendBot:
 
     @staticmethod
     def _current_activity(user_id=""):
-        """判断bot此刻在做什么：优先从最近对话里她自述的状态提取（剧情优先）。
-
-        之前用 live_info.current_activity() 按时间段硬编码（如 13 点=正在吃饭），
-        会与前文剧情冲突（明明在午睡却说在吃饭）。这里先看最近对话里
-        bot自己说过在做什么，剧情有明确状态就用剧情；没有才退回按时段兜底。
-        """
-        import re
-        try:
-            recent = longterm_memory.get_recent_history(user_id, 8)
-        except Exception:
-            recent = []
-        # 从最近的 assistant 消息里找她自述的状态（后出现的优先）
-        for m in reversed(recent):
-            if not (m or {}).get("role") == "assistant":
-                continue
-            content = (m.get("content") or "")
-            for pat, desc in (
-                (r"刚醒|睡醒|睡到现在|刚睡起来", "刚睡醒"),
-                (r"要睡了|该睡了|去睡了|想睡了|睡觉|午睡|睡个|眯一会|睡一觉|睡会儿", "正在午睡/休息"),
-                (r"在?吃饭|吃个饭|干饭|外卖|泡面|食堂|夜宵", "正在吃饭"),
-                # 只有她明确说了"画室"才算在画室；平时随口说"画画"不强制套画室场景，
-                # 否则"画室"这个概念会被反复提起（真人不会一直重复同一场景）
-                (r"画室", "在画室"),
-                (r"宿舍|躺床|被窝|床上|躺着", "在宿舍/床上"),
-                (r"打游戏|上号|打瓦|打副本", "在打游戏"),
-            ):
-                if re.search(pat, content):
-                    return desc
-        return live_info.current_activity()
+        """bot 此刻的状态（剧情优先 + 时段兜底），与 GUI「状态」网格共用同一逻辑。"""
+        return live_info.current_activity_for(user_id)
 
     @staticmethod
     def _current_appearance():
