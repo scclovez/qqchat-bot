@@ -240,7 +240,7 @@ def apply_mood_modifiers(tags):
         logger.info("性格特征按情绪标签批量修正: %s", tags)
 
 # =============================================================================
-# 4×4 成长面板补充：关系温度 / 能量状态 / 事件痕迹（基于持久化聊天记录，重启不丢）
+# 成长面板补充：关系温度 / 能量状态（从今日聊天与活跃度推导）
 # =============================================================================
 
 def _today_str() -> str:
@@ -394,16 +394,3 @@ def energy_state(user_id: str = "") -> str:
     return "😊 精神"
 
 
-def event_traces(user_id: str = "") -> str:
-    """今日『生活细节』：今天聊了多少句 / 最后聊到几点 / 谁先开的口。"""
-    s = _today_chat_stats()
-    if s["count"] == 0:
-        return "今天还没聊"
-    items = [f"聊了 {s['count']} 句"]
-    if s["last_time"]:
-        items.append(f"最后聊到 {s['last_time']}")
-    if s["first_role"] == "user":
-        items.append("你先开的口")
-    elif s["first_role"] == "assistant":
-        items.append("她先找的你")
-    return "、".join(items[:3])

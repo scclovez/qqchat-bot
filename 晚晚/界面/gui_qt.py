@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""PySide6 版控制面板（天空蓝主题）— 替代 customtkinter 版。
+"""PySide6 版控制面板（天空蓝主题）。
 
 性能更强（Qt C++ 渲染）、QSS 美化、支持 PyInstaller 打包。
 业务逻辑复用 晚晚/ 各模块（config / llm_providers / usage / appearance_ref / personality_state 等），
@@ -41,7 +41,7 @@ from usage import usage_tracker  # noqa: E402
 logger = logging.getLogger("gui_qt")
 
 # =============================================================================
-# 天空蓝色板（与 customtkinter 版一致）
+# 天空蓝配色
 # =============================================================================
 BG = "#f6f2ec"            # 主背景（燕麦白）
 CARD = "#fffdfa"          # 卡片暖白
@@ -80,7 +80,6 @@ GROWTH_HINTS = {
     "dependency": "依赖度：她有多依赖你；主动聊天、追问、撩人都会增加",
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的尺度",
-    "traces": "今日生活细节：今天聊了多少句、最后聊到几点、谁先开的口",
     "nickname": "她当前对你的称呼，随性格阶段与深度绑定细分变化：你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝",
     "state": "她此刻的状态（在睡觉/在画画/在吃饭…）：剧情优先取最近对话她自述的状态，没有则按时段兜底",
     "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
@@ -421,7 +420,7 @@ class MainWindow(QMainWindow):
         self._growth_items = [
             ("stage", "性格阶段", True), ("rel_hot", "关系温度", True), ("energy", "能量状态", True), ("mood", "实时情绪", False),
             ("affection", "亲密度", True), ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True), ("lewdness", "淫乱度", True),
-            ("traces", "事件痕迹", True), ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
+            ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
             ("days", "在一起", True), ("memory", "记得你", True), ("chats", "聊天记录", True), ("mood_delta", "今日亲密度", False),
         ]
         for i, (key, name, always) in enumerate(self._growth_items):
@@ -1654,10 +1653,9 @@ class MainWindow(QMainWindow):
             boyfriend = str(_rt.PROACTIVE_ONLY_USER_ID or "").strip()
             # 状态：她此刻在做什么（剧情优先 + 时段兜底）
             vals["state"] = live_info.current_activity_for(boyfriend)
-            # 关系温度 / 能量状态 / 生活细节（从今日聊天与活跃度推导）
+            # 关系温度 / 能量状态（从今日聊天与活跃度推导）
             vals["rel_hot"] = pstate.relationship_temperature()
             vals["energy"] = pstate.energy_state()
-            vals["traces"] = pstate.event_traces(boyfriend)
             vals["mood"] = pstate.current_mood(boyfriend)
             delta = growth_diary.get_today_affection_delta()
             vals["mood_delta"] = f"{'+' if delta > 0 else ''}{delta}" if delta else ""
