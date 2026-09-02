@@ -249,22 +249,24 @@ def _today_str() -> str:
 
 
 def _today_chat_stats() -> dict:
-    """今日（本地日期）聊天统计：句数 / 最长一条 / 提到名字次数。"""
+    """今日（本地日期）聊天统计：句数/字数/最长一句/提到名字/最后时间/谁先开口。"""
     import memory as longterm_memory
     try:
         conn = longterm_memory._get_conn()
         day = _today_str()
         with longterm_memory._lock:
             rows = conn.execute(
-                "SELECT role, content FROM chat_history WHERE date(created_at) = ? ORDER BY id",
+                "SELECT role, content, created_at FROM chat_history WHERE date(created_at) = ? ORDER BY id",
                 (day,),
             ).fetchall()
     except Exception:
-        return {"count": 0, "max_len": 0, "max_text": "", "name_mentions": 0}
+        return {"count": 0, "max_len": 0, "max_text": "", "name_mentions": 0,
+                "total_chars": 0, "last_time": "", "first_role": ""}
     count = len(rows)
-    max_len, max_text = 0, ""
+    max_len, max_text, total = 0, "", 0
     for r in rows:
         c = (r["content"] or "")
+        total += len(c)
         if len(c) > max_len:
             max_len, max_text = len(c), c
     try:
@@ -273,7 +275,14 @@ def _today_chat_stats() -> dict:
     except Exception:
         names = {"bot", "小晚", "晚晚"}
     name_mentions = sum(1 for r in rows if any(n and n in (r["content"] or "") for n in names))
-    return {"count": count, "max_len": max_len, "max_text": max_text, "name_mentions": name_mentions}
+    last_time, first_role = "", ""
+    if rows:
+        last_raw = (rows[-1]["created_at"] or "")
+        if len(last_raw) >= 16:
+            last_time = last_raw[11:16]
+        first_role = rows[0]["role"] or ""
+    return {"count": count, "max_len": max_len, "max_text": max_text, "name_mentions": name_mentions,
+            "total_chars": total, "last_time": last_time, "first_role": first_role}
 
 
 def _last_msg_days() -> int:
@@ -296,24 +305,76 @@ def _last_msg_days() -> int:
         return 99
 
 
+# 实时情绪：从最近的 assistant 消息里用情绪词检测她当下的心情（未命中用情绪信号兜底）
+_MOOD_LEXICON = [
+    ("撒娇", ("撒娇", "抱抱", "亲亲", "么么", "粘", "哼哼", "好嘛", "嘛~")),
+    ("开心", ("开心", "高兴", "嘻嘻", "哈哈", "笑死", "超开心")),
+    ("委屈", ("委屈", "呜呜", "难过", "伤心", "哭", "呜呜呜")),
+    ("生气", ("生气", "气死", "不理你", "烦死", "火大")),
+    ("害羞", ("害羞", "脸红", "不好意思", "羞")),
+    ("吃醋", ("吃醋", "醋", "别人", "别的女生", "别的女人", "她是谁")),
+    ("心动", ("心动", "喜欢你", "想你", "好喜欢", "甜")),
+    ("疲惫", ("累", "困", "疲惫", "没力气", "好困")),
+    ("慵懒", ("懒", "瘫", "不想动", "摆烂")),
+    ("温柔", ("温柔", "乖乖", "轻声", "好乖")),
+    ("傲娇", ("才不理", "才不要", "讨厌", "哼")),
+    ("无奈", ("无语", "你呀", "真是的", "服了")),
+]
+
+
+def current_mood(user_id: str = "") -> str:
+    """实时情绪：从今天最近的 assistant 消息里用情绪词检测她此刻的心情。"""
+    try:
+        import memory as longterm_memory
+        conn = longterm_memory._get_conn()
+        with longterm_memory._lock:
+            rows = conn.execute(
+                "SELECT content FROM chat_history WHERE date(created_at) = ? AND role='assistant' "
+                "ORDER BY id DESC LIMIT 60",
+                (_today_str(),),
+            ).fetchall()
+    except Exception:
+        rows = []
+    counts = {}
+    for r in rows:
+        c = r["content"] or ""
+        for label, kws in _MOOD_LEXICON:
+            if c and any(k in c for k in kws):
+                counts[label] = counts.get(label, 0) + 1
+    if counts:
+        top = [k for k, _v in sorted(counts.items(), key=lambda x: -x[1])[:2]]
+        return " / ".join(top)
+    try:
+        import liveness
+        if liveness.today_mood_low():
+            return "低落"
+        if user_id and liveness.is_angry(user_id):
+            return "生气"
+    except Exception:
+        pass
+    return "平静"
+
+
 def relationship_temperature(user_id: str = "") -> str:
-    """关系温度：近期对这段关系的**冷热感**（不是亲密度）。基于今日活跃 + 亲密度档位推导。"""
+    """关系温度：最近这段关系的冷热感（不是亲密度）。由亲密度档位 + 今日活跃强度推导。"""
     a = get_affection()
     stats = _today_chat_stats()
-    if stats["count"] > 0:          # 今天聊了 → 至少温热
-        if a >= 151:
-            return "🔥 滚烫"
-        if a >= 51:
-            return "🍯 温热"
-        return "🌤 常温"
-    days = _last_msg_days()
-    if days <= 1:
-        return "🌤 常温"
-    if days <= 3:
-        return "🧊 转凉"
-    if days <= 7:
-        return "🥶 冷淡"
-    return "🌫 疏远"
+    base = 3 if a >= 151 else (2 if a >= 51 else 1)
+    if stats["count"] > 0:
+        intensity = 2 if stats["count"] >= 40 else (1 if stats["count"] >= 10 else 0)
+        score = base + intensity
+    else:
+        days = _last_msg_days()
+        if days <= 1:
+            score = base
+        elif days <= 3:
+            score = base - 1
+        elif days <= 7:
+            score = base - 2
+        else:
+            score = base - 3
+    levels = {5: "🔥 滚烫", 4: "🍯 温热", 3: "🌤 常温", 2: "🧊 转凉", 1: "🥶 冷淡", 0: "🌫 疏远"}
+    return levels.get(score, "🌤 常温")
 
 
 def energy_state(user_id: str = "") -> str:
@@ -334,14 +395,15 @@ def energy_state(user_id: str = "") -> str:
 
 
 def event_traces(user_id: str = "") -> str:
-    """今天的『事件痕迹』：非日记，而是细碎的生活痕迹（最长一句 / 叫过名字）。"""
-    stats = _today_chat_stats()
-    if stats["count"] == 0:
+    """今日『生活细节』：今天聊了多少句 / 最后聊到几点 / 谁先开的口。"""
+    s = _today_chat_stats()
+    if s["count"] == 0:
         return "今天还没聊"
-    n = f"聊了 {stats['count']} 句"
-    longest = f"最长一句 {stats['max_len']} 字" if stats["max_len"] else ""
-    if stats["name_mentions"] > 0:
-        name = f"叫过我名字 {stats['name_mentions']} 次"
-    else:
-        name = "还没叫过我名字"
-    return "、".join([x for x in (n, longest, name) if x])
+    items = [f"聊了 {s['count']} 句"]
+    if s["last_time"]:
+        items.append(f"最后聊到 {s['last_time']}")
+    if s["first_role"] == "user":
+        items.append("你先开的口")
+    elif s["first_role"] == "assistant":
+        items.append("她先找的你")
+    return "、".join(items[:3])
