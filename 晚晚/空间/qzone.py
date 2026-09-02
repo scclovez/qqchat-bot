@@ -40,6 +40,7 @@ POSTS_PER_DAY = 3            # 每天最多发几条说说（GUI 可调）
 POST_IMAGE_PROB = 0.6        # 发说说配图概率（GUI 可调；0=纯文字）
 ACTION_GAP_MIN, ACTION_GAP_MAX = 3.0, 8.0  # 操作间随机间隔（秒）
 POST_HOUR_START, POST_HOUR_END = 8, 23      # 每天发说说的时间窗口
+POST_STALE_GRACE = 2 * 3600                 # 计划时间点错过超过 2 小时则跳过（不补发旧帖）
 
 
 def _feed_comment_prob() -> float:
@@ -48,7 +49,7 @@ def _feed_comment_prob() -> float:
 
 # 去重种类
 KIND_DAILY_POST = "daily_post"            # ref = 本地时间戳（统计每天发布条数）
-KIND_POST_NEXT = "daily_post_next"        # ref = 下次可发时间（unix 秒，发布时随机锁定）
+KIND_POST_DONE = "daily_post_done"        # ref = 已消费（已发/跳过）的计划发布时间戳
 KIND_COMMENT_REPLIED = "comment_replied"  # ref = 评论 comment_id
 KIND_FEED_LIKED = "feed_liked"            # ref = feed key
 KIND_FEED_COMMENTED = "feed_commented"    # ref = feed key
@@ -245,37 +246,69 @@ def _post_interval_range() -> tuple:
     return lo, hi
 
 
-def _next_post_ts() -> float:
-    """最近一次发布时锁定的"下次可发时间"（unix 秒）；没有锁定记录返回 0。
-
-    注意：每次发布都会新增一条锁记录，这里必须取**最新**一条
-    （ORDER BY rowid DESC），否则会读到最早那条早已过期的锁，
-    导致条间间隔冷却永远不生效。
+def _daily_post_times() -> list:
+    """今天计划发说说的时刻（本地 unix 秒，升序）。按日期种子**确定性**生成：
+    同一天内稳定（重启也不重排、不连发）；时间散落在 8–23 点窗口内、彼此错开
+    （早/午/晚各有一次），每次间隔 >= QZONE_POST_INTERVAL_MIN 小时（0=不限制）。
     """
-    conn = _get_conn()
-    with _lock:
-        row = conn.execute(
-            "SELECT ref FROM qzone_processed WHERE kind = ? ORDER BY rowid DESC LIMIT 1",
-            (KIND_POST_NEXT,),
-        ).fetchone()
-    if not row:
-        return 0
-    try:
-        return float(row["ref"])
-    except (TypeError, ValueError):
-        return 0
+    n = _posts_per_day()
+    day0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = day0.replace(hour=POST_HOUR_START)
+    end = day0.replace(hour=POST_HOUR_END)
+    total = max(1.0, (end - start).total_seconds())
+    min_gap = _post_interval_range()[0] * 3600  # MIN 小时 → 秒（0=不限制）
+    seg = total / max(1, n)
+    rnd = random.Random(day0.strftime("%Y%m%d") + "_qzone")
+    start_ts = start.timestamp()
+    times = []
+    for i in range(n):
+        offset = seg * i + rnd.uniform(0, seg * 0.5)
+        times.append(int(start_ts + offset))
+    # 保证最小间隔（极端配置下也不挤在一起）
+    if min_gap > 0:
+        for i in range(1, len(times)):
+            if times[i] - times[i - 1] < min_gap:
+                times[i] = times[i - 1] + int(min_gap)
+    # 钳制，不越过窗口终点
+    end_ts = int(end.timestamp())
+    return sorted(min(t, end_ts) for t in times)
 
 
-def _lock_next_post(ts):
-    """写入新的"下次可发时间"并清掉历史锁（只保留最新一条，表里不堆积）。"""
+def _consumed_slots() -> set:
+    """已消费（已发/跳过）的计划发布时间戳集合。"""
     conn = _get_conn()
     with _lock:
-        conn.execute("DELETE FROM qzone_processed WHERE kind = ?", (KIND_POST_NEXT,))
-        conn.execute(
-            "INSERT INTO qzone_processed (kind, ref) VALUES (?, ?)",
-            (KIND_POST_NEXT, str(int(ts))),
-        )
-        conn.commit()
+        rows = conn.execute(
+            "SELECT ref FROM qzone_processed WHERE kind = ?", (KIND_POST_DONE,)
+        ).fetchall()
+    out = set()
+    for r in rows:
+        try:
+            out.add(int(r["ref"]))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _next_pending_slot() -> float:
+    """下一个应发布的槽（unix 秒）；未到计划时间返回 0。
+
+    已到点但**严重过期**（错过 > POST_STALE_GRACE）的槽直接消费跳过，
+    避免机器人重启后"补发/连发"旧帖——真人错过那个点就是错过了。
+    """
+    now = time.time()
+    consumed = _consumed_slots()
+    for t in _daily_post_times():
+        if t in consumed:
+            continue
+        if t <= now:
+            if now - t <= POST_STALE_GRACE:
+                return float(t)
+            mark_processed(KIND_POST_DONE, str(t))
+            consumed.add(t)
+        else:
+            break
+    return 0.0
 
 
 def _posts_per_day() -> int:
@@ -303,7 +336,7 @@ def _to_qzone_image_src(path_or_url: str) -> str:
 
 
 async def send_qzone_update(api_call, llm_chat, image_gen_cb=None):
-    """生成并发送一条空间说说；达每日上限/冷却中/窗口外返回空串。
+    """生成并发送一条空间说说；达每日上限/未到计划发布时间/窗口外返回空串。
 
     成功发布返回说说内容（供"发完喊你看"等联动）；失败/跳过返回空串。
 
@@ -321,11 +354,10 @@ async def send_qzone_update(api_call, llm_chat, image_gen_cb=None):
     # 空间接口失败退避：共用 30 分钟冷却（防限流时每 5 分钟硬撞）
     if _qzone_in_fail_cooldown():
         return ""
-    # 条间冷却：上次发布时在 [MIN, MAX] 区间随机锁定了下次可发时间
-    next_ts = _next_post_ts()
-    if next_ts and time.time() < next_ts:
-        left = int((next_ts - time.time()) / 60)
-        logger.info("空间说说: 冷却中（约 %d 分钟后可再发），跳过", left)
+    # 计划发布时间：到点才发（每天预排、错开；错过 >2 小时跳过，不连发）
+    target = _next_pending_slot()
+    if not target:
+        logger.info("空间说说: 未到计划发布时间，跳过")
         return ""
     hour = datetime.now().hour
     if not (POST_HOUR_START <= hour < POST_HOUR_END):
@@ -391,12 +423,8 @@ async def send_qzone_update(api_call, llm_chat, image_gen_cb=None):
             _qzone_mark_failure()
             return ""
         mark_processed(KIND_DAILY_POST, datetime.now().strftime("%Y%m%d%H%M%S"))
-        # 锁定下次可发时间：在 [MIN, MAX] 区间随机取一个间隔（0,0 或 max<=0 = 关闭冷却）
-        lo, hi = _post_interval_range()
-        if hi > 0:
-            next_ts = int(time.time() + random.uniform(lo, hi) * 3600)
-            _lock_next_post(next_ts)
-            logger.info("空间说说: 下次可发时间已锁定（%d-%d 小时后，随机）", lo, hi)
+        # 记录该计划槽已消费，同一天不会在同一个时间点重复发
+        mark_processed(KIND_POST_DONE, str(int(target)))
         logger.info("已发布空间说说（今日 %d/%d%s）: %s",
                     count + 1, limit, "，带图" if params.get("images") else "", content[:50])
         return content
