@@ -81,7 +81,7 @@ GROWTH_HINTS = {
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的尺度",
     "nickname": "她当前对你的称呼，随性格阶段与深度绑定细分变化：你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝",
-    "now_thought": "此刻她心里闪过的什么：取最近她说的一句（节选），更有她正在想的感觉",
+    "now_thought": "今天一件值得记的小事（大模型提炼，最生动/最生活感的那一件）",
     "state": "她此刻的状态（在睡觉/在画画/在吃饭…）：剧情优先取最近对话她自述的状态，没有则按时段兜底",
     "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
     "days": "在一起第几天（从纪念日起始日期算起）",
@@ -311,6 +311,10 @@ class MainWindow(QMainWindow):
         self._sliders = {}
         self._slider_labels = {}
         self._assign_vars = {}
+        # 大模型提炼的"今日状态"缓存（约每 10 分钟后台刷新一次，GUI 5 秒刷新只读缓存）
+        self._today_digest = None
+        self._today_digest_ts = 0.0
+        self._digest_building = False
         self._growth_labels = {}
         self._growth_cell_kw = {}
         self._growth_tips = {}
@@ -421,7 +425,7 @@ class MainWindow(QMainWindow):
         self._growth_items = [
             ("stage", "性格阶段", True), ("rel_hot", "关系温度", True), ("energy", "能量状态", True), ("mood", "实时情绪", False),
             ("affection", "亲密度", True), ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True), ("lewdness", "淫乱度", True),
-            ("now_thought", "此刻", True), ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
+            ("now_thought", "今天的小事", True), ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
             ("days", "在一起", True), ("memory", "记得你", True), ("chats", "聊天记录", True), ("mood_delta", "今日亲密度", False),
         ]
         for i, (key, name, always) in enumerate(self._growth_items):
@@ -1652,13 +1656,14 @@ class MainWindow(QMainWindow):
                 "nickname": nickname,
             }
             boyfriend = str(_rt.PROACTIVE_ONLY_USER_ID or "").strip()
-            # 状态：她此刻在做什么（剧情优先 + 时段兜底）
-            vals["state"] = live_info.current_activity_for(boyfriend)
-            # 关系温度 / 能量状态 / 此刻（从今日聊天与活跃度推导）
-            vals["rel_hot"] = pstate.relationship_temperature()
-            vals["energy"] = pstate.energy_state()
-            vals["now_thought"] = pstate.current_thought(boyfriend)
-            vals["mood"] = pstate.current_mood(boyfriend)
+            # 状态类格子：优先用大模型提炼的今日状态，未就绪/失败回退关键词
+            self._ensure_today_digest()
+            dig = self._today_digest or {}
+            vals["state"] = dig.get("state") or live_info.current_activity_for(boyfriend)
+            vals["rel_hot"] = dig.get("rel") or pstate.relationship_temperature()
+            vals["energy"] = dig.get("energy") or pstate.energy_state()
+            vals["now_thought"] = dig.get("moment") or pstate.current_thought(boyfriend)
+            vals["mood"] = dig.get("mood") or pstate.current_mood(boyfriend)
             delta = growth_diary.get_today_affection_delta()
             vals["mood_delta"] = f"{'+' if delta > 0 else ''}{delta}" if delta else ""
             moods = []
@@ -1707,6 +1712,78 @@ class MainWindow(QMainWindow):
             self._growth_evo_var.setText("　|　".join(evo) if evo else "（暂无性格演化记录）")
         except Exception as e:
             self._growth_evo_var.setText(f"成长状态读取失败：{e}")
+
+
+    # ===================== 今日状态（大模型提炼，缓存） =====================
+    _DIGEST_TTL = 600  # 秒：大模型结果缓存时长（约 10 分钟）
+
+    def _today_digest_stale(self):
+        """大模型结果是否过期（无结果/超时）。"""
+        return (not self._today_digest) or (time.time() - self._today_digest_ts > self._DIGEST_TTL)
+
+    def _ensure_today_digest(self):
+        """过期且未在构建时，后台线程重新调用大模型。GUI 每 5 秒刷新只读缓存，不阻塞。"""
+        if self._digest_building or not self._today_digest_stale():
+            return
+        self._digest_building = True
+        threading.Thread(target=self._digest_worker, daemon=True).start()
+
+    def _digest_worker(self):
+        data = self._build_today_digest()
+        if data:
+            self._today_digest = data
+            self._today_digest_ts = time.time()
+        self._digest_building = False
+        self._safe_after(0, self._refresh_growth_stats)
+
+    def _build_today_digest(self) -> dict:
+        """用大模型提炼今天的状态（实时情绪/状态/关系温度/能量/今天的小事）；失败返回空 dict。"""
+        import asyncio, json
+        import memory as longterm_memory
+        from deepseek_client import DeepSeekClient
+        try:
+            conn = longterm_memory._get_conn()
+            with longterm_memory._lock:
+                rows = conn.execute(
+                    "SELECT role, content FROM chat_history ORDER BY id DESC LIMIT 40"
+                ).fetchall()
+            rows = list(reversed(rows))
+        except Exception:
+            rows = []
+        if not rows:
+            return {}
+        hist = "\n".join(f"{'我' if r['role'] == 'user' else '她'}: {r['content']}" for r in rows)
+        prompt = (
+            "你是小晚的成长记录助手。下面是今天她和男朋友最近的聊天记录（节选）。\n"
+            "请提炼她今天的状态，只返回一段 JSON，字段如下：\n"
+            '{"mood":"她此刻的情绪(2-4字，如 开心/撒娇/疲惫/委屈，没明确则给 平静)",'
+            '"state":"她此刻在做什么(如 在休息/在床上/刚忙完，基于最近对话，不要虚构时间与地点)",'
+            '"rel":"她对这段关系最近的冷热感(从 滚烫/温热/常温/转凉/冷淡 选一个)",'
+            '"energy":"她今天累不累(从 精神/还可以/有点累/很累/困了 选一个)",'
+            '"moment":"今天最值得记的一件小事(一句话，≤30字，最生动、最有生活感的那一件)"}\n'
+            "只返回 JSON，不要任何其它文字。\n\n聊天记录：\n" + hist
+        )
+        async def _run():
+            client = DeepSeekClient()
+            try:
+                return await client.chat(
+                    [{"role": "system", "content": "你是小晚的成长记录助理，只回 JSON。"},
+                     {"role": "user", "content": prompt}],
+                    temperature=0.3, max_tokens=240, disable_thinking=True,
+                )
+            finally:
+                await client.aclose()
+        try:
+            text = (asyncio.run(_run()) or "").strip()
+        except Exception as ex:
+            logger.warning("大模型提炼今日状态失败: %s", ex)
+            return {}
+        s = text.find("{")
+        e = text.rfind("}")
+        try:
+            return json.loads(text[s:e + 1]) if (s >= 0 and e > s) else {}
+        except Exception:
+            return {}
 
     def _growth_tick(self):
         self._refresh_growth_stats()
