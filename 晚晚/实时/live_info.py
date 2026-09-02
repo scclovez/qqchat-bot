@@ -89,11 +89,13 @@ def current_activity_for(user_id: str = "") -> str:
             continue
         content = m["content"] or ""
         for pat, desc in (
-            (r"累死|好累|累得|没力气|瘫|酸软", "累瘫了，在休息"),
-            (r"躺床|躺下|赖床|被窝|床上|躺着", "在床上/躺着"),
+            (r"抱着|抱着你|怀里|窝在|窝着|缠着|黏着|赖着你", "在你怀里/黏着你"),
+            (r"累死|好累|累得|没力气|瘫|酸软|软了", "累瘫了，在休息"),
+            (r"躺床|躺下|赖床|被窝|床上|躺着|躺", "在床上/躺着"),
+            (r"醒了|睡醒|醒过来|醒了没", "刚醒"),
+            (r"睡着|抱睡|哄睡|睡了", "在睡觉/休息"),
             (r"刚洗完|洗好澡|刚做完|完事", "刚忙完，躺着休息"),
             (r"休息|歇会|缓缓|回血|充电", "在休息"),
-            (r"刚醒|睡醒|睡到现在|刚睡起来", "刚睡醒"),
             (r"要睡了|该睡了|去睡了|想睡了|睡觉|午睡|睡个|眯一会|睡一觉|睡会儿", "正在午睡/休息"),
             (r"在?吃饭|吃个饭|干饭|外卖|泡面|食堂|夜宵", "正在吃饭"),
             (r"画室", "在画室"),
@@ -102,6 +104,19 @@ def current_activity_for(user_id: str = "") -> str:
         ):
             if re.search(pat, content):
                 return desc
+    # 有活跃对话但没明确自述 → 用居家安全态，避免编造"操场/图书馆/上课"这类不在剧情里的活动
+    if rows:
+        from datetime import datetime
+        hour = datetime.now().hour
+        if hour < 7 or hour >= 23:
+            return "在家准备睡了"
+        if hour < 11:
+            return "刚起，在家待着"
+        if hour < 14:
+            return "在家歇着"
+        if hour < 18:
+            return "在家待着/忙自己的事"
+        return "在家瘫着"
     return current_activity()
 
 

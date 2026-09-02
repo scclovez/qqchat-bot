@@ -69,6 +69,13 @@ SHORT_REPLY_REMINDER = (
     "要说的事情多，就把每条短消息单独一行，用换行分开。"
 )
 
+# 追加在 system prompt 的"前后一致"提醒：遵守既定事实，不推翻、不制造矛盾
+CONTINUITY_REMINDER = (
+    "【前后一致】保持和前面剧情的连贯：你们之间已经确定的事（比如他帮你请了假、今天没课、"
+    "你现在在他身边/在床上、现在是几点等）就接着演，不要突然说出'在操场走了两圈''下午还有课'"
+    "这类与既定剧情矛盾的话；时间一律按【当前真实时间】，不要自己编时间。"
+)
+
 # 语音模式：本次回复将转为语音时追加到 system prompt，要求输出情感标签
 VOICE_INSTRUCTION = (
     "【语音模式】本次回复将转为语音条发送。请在回复最前面用【情感词】标注情绪"
@@ -720,7 +727,7 @@ class QQGirlfriendBot:
             # 将长期记忆注入 system prompt（替换默认的纯人设 prompt）
             messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
                 user_id, build_system_prompt(),
-            ) + "\n\n" + SHORT_REPLY_REMINDER
+            ) + "\n\n" + SHORT_REPLY_REMINDER + "\n\n" + CONTINUITY_REMINDER
             # 注入实时信息：当前时间（必带）+ 天气/联网搜索（按消息关键词触发）
             await self._inject_live_context(messages, raw_message, user_id)
             # 语音模式：先决定本次是否发语音，若是则要求模型输出情感标签
@@ -1350,10 +1357,12 @@ class QQGirlfriendBot:
             # 注入"此刻bot在做什么"的动态描述，让回复能基于当前时刻自圆其说
             if user_text and any(k in user_text for k in live_info.TIME_TRIGGERS):
                 extra.append(
-                    f"（用户提到了时间/此刻相关话题。你此刻的状态：{self._current_activity(user_id)}。"
-                    "如果这个状态与你之前聊过的剧情（比如'下午睡着了'）不一致，"
-                    "请按真实时间+剧情自然衔接（例如刚睡醒就说'刚醒，现在都一点多了'）。"
-                    "回答时自然地说明你现在在做什么、现在几点，不要提及这段提示词本身。）"
+                    f"（用户提到了时间/此刻相关话题。现在真实时间是【{live_info.now_text()}】，"
+                    "无论剧情里是几点，一律以当前真实时间为准；你此刻的状态按最近你确实说过/在做的事来"
+                    f"（当前状态：{self._current_activity(user_id)}）。"
+                    "不要编造'在操场走了两圈''在上课''在图书馆''下午有课'这类不在剧情里的活动；"
+                    "例如刚睡醒就说'刚醒'，几点就是几点。"
+                    "回答时自然地说明现在几点、你在做什么，不要提及这段提示词本身。）"
                 )
             if user_text and self._is_weather_query(user_text):
                 city = runtime.WEATHER_CITY or "南昌"
