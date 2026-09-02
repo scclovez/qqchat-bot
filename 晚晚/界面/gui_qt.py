@@ -73,18 +73,21 @@ TIP_FG = "#f7f0e6"        # 悬停提示文字
 # 成长状态各参数的说明（悬停 ⓘ 显示）
 GROWTH_HINTS = {
     "stage": "性格阶段：随相处推进，从礼貌试探 → 热情升温 → 深度绑定，影响她的语气、状态和行为",
+    "rel_hot": "关系温度：最近对这段关系的冷热感（不是亲密度）——今天聊得越热、亲密度越高越热",
+    "energy": "能量状态：她今天累不累（结合当前时段与今日聊天量），持久化、重启不丢",
+    "mood": "实时情绪：今天互动中积累的情绪（吃醋 / 撒娇 / 开心…），持久化、重启不丢",
     "affection": "亲密度：每聊一句 +1，反映你们关系的亲密程度；到达阈值会进入下一阶段",
     "dependency": "依赖度：她有多依赖你；主动找你聊天、追问、撩人都会增加",
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的开放尺度",
-    "days": "在一起第几天（从纪念日起始日期算起）",
+    "traces": "今天的『事件痕迹』：细碎的生活痕迹（今天聊了多少句 / 最长一句 / 叫过我名字）",
     "nickname": "她当前对你的称呼，随性格阶段与深度绑定细分变化：你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝",
     "state": "她此刻的状态（在睡觉 / 在画画 / 正在吃饭…）：剧情优先取最近对话里她自述的状态，没有则按时段兜底",
+    "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
+    "days": "在一起第几天（从纪念日起始日期算起）",
     "memory": "她长期记忆里关于你的事（提炼的事实 + 偏好数量）",
     "chats": "累计聊天的消息条数",
-    "mood": "今日情绪标签：今天互动中积累的情绪（吃醋 / 撒娇 / 开心…）",
-    "mood_delta": "今日亲密度变化：今天通过聊天涨了多少亲密度",
-    "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
+    "mood_delta": "今日亲密度变化：今天通过聊天涨了多少亲密度（持久化、重启不丢）",
 }
 
 # =============================================================================
@@ -416,12 +419,10 @@ class MainWindow(QMainWindow):
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setSpacing(6)
         self._growth_items = [
-            ("stage", "性格阶段", True), ("affection", "亲密度", True),
-            ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True),
-            ("lewdness", "淫乱度", True), ("days", "在一起", True),
-            ("nickname", "称呼", True), ("state", "状态", True), ("memory", "记得你", True),
-            ("chats", "聊天记录", True), ("mood", "今日情绪", False),
-            ("mood_delta", "今日亲密度", False), ("mood_state", "今日心情", True),
+            ("stage", "性格阶段", True), ("rel_hot", "关系温度", True), ("energy", "能量状态", True), ("mood", "实时情绪", False),
+            ("affection", "亲密度", True), ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True), ("lewdness", "淫乱度", True),
+            ("traces", "事件痕迹", True), ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
+            ("days", "在一起", True), ("memory", "记得你", True), ("chats", "聊天记录", True), ("mood_delta", "今日亲密度", False),
         ]
         for i, (key, name, always) in enumerate(self._growth_items):
             cell = QFrame()
@@ -1653,9 +1654,13 @@ class MainWindow(QMainWindow):
             boyfriend = str(_rt.PROACTIVE_ONLY_USER_ID or "").strip()
             # 状态：她此刻在做什么（剧情优先 + 时段兜底）
             vals["state"] = live_info.current_activity_for(boyfriend)
+            # 关系温度 / 能量状态 / 事件痕迹（基于持久化数据，重启不丢）
+            vals["rel_hot"] = pstate.relationship_temperature()
+            vals["energy"] = pstate.energy_state()
+            vals["traces"] = pstate.event_traces(boyfriend)
             tags = growth_diary.get_today_mood_tags()
             vals["mood"] = "、".join(str(t) for t in list(tags)[:6]) if tags else ""
-            delta = getattr(growth_diary, "_today_affection_delta", 0) or 0
+            delta = growth_diary.get_today_affection_delta()
             vals["mood_delta"] = f"{'+' if delta > 0 else ''}{delta}" if delta else ""
             moods = []
             if liveness.today_mood_low():

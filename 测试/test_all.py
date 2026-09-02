@@ -98,8 +98,8 @@ def test_gui():
     QTimer.singleShot(1500, verify)
     app.exec()
     assert result.get("tabs") == 5, "应有 5 个顶级页"
-    assert result.get("growth") == 13, "成长网格应为 13 格"
-    print("      GUI 5 页构建 OK，成长网格 13 格 OK")
+    assert result.get("growth") == 16, "成长网格应为 16 格（4×4）"
+    print("      GUI 5 页构建 OK，成长网格 16 格 OK")
 
 
 def main():

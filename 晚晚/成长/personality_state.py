@@ -238,3 +238,110 @@ def apply_mood_modifiers(tags):
             _set(key, _get(key) + delta)
     if tags:
         logger.info("性格特征按情绪标签批量修正: %s", tags)
+
+# =============================================================================
+# 4×4 成长面板补充：关系温度 / 能量状态 / 事件痕迹（基于持久化聊天记录，重启不丢）
+# =============================================================================
+
+def _today_str() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _today_chat_stats() -> dict:
+    """今日（本地日期）聊天统计：句数 / 最长一条 / 提到名字次数。"""
+    import memory as longterm_memory
+    try:
+        conn = longterm_memory._get_conn()
+        day = _today_str()
+        with longterm_memory._lock:
+            rows = conn.execute(
+                "SELECT role, content FROM chat_history WHERE date(created_at) = ? ORDER BY id",
+                (day,),
+            ).fetchall()
+    except Exception:
+        return {"count": 0, "max_len": 0, "max_text": "", "name_mentions": 0}
+    count = len(rows)
+    max_len, max_text = 0, ""
+    for r in rows:
+        c = (r["content"] or "")
+        if len(c) > max_len:
+            max_len, max_text = len(c), c
+    try:
+        from config import runtime
+        names = {runtime.GIRLFRIEND_NAME, "小晚", "晚晚"}
+    except Exception:
+        names = {"bot", "小晚", "晚晚"}
+    name_mentions = sum(1 for r in rows if any(n and n in (r["content"] or "") for n in names))
+    return {"count": count, "max_len": max_len, "max_text": max_text, "name_mentions": name_mentions}
+
+
+def _last_msg_days() -> int:
+    """距最近一条消息过去的天数；无记录返回 99。"""
+    try:
+        import memory as longterm_memory
+        conn = longterm_memory._get_conn()
+        with longterm_memory._lock:
+            row = conn.execute("SELECT MAX(created_at) AS last FROM chat_history").fetchone()
+        last = row["last"] or ""
+    except Exception:
+        return 99
+    if not last:
+        return 99
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(last)
+        return (datetime.now() - dt).days
+    except Exception:
+        return 99
+
+
+def relationship_temperature(user_id: str = "") -> str:
+    """关系温度：近期对这段关系的**冷热感**（不是亲密度）。基于今日活跃 + 亲密度档位推导。"""
+    a = get_affection()
+    stats = _today_chat_stats()
+    if stats["count"] > 0:          # 今天聊了 → 至少温热
+        if a >= 151:
+            return "🔥 滚烫"
+        if a >= 51:
+            return "🍯 温热"
+        return "🌤 常温"
+    days = _last_msg_days()
+    if days <= 1:
+        return "🌤 常温"
+    if days <= 3:
+        return "🧊 转凉"
+    if days <= 7:
+        return "🥶 冷淡"
+    return "🌫 疏远"
+
+
+def energy_state(user_id: str = "") -> str:
+    """今天的能量状态：当前累了没（基于时段 + 今日聊天量）。"""
+    from datetime import datetime
+    hour = datetime.now().hour
+    stats = _today_chat_stats()
+    msg_cnt = stats["count"]
+    if msg_cnt >= 60:
+        return "😩 有点累"
+    if msg_cnt >= 25:
+        return "😌 还行"
+    if hour < 7 or hour >= 23:
+        return "😪 困了"
+    if hour < 9:
+        return "🥱 刚醒"
+    return "😊 精神"
+
+
+def event_traces(user_id: str = "") -> str:
+    """今天的『事件痕迹』：非日记，而是细碎的生活痕迹（最长一句 / 叫过名字）。"""
+    stats = _today_chat_stats()
+    if stats["count"] == 0:
+        return "今天还没聊"
+    n = f"聊了 {stats['count']} 句"
+    longest = f"最长一句 {stats['max_len']} 字" if stats["max_len"] else ""
+    if stats["name_mentions"] > 0:
+        name = f"叫过我名字 {stats['name_mentions']} 次"
+    else:
+        name = "还没叫过我名字"
+    return "、".join([x for x in (n, longest, name) if x])

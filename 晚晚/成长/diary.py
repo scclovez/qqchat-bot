@@ -19,31 +19,86 @@ DIARY_PROMPT_TEMPLATE = (
     "不要出现“日记”二字，直接写内容。今天的情绪标签有：{mood_tags}。"
 )
 
-# 今日情绪标签 / 亲密度变化（进程内积累；跨重启丢失可接受，实时特征值在 personality_state）
+# 今日情绪标签 / 今日亲密度变化：持久化到 diary 表（date=今天），重启不丢。
+# 实时特征值（亲密度/依赖度/醋意）在 personality_state 表。
 _today_tags = set()
 _today_affection_delta = 0
+_loaded = False
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _persist_today():
+    """把今日情绪/亲密度写入 diary 表（date=今天），供重启后恢复（不清空 content）。"""
+    try:
+        import json as _json
+        conn = db.get_conn()
+        with db._lock:
+            conn.execute(
+                "INSERT INTO diary (date, content, mood_tags, affection_delta) "
+                "VALUES (?, '', ?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET "
+                "mood_tags=excluded.mood_tags, affection_delta=excluded.affection_delta",
+                (_today(), _json.dumps(sorted(_today_tags), ensure_ascii=False), _today_affection_delta),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.debug("持久化今日状态失败: %s", e)
+
+
+def _load_today_from_db():
+    """首次读取时从 diary 表恢复今日情绪与亲密度（跨重启）。"""
+    global _today_tags, _today_affection_delta, _loaded
+    if _loaded:
+        return
+    _loaded = True
+    try:
+        import json as _json
+        conn = db.get_conn()
+        with db._lock:
+            row = conn.execute(
+                "SELECT mood_tags, affection_delta FROM diary WHERE date = ?", (_today(),),
+            ).fetchone()
+        if row:
+            _today_tags = set(_json.loads(row["mood_tags"] or "[]"))
+            _today_affection_delta = int(row["affection_delta"] or 0)
+    except Exception as e:
+        logger.debug("恢复今日状态失败: %s", e)
 
 
 def add_mood_tag(tag):
+    _load_today_from_db()
     global _today_tags
     tag = (tag or "").strip()
     if tag:
         _today_tags.add(tag)
+        _persist_today()
 
 
 def add_affection_delta(delta):
+    _load_today_from_db()
     global _today_affection_delta
     _today_affection_delta += int(delta or 0)
+    _persist_today()
 
 
 def get_today_mood_tags() -> list:
+    _load_today_from_db()
     return list(_today_tags)
+
+
+def get_today_affection_delta() -> int:
+    _load_today_from_db()
+    return _today_affection_delta
 
 
 def reset_day():
     global _today_tags, _today_affection_delta
     _today_tags = set()
     _today_affection_delta = 0
+    _persist_today()
 
 
 # 目标日：日记/演化在凌晨执行，总结"刚过去的完整自然日"（昨天）。
