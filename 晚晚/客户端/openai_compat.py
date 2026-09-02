@@ -32,6 +32,14 @@ class OpenAICompatClient(BaseLLMClient):
             max_retries=1,
         )
 
+    async def _rebuild_client(self):
+        """连接错误时重建底层客户端（重新解析 DNS、清掉卡死的连接池）。"""
+        self._client = AsyncOpenAI(
+            api_key=self.api_key or "sk-local",
+            base_url=self.base_url or "http://127.0.0.1:11434/v1",
+            timeout=120.0, max_retries=1,
+        )
+
     async def _create(self, model, messages, temperature, max_tokens,
                       force_disable_thinking=False, tools=None):
         kwargs = dict(model=model, messages=messages,

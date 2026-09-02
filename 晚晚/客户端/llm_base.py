@@ -46,7 +46,8 @@ class BaseLLMClient:
         raise NotImplementedError
 
     async def chat(self, messages, temperature=None, max_tokens=None, model=None,
-                   disable_thinking=False, tools=None, execute_tool=None):
+                   disable_thinking=False, tools=None, execute_tool=None,
+                   _conn_retried=False):
         """调用后端 chat；支持 function calling（tools + execute_tool）。
 
         - tools: OpenAI 兼容的 function 定义列表（模型可自主决定调用）
@@ -101,6 +102,15 @@ class BaseLLMClient:
                     })
             return ""
         except Exception as e:
+            # 连接类错误：重建底层客户端（清掉卡死的连接池/坏IP）后重试一次
+            import openai
+            if isinstance(e, openai.APIConnectionError) and not _conn_retried:
+                logger.warning("LLM 连接错误，重建客户端后重试一次: %s", e)
+                await self._rebuild_client()
+                return await self.chat(messages, temperature=temp, max_tokens=tokens,
+                                       model=mdl, disable_thinking=disable_thinking,
+                                       tools=tools, execute_tool=execute_tool,
+                                       _conn_retried=True)
             # 后端不支持 tools（本地模型/精简服务常见）→ 去掉 tools 回退纯对话一次
             if tools:
                 logger.warning("LLM 调用带工具失败（%s），回退纯对话重试", e)
@@ -112,6 +122,10 @@ class BaseLLMClient:
                     logger.error("纯对话重试也失败: %s", e2)
             logger.error("LLM 调用失败 [%s]: %s", type(self).__name__, e)
             return self.error_reply
+
+    async def _rebuild_client(self):
+        """连接错误时重建底层客户端（子类实现）；默认无操作。"""
+        logger.warning("%s 未实现 _rebuild_client，无法重建连接", type(self).__name__)
 
     async def summarize(self, history_text):
         """把聊天记录压缩成摘要（对话上下文压缩用）。"""

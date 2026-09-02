@@ -31,6 +31,13 @@ class DeepSeekClient(BaseLLMClient):
             max_retries=2,
         )
 
+    async def _rebuild_client(self):
+        """连接错误时重建底层客户端（重新解析 DNS、清掉卡死的连接池）。"""
+        self._client = AsyncOpenAI(
+            api_key=self.api_key, base_url=self.base_url,
+            timeout=60.0, max_retries=2,
+        )
+
     def _thinking_body(self):
         """思考模式参数：THINKING_MODE=0 时关闭（避免思考吃光 token 导致空回复）。"""
         if not getattr(runtime, "THINKING_MODE", 1):
