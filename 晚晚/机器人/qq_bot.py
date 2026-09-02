@@ -682,6 +682,7 @@ class QQGirlfriendBot:
         # 成长系统：亲密/露骨话题 → 淫乱度 +1（只积累数值，面板只读展示）
         if any(k in raw_message for k in INTIMATE_TRIGGERS):
             pstate.add_lewdness(1)
+            pstate.mark_intimate()  # 亲密/露骨话题：记录用于能量骤降 + 贤者时间
             logger.info("检测到亲密话题，淫乱度 +1 [%s]", user_id)
         # 活人感：哄话消气（改签名"今天天气好好"）；没哄且没在生气时低概率闹脾气（签名"哼"）
         if runtime.LIVENESS_ENABLED:
@@ -739,6 +740,13 @@ class QQGirlfriendBot:
                 mood_inj = liveness.build_mood_injection(user_id, longterm_memory)
                 if mood_inj:
                     messages[0]["content"] += mood_inj
+                # 贤者时间/身体感：热度低→对撩拨平淡；很累→主动说不想说话
+                _sat = pstate.satiety_injection()
+                if _sat:
+                    messages[0]["content"] += _sat
+                if "很累" in pstate.energy_state() or "困了" in pstate.energy_state():
+                    messages[0]["content"] += ("\n（你今天很累/困了：回复可以更短、更懒，"
+                                               "有时会顺着说一句\"好累，不想说话了\"之类，但不会不理他。）")
                 _h = time.localtime().tm_hour
                 if _h >= 23 or _h < 6:
                     messages[0]["content"] += ("\n（现在很晚了，你困得不行：回复要更短、更懒散，"
@@ -2179,6 +2187,12 @@ class QQGirlfriendBot:
         # 活人感：分场景延迟 —— 她在画室/吃饭/打游戏时回复更慢（冷却乘倍率）
         if runtime.LIVENESS_ENABLED and msg_type == "private":
             cooldown *= liveness.activity_delay_factor(self._current_activity(user_id))
+            # 身体感：今天很累/精神差 → 回得更慢一点
+            _en = pstate.energy_state(user_id)
+            if "很累" in _en or "困了" in _en:
+                cooldown *= 1.35
+            elif "还可以" in _en:
+                cooldown *= 1.15
         if cooldown > 0:
             if runtime.LIVENESS_ENABLED and msg_type == "private":
                 await self._simulate_typing(user_id, cooldown)
@@ -2405,7 +2419,8 @@ class QQGirlfriendBot:
             return False
         if runtime.LIVENESS_ENABLED:
             prob = min(1.0, prob * liveness.voice_hour_factor()
-                       * liveness.mood_modal_factor(user_id))
+                       * liveness.mood_modal_factor(user_id)
+                       * liveness.grudge_voice_factor(user_id))
         return random.random() < prob
 
     async def _maybe_send_voice(self, msg_type, target_id, user_id, text):

@@ -454,6 +454,18 @@ def grudge_count_today(user_id: str) -> int:
     return int(v) if v.isdigit() else 0
 
 
+def grudge_voice_factor(user_id: str = "") -> int:
+    """被惹多了 → 语音收敛（有情绪账，不太想给你发语音）。"""
+    cnt = grudge_count_today(user_id) if user_id else 0
+    if cnt >= 3:
+        return 0.3
+    if cnt >= 2:
+        return 0.5
+    if cnt >= 1:
+        return 0.7
+    return 1.0
+
+
 def mood_residue_injection(user_id: str) -> str:
     """情绪滞后：昨天的情绪今天还带一点（生气残留 / 甜蜜余温）。"""
     v = _get(MOOD_LAST_KEY + str(user_id), "")

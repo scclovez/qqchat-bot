@@ -63,6 +63,27 @@ def current_activity() -> str:
     return text
 
 
+def daily_scene() -> str:
+    """当前时段的主场景（作息一致性）：主动消息/自述贴合它，而不是只有延迟倍率。"""
+    from datetime import datetime
+    hour = datetime.now().hour
+    if hour < 6:
+        return "深夜在家"
+    if hour < 9:
+        return "早上在家刚醒"
+    if hour < 12:
+        return "上午在家/画室待着"
+    if hour < 14:
+        return "中午在家吃饭/歇着"
+    if hour < 18:
+        return "下午在家/画室忙自己的事"
+    if hour < 21:
+        return "傍晚在家待着"
+    if hour < 23:
+        return "晚上在家/有点困"
+    return "深夜在家，该睡了"
+
+
 def current_activity_for(user_id: str = "") -> str:
     """bot 此刻的状态（称呼→状态）：优先取最近对话里她自述的状态（剧情优先），
     没有才按时段兜底（current_activity）。供机器人注入与 GUI「状态」网格共用。

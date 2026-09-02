@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 import evolution_db as db
 import personality_state
+import live_info
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +25,9 @@ SILENCE_STAGE1_HOURS = 4   # 阶段一：沉默这么久触发
 CHECK_INTERVAL_SECONDS = 15 * 60  # 独立定时任务间隔
 
 PULL_PROMPT_TEMPLATE = (
-    "根据当前时段（{period}）、沉默时长（{silence_hours}小时）、当前性格阶段（{stage}），"
-    "生成一条主动消息。语气符合当前阶段，不要超过 30 字。"
-    "短消息风格，不要括号动作描写，直接输出。"
+    "根据当前时段（{period}）、当前场景（{scene}）、沉默时长（{silence_hours}小时）、当前性格阶段（{stage}），"
+    "生成一条主动消息。内容贴合你此刻在做的场景（比如在画室就说画画、刚吃完饭就说吃的什么）。"
+    "语气符合当前阶段，不要超过 30 字。短消息风格，不要括号动作描写，直接输出。"
 )
 
 
@@ -80,13 +81,19 @@ def _increment_count():
         conn.commit()
 
 
-def should_pull(last_user_msg_ts) -> bool:
+def should_pull(last_user_msg_ts, user_id: str = "") -> bool:
     """检查是否满足撩人条件。"""
     if _is_night():
         return False
     st = _get_state()
     if st.get("count", 0) >= daily_limit():
         return False
+    # 被惹多了 → 今天更不想主动撩他（有情绪账，先晾他一下）
+    try:
+        if user_id and liveness.grudge_count_today(user_id) >= 2:
+            return False
+    except Exception:
+        pass
     silence = (time.time() - last_user_msg_ts) / 3600 if last_user_msg_ts else 999
     stage = personality_state.get_stage()
     need = SILENCE_STAGE23_HOURS if stage >= 2 else SILENCE_STAGE1_HOURS
@@ -114,11 +121,12 @@ def _build_persona_prompt() -> str:
 async def check_and_run(bot, user_id) -> bool:
     """15 分钟一次的撩人检查；满足条件则生成并发送。bot 提供 _deepseek/_reply_split 等。"""
     try:
-        if not should_pull(bot._last_user_msg.get(user_id, 0)):
+        if not should_pull(bot._last_user_msg.get(user_id, 0), user_id):
             return False
         silence = max(1, int((time.time() - bot._last_user_msg.get(user_id, 0)) / 3600))
         prompt = PULL_PROMPT_TEMPLATE.format(
             period=_period_text(),
+            scene=live_info.daily_scene(),
             silence_hours=silence,
             stage=personality_state.stage_name(),
         )

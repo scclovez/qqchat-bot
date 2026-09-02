@@ -415,3 +415,109 @@ def current_thought(user_id: str = "") -> str:
     return t
 
 
+# =============================================================================
+# 能量/身体感/贤者时间（#5 #6 #7）：按作息曲线衰减 + 每日精力值 + 亲密后骤降
+# =============================================================================
+
+def _energy_level_key() -> str:
+    return "energy_level:" + _today_str()
+
+
+def get_today_energy_level() -> int:
+    """当天身体感精力值：0低 / 1中 / 2高（每天随机一次并持久化，重启不变）。"""
+    v = _get(_energy_level_key())
+    if v:
+        return v
+    import random
+    level = random.choices([1, 2, 0], weights=[70, 20, 10])[0]
+    _set(_energy_level_key(), level)
+    return level
+
+
+def mark_intimate():
+    """亲密/露骨话题发生时记一笔（用于能量骤降 + 贤者时间）。"""
+    import time
+    _set("intimate_last:" + _today_str(), int(time.time()))
+
+
+def _intimate_minutes_ago() -> float:
+    v = _get("intimate_last:" + _today_str())
+    if not v:
+        return 999
+    import time
+    return max(0, (time.time() - v) / 60)
+
+
+def _hour_base(hour: int) -> float:
+    """作息曲线基准：早高、午降、晚最低。"""
+    if hour < 6:
+        return 0.15
+    if hour < 9:
+        return 0.85
+    if hour < 12:
+        return 0.75
+    if hour < 14:
+        return 0.55
+    if hour < 18:
+        return 0.65
+    if hour < 21:
+        return 0.55
+    if hour < 23:
+        return 0.4
+    return 0.2
+
+
+def energy_state(user_id: str = "") -> str:
+    """今天的能量/累不累：按作息曲线 + 对话密度消耗 + 每日精力值 + 亲密后的骤降。"""
+    from datetime import datetime
+    hour = datetime.now().hour
+    base = _hour_base(hour)
+    stats = _today_chat_stats()
+    use = base - min(0.35, (stats["count"] or 0) / 180 * 0.35)
+    use += {2: 0.15, 1: 0, 0: -0.15}[get_today_energy_level()]
+    if _intimate_minutes_ago() < 90:
+        use -= 0.45
+    if use >= 0.75:
+        return "😊 精神"
+    if use >= 0.55:
+        return "😌 还可以"
+    if use >= 0.35:
+        return "😐 有点累"
+    if use >= 0.2:
+        return "😩 很累"
+    return "😪 困了"
+
+
+def satiety_level() -> int:
+    """贤者时间/热度值（0-4）：常态 2；深夜/亲密后/被撩到会变；亲密后骤降，之后慢慢回升。"""
+    base = 2.0
+    hour = None
+    try:
+        from datetime import datetime
+        hour = datetime.now().hour
+    except Exception:
+        pass
+    if hour is not None and (hour >= 22 or hour < 5):
+        base += 0.6
+    minutes = _intimate_minutes_ago()
+    if minutes < 90:
+        base -= 2
+    elif minutes < 240:
+        base -= 1
+    return max(0, min(4, int(round(base))))
+
+
+def satiety_injection() -> str:
+    """贤者时间注入：热度低时对撩拨平淡/回"你正经点"；高时更暧昧。"""
+    lv = satiety_level()
+    if lv <= 1:
+        return ("\n（你现在是贤者/冷淡状态：对他这次的撩拨提不起劲、反应平淡，"
+                "哪怕他调戏你也只淡淡回一句；可以有点慵懒、懒得配合，但不是生气。"
+                "如果他一直调戏你，你就说\"你正经点\"，然后随便敷衍一下。）")
+    if lv >= 3:
+        return ("\n（你此刻有点在意/上头：对他的撩拨更敏感、更容易脸红嘴硬，"
+                "回复会更暧昧、更配合，但也更傲娇。）")
+    return ""
+
+
+
