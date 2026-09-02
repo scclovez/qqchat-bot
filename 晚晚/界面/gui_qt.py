@@ -81,6 +81,7 @@ GROWTH_HINTS = {
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的尺度",
     "nickname": "她当前对你的称呼，随性格阶段与深度绑定细分变化：你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝",
+    "now_thought": "此刻她心里闪过的什么：取最近她说的一句（节选），更有她正在想的感觉",
     "state": "她此刻的状态（在睡觉/在画画/在吃饭…）：剧情优先取最近对话她自述的状态，没有则按时段兜底",
     "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
     "days": "在一起第几天（从纪念日起始日期算起）",
@@ -420,7 +421,7 @@ class MainWindow(QMainWindow):
         self._growth_items = [
             ("stage", "性格阶段", True), ("rel_hot", "关系温度", True), ("energy", "能量状态", True), ("mood", "实时情绪", False),
             ("affection", "亲密度", True), ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True), ("lewdness", "淫乱度", True),
-            ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
+            ("now_thought", "此刻", True), ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
             ("days", "在一起", True), ("memory", "记得你", True), ("chats", "聊天记录", True), ("mood_delta", "今日亲密度", False),
         ]
         for i, (key, name, always) in enumerate(self._growth_items):
@@ -1653,9 +1654,10 @@ class MainWindow(QMainWindow):
             boyfriend = str(_rt.PROACTIVE_ONLY_USER_ID or "").strip()
             # 状态：她此刻在做什么（剧情优先 + 时段兜底）
             vals["state"] = live_info.current_activity_for(boyfriend)
-            # 关系温度 / 能量状态（从今日聊天与活跃度推导）
+            # 关系温度 / 能量状态 / 此刻（从今日聊天与活跃度推导）
             vals["rel_hot"] = pstate.relationship_temperature()
             vals["energy"] = pstate.energy_state()
+            vals["now_thought"] = pstate.current_thought(boyfriend)
             vals["mood"] = pstate.current_mood(boyfriend)
             delta = growth_diary.get_today_affection_delta()
             vals["mood_delta"] = f"{'+' if delta > 0 else ''}{delta}" if delta else ""

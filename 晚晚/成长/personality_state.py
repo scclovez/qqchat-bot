@@ -394,3 +394,24 @@ def energy_state(user_id: str = "") -> str:
     return "😊 精神"
 
 
+def current_thought(user_id: str = "") -> str:
+    """此刻心里闪过了什么：取最近她说过的一句（节选），表现"她正在想/说"的即时感。"""
+    import re
+    import memory as longterm_memory
+    try:
+        conn = longterm_memory._get_conn()
+        with longterm_memory._lock:
+            row = conn.execute(
+                "SELECT content FROM chat_history WHERE role='assistant' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    except Exception:
+        row = None
+    if not row or not (row["content"] or "").strip():
+        return "还没聊"
+    t = (row["content"] or "").strip()
+    t = re.sub(r"[（(][^）)]*[)）]", "", t).strip()   # 去动作括号
+    if len(t) > 28:
+        t = t[:28] + "…"
+    return t
+
+
