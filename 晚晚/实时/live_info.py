@@ -85,9 +85,9 @@ def current_activity_for(user_id: str = "") -> str:
         rows = []
     # 从最近的 assistant 消息里找她自述的状态（后出现的优先；覆盖"累/躺/休息"等）
     for m in reversed(rows):
-        if not (m or {}).get("role") == "assistant":
+        if not m or m["role"] != "assistant":
             continue
-        content = (m.get("content") or "")
+        content = m["content"] or ""
         for pat, desc in (
             (r"累死|好累|累得|没力气|瘫|酸软", "累瘫了，在休息"),
             (r"躺床|躺下|赖床|被窝|床上|躺着", "在床上/躺着"),
