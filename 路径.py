@@ -33,6 +33,11 @@ def _data_root() -> str:
         if os.path.isdir(os.path.join(parent, "晚晚", "配置")):
             return parent
         return d  # 独立分发时兜底用 exe 所在目录
+    # 测试隔离：设置了 DSH_DATA_ROOT 时（如 测试/test_all.py 自建一次性临时目录），
+    # 可写数据根指向它，防止测试读写/污染真实数据（.env / 数据库 / 配置 / 日志）。
+    env_root = os.environ.get("DSH_DATA_ROOT")
+    if env_root:
+        return os.path.abspath(env_root)
     return os.path.dirname(os.path.abspath(__file__))
 
 

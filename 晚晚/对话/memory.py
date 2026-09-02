@@ -443,7 +443,7 @@ def build_system_prompt_with_memory(user_id: str, base_skill_prompt: str) -> str
     memory = get_user_memory(user_id)
     if memory:
         # 固定事实（高优先级，必须遵守；非"不可信参考"，是已确立的剧情设定）
-        fixed = memory.get("fixed_facts", [])[:FIXED_FACTS_LIMIT]
+        fixed = memory.get("fixed_facts", [])[-FIXED_FACTS_LIMIT:]
         if fixed:
             parts.append("【必须遵守的当前事实/设定】以下是与你们当前剧情一致的既定事实，"
                          "后续回复必须自然地保持连续，不要违背或推翻：")
@@ -453,7 +453,9 @@ def build_system_prompt_with_memory(user_id: str, base_skill_prompt: str) -> str
         name = memory.get("name", "")
         if name:
             lines.append(f"- 姓名/称呼：{name}")
-        facts = memory.get("facts", [])[:MEMORY_FACTS_LIMIT]
+        # 事实取最新 MEMORY_FACTS_LIMIT 条（写入端一律 append 到尾部，取尾部 = 最近记忆优先；
+        # 若取头部会把最旧的 20 条永久占住注入窗口，新事实超过 20 条后反而永远不被注入）
+        facts = memory.get("facts", [])[-MEMORY_FACTS_LIMIT:]
         if facts:
             lines.append("- 已知事实：")
             for f in facts:

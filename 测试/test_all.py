@@ -11,12 +11,47 @@
     4. 提供商配置读写（llm_providers.json 可读写）
     5. GUI 冒烟（PySide6 离屏构建 5 个页面，不弹窗）
 """
+import atexit
 import os
+import pathlib
+import shutil
 import sys
+import tempfile
+import time
 import traceback
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, ROOT)
+
+# 数据隔离：把可写数据根指到一次性临时目录后再 import 路径/业务模块，
+# 防止测试读写、污染真实数据（.env / bot_memory.db / llm_providers.json / 日志等）。
+# 以前测试直接落在项目目录（priv 版里因此留下 testuser/_tmp_test_* 残留）。
+# 注意：不能用 tempfile.mkdtemp 后再建中文子目录（受限环境实测 WinError 5），
+# 因此用单次 makedirs 直接创建多级目录。临时目录退出时自动删除。
+_TMP_BASE = os.path.join(ROOT, ".dsh_test_data_tmp")
+_TEST_DATA = os.path.join(_TMP_BASE, f"data_{os.getpid()}_{int(time.time() * 1000)}")
+os.environ["DSH_DATA_ROOT"] = _TEST_DATA
+for _sub in ("晚晚", "配置"), ("晚晚", "数据"), ("晚晚", "用量"), ("晚晚", "图片"):
+    os.makedirs(os.path.join(_TEST_DATA, *_sub), exist_ok=True)
+
+
+def _cleanup_test_data():
+    shutil.rmtree(_TEST_DATA, ignore_errors=True)
+    try:
+        os.rmdir(_TMP_BASE)  # 空则删，非空（残留）保留待查
+    except OSError:
+        pass
+
+
+atexit.register(_cleanup_test_data)
+
+# Windows 控制台默认 GBK：让 stdout/stderr 按 UTF-8 输出，
+# 否则结尾 print("全部通过 ✔") 会抛 UnicodeEncodeError 导致退出码 1（曾实测 5/5 通过却报失败）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import 路径  # noqa: E402
 

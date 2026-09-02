@@ -39,6 +39,8 @@ build/
 *.spec.bak
 _tmp/
 _MEI*
+# 测试数据隔离临时目录（测试/test_all.py 自建自清，异常退出可能残留）
+.dsh_test_data_tmp/
 
 # ============ 单实例锁 ============
 *.lock

@@ -3,7 +3,7 @@
 
 - 输入：当天 chat_history + 当日情绪标签 + 当日亲密度变化
 - 处理：DeepSeek 按人设写 ≤150 字第一人称日记
-- 存储：diary 表 + 写入长期记忆（用户 facts，供后续对话引用）
+- 存储：diary 表（每天一篇）
 """
 import json
 import logging
@@ -133,17 +133,6 @@ def _today_chat():
     return [(r["role"], r["content"]) for r in reversed(rows)]
 
 
-def _today_users():
-    import memory as longterm_memory
-    conn = longterm_memory._get_conn()
-    day = _target_day()
-    with longterm_memory._lock:
-        rows = conn.execute(
-            "SELECT DISTINCT user_id FROM chat_history WHERE date(created_at) = ?", (day,),
-        ).fetchall()
-    return [r["user_id"] for r in rows]
-
-
 async def generate_diary(llm_call):
     """生成当天日记并存储；llm_call 为 async (messages, **kw) -> str（传 bot._deepseek.chat）。"""
     chats = _today_chat()
@@ -185,13 +174,8 @@ async def generate_diary(llm_call):
     logger.info("日记已生成 %s（%d 字，情绪 %s，亲密度 +%d）",
                 day, len(content), tags, _today_affection_delta)
 
-    # 联动：写入长期记忆，供后续对话引用
-    try:
-        import memory as longterm_memory
-        for uid in _today_users():
-            longterm_memory.add_user_fact(uid, f"日记：{content}")
-    except Exception as e:
-        logger.warning("日记写入长期记忆失败: %s", e)
-
+    # 注意：这里刻意不把日记写入 user_memory —— user_memory 存的是"关于用户的事实"，
+    # 把 bot 的第一人称日记塞进去会以「关于用户的重要信息」注入 prompt，导致角色错乱，
+    # 且会污染当天所有活跃用户（曾实测 4 个用户同一时间出现同一条日记 fact）。
     reset_day()
     return content
