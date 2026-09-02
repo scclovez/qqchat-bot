@@ -78,6 +78,7 @@ GROWTH_HINTS = {
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的开放尺度",
     "days": "在一起第几天（从纪念日起始日期算起）",
+    "nickname": "她当前对你的称呼，随性格阶段与深度绑定细分变化：你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝",
     "state": "她此刻的状态（在睡觉 / 在画画 / 正在吃饭…）：剧情优先取最近对话里她自述的状态，没有则按时段兜底",
     "memory": "她长期记忆里关于你的事（提炼的事实 + 偏好数量）",
     "chats": "累计聊天的消息条数",
@@ -418,7 +419,7 @@ class MainWindow(QMainWindow):
             ("stage", "性格阶段", True), ("affection", "亲密度", True),
             ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True),
             ("lewdness", "淫乱度", True), ("days", "在一起", True),
-            ("state", "状态", True), ("memory", "记得你", True),
+            ("nickname", "称呼", True), ("state", "状态", True), ("memory", "记得你", True),
             ("chats", "聊天记录", True), ("mood", "今日情绪", False),
             ("mood_delta", "今日亲密度", False), ("mood_state", "今日心情", True),
         ]
@@ -1549,6 +1550,7 @@ class MainWindow(QMainWindow):
             j = pstate.get_jealousy()
             lv = pstate.get_lewdness()
             days = liveness.days_together()
+            nickname = liveness.nickname_for_stage(stage, pstate.sublevel_name())
             vals = {
                 "stage": pstate.stage_name(),
                 "affection": str(a),
@@ -1556,9 +1558,10 @@ class MainWindow(QMainWindow):
                 "jealousy": str(j),
                 "lewdness": f"{lv}（{pstate.lewdness_tier_name()}）",
                 "days": f"第 {days} 天",
+                "nickname": nickname,
             }
             boyfriend = str(_rt.PROACTIVE_ONLY_USER_ID or "").strip()
-            # 状态：替换原"称呼"（你/宝/老公）→ 她此刻在做什么（剧情优先 + 时段兜底）
+            # 状态：她此刻在做什么（剧情优先 + 时段兜底）
             vals["state"] = live_info.current_activity_for(boyfriend)
             tags = growth_diary.get_today_mood_tags()
             vals["mood"] = "、".join(str(t) for t in list(tags)[:6]) if tags else ""

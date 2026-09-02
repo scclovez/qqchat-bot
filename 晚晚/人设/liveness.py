@@ -279,16 +279,35 @@ def anniversary_years(start_date=None) -> int:
 # 8) 称呼随性格阶段
 # =============================================================================
 
+# 称呼随性格阶段（你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝）
 STAGE_NICKNAMES = {
-    1: "你",
-    2: "宝",
-    3: "老公",
+    1: ["你"],
+    2: ["宝"],
+    3: ["老公", "亲爱的"],
+}
+# 深度绑定期内部细分 → 更亲昵的称呼（每天固定一种，跨天自然换）
+NICKNAMES_SUBLEVEL = {
+    "深度绑定": ["老公", "亲爱的"],
+    "依恋": ["老公公", "亲爱的"],
+    "挚爱": ["达令", "我的宝"],
 }
 
 
-def nickname_for_stage(stage: int) -> str:
-    """按性格阶段返回对男友的称呼（1 礼貌试探→你 / 2 热情升温→宝 / 3 深度绑定→老公）。"""
-    return STAGE_NICKNAMES.get(int(stage or 1), "你")
+def nickname_for_stage(stage: int, sublevel: str = "") -> str:
+    """按性格阶段 + 深度绑定细分返回对男友的称呼。
+
+    1 礼貌试探→你；2 热情升温→宝；3 深度绑定按细分：
+    深度绑定→老公/亲爱的、依恋→老公公/亲爱的、挚爱→达令/我的宝。
+    同一天固定一个（避免一条条消息乱换称呼），跨天自然变化。
+    """
+    import random
+    from datetime import datetime
+    stage = int(stage or 1)
+    pool = STAGE_NICKNAMES.get(stage, ["你"])
+    if stage >= 3 and sublevel in NICKNAMES_SUBLEVEL:
+        pool = NICKNAMES_SUBLEVEL[sublevel]
+    seed = datetime.now().strftime("%Y%m%d") + sublevel + pool[0]
+    return random.Random(seed).choice(pool)
 
 
 # =============================================================================

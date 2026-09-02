@@ -746,10 +746,12 @@ class QQGirlfriendBot:
                     messages[0]["content"] += "\n（今天是他的生日！你要祝他生日快乐，语气甜甜的。）"
                 if len(raw_message) <= 4:
                     messages[0]["content"] += "\n（他这条回得很短，你也只回几个字，别发长消息。）"
-                # 称呼 → 状态：在性格阶段/活人感里展示她此刻在做什么（剧情优先 + 时段兜底）
+                # 称呼随性格阶段（你→宝→老公→老公公/亲爱的→达令/我的宝），同时展示她此刻的状态
+                _nick = liveness.nickname_for_stage(pstate.get_stage(), pstate.sublevel_name())
                 messages[0]["content"] += (
-                    f"\n（你此刻的状态：{self._current_activity(user_id)}。"
-                    "自然地让这个状态体现在你的言行、语气和回复节奏里，不要解释这段提示。）"
+                    f"\n（你习惯叫他：{_nick}。"
+                    f"你此刻的状态：{self._current_activity(user_id)}。"
+                    "自然地体现在你的言行、语气和回复节奏里，不要解释这段提示。）"
                 )
                 # 纪念日：在一起第 N 天（他问起时间/在一起多久时准确回答）
                 _days = liveness.days_together()
