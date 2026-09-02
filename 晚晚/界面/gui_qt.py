@@ -704,7 +704,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_assign_provider(self, cat, cb, mv):
-        """更换提供商：清空该模块的模型列表，回到"（提供商默认）"，并保存。"""
+        """更换提供商：清空该模块的模型列表，回到"（提供商默认）"，并自动拉取新供应商的模型。"""
         mv.blockSignals(True)
         try:
             mv.clear()
@@ -712,9 +712,14 @@ class MainWindow(QMainWindow):
         finally:
             mv.blockSignals(False)
         self._on_assign(cat, cb, mv)
+        # 自动填充该供应商的模型下拉（失败静默，按钮可手动刷新）
+        self._fill_assign_models(cat, cb, mv, silent=True)
 
-    def _fill_assign_models(self, cat, cb, mv):
-        """获取所选提供商 的模型列表，填充到该模块的模型下拉框。"""
+    def _fill_assign_models(self, cat, cb, mv, silent=False):
+        """获取所选提供商 的模型列表，填充到该模块的模型下拉框。
+
+        silent=True（自动触发）失败时静默，不给用户弹错；按钮点击时为 False，弹正确/错误提示。
+        """
         from llm_providers import load_providers, get_active_provider
         pid = cb.currentData() or ""
         try:
@@ -753,13 +758,14 @@ class MainWindow(QMainWindow):
                 models = asyncio.run(_run())
             except Exception as e:
                 err = str(e)
-            self._safe_after(0, lambda: self._on_assign_models_loaded(mv, models, err, name))
+            self._safe_after(0, lambda: self._on_assign_models_loaded(mv, models, err, name, silent))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_assign_models_loaded(self, mv, models, err, name):
+    def _on_assign_models_loaded(self, mv, models, err, name, silent=False):
         if not models:
-            QMessageBox.warning(self, "获取模型", f"{name}：{err or '未返回任何模型'}")
+            if not silent:
+                QMessageBox.warning(self, "获取模型", f"{name}：{err or '未返回任何模型'}")
             return
         cur = mv.currentText() or ""
         mv.blockSignals(True)
@@ -772,7 +778,8 @@ class MainWindow(QMainWindow):
                 mv.setCurrentText(cur)
         finally:
             mv.blockSignals(False)
-        QMessageBox.information(self, "模型列表", f"{name}：已获取 {len(models)} 个模型，可直接下拉选择")
+        if not silent:
+            QMessageBox.information(self, "模型列表", f"{name}：已获取 {len(models)} 个模型，可直接下拉选择")
 
     def _conn_row(self, label):
         """连接设置区一行：返回 (标签, 容器布局)。"""
