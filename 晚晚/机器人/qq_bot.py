@@ -2180,7 +2180,10 @@ class QQGirlfriendBot:
         if runtime.LIVENESS_ENABLED and msg_type == "private":
             cooldown *= liveness.activity_delay_factor(self._current_activity(user_id))
         if cooldown > 0:
-            await asyncio.sleep(cooldown)
+            if runtime.LIVENESS_ENABLED and msg_type == "private":
+                await self._simulate_typing(user_id, cooldown)
+            else:
+                await asyncio.sleep(cooldown)
         if force_voice:
             # 语音前的情感冗余：偶尔先发一句"算了，我还是说吧……"再发语音（犹豫感）
             if (runtime.LIVENESS_ENABLED and msg_type == "private"
@@ -3279,6 +3282,28 @@ class QQGirlfriendBot:
             })
         except Exception as e:
             logger.warning("设置输入状态失败: %s", e)
+
+    async def _simulate_typing(self, user_id, total):
+        """模拟真人打字曲线：正在输入→停顿(消失)→再打；偶尔"删了重打"。
+        避免输入状态一直亮到发完——真人会打一阵停一阵，甚至输入很久才发一小句。
+        """
+        if total <= 0:
+            return
+        await self._set_typing(user_id, 1)
+        el = 0.0
+        while el < total:
+            seg = min(random.uniform(1.0, 3.4), total - el)
+            await asyncio.sleep(seg)
+            el += seg
+            if el >= total:
+                break
+            # 打个招呼后停一下（输入消失一会儿），像在想/在删改
+            await self._set_typing(user_id, 2)
+            await asyncio.sleep(random.uniform(0.5, 1.7))
+            if el < total and random.random() < 0.7:
+                await self._set_typing(user_id, 1)
+        # 发送前保持"正在输入"（若中途没再开），发完由 _handle_message_inner 统一置停
+        await self._set_typing(user_id, 1)
 
     async def _api_call(self, action, params, retries=0, timeout=8.0):
         """调用 OneBot API。retries>0 时等待响应并重试（发送消息用 1 次重试）。

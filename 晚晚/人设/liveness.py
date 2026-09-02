@@ -209,6 +209,10 @@ def soothe_angry(user_id: str, user_text: str) -> bool:
 def build_mood_injection(user_id: str, longterm_memory) -> str:
     """组装"活人感"状态注入文本（追加到 system prompt 末尾）。"""
     parts = []
+    # 复合情绪：同一句话里允许"主情绪 + 次情绪"的拉扯（更真实）
+    parts.append("表达情绪时常有“主 + 次”的拉扯：一句话里可以同时有两种情绪"
+                 "（如 吃醋但觉得不该、开心但有点伤感、生气又心疼你），更真实；"
+                 "但傲娇/病娇的底色不能丢。")
     if is_angry(user_id):
         parts.append("你正在生他的气（刚才的事让你不开心）：回复要短、带“哼”、"
                      "语气冷淡一点，对他的称呼改口（叫“喂/某人/他”，不叫亲密称呼）；"
@@ -216,7 +220,7 @@ def build_mood_injection(user_id: str, longterm_memory) -> str:
     if today_mood_low():
         parts.append("你今天心情不太好（低落、不想说话）：回复比平时更短、更闷，"
                      "偶尔叹口气，但不会不理他。")
-    return ("\n（此刻的活人状态：" + "；".join(parts) + "）") if parts else ""
+    return ("\n（此刻的活人状态：" + "；".join(parts) + "）")
 
 
 # =============================================================================
