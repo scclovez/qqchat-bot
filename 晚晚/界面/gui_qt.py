@@ -1754,7 +1754,7 @@ class MainWindow(QMainWindow):
             return {}
         hist = "\n".join(f"{'我' if r['role'] == 'user' else '她'}: {r['content']}" for r in rows)
         prompt = (
-            "你是小晚的成长记录助手。下面是今天她和男朋友最近的聊天记录（节选）。\n"
+            f"你是{runtime.GIRLFRIEND_NAME}的成长记录助手。下面是今天她和男朋友最近的聊天记录（节选）。\n"
             "请提炼她今天的状态，只返回一段 JSON，字段如下：\n"
             '{"mood":"她此刻的情绪(2-4字，如 开心/撒娇/疲惫/委屈，没明确则给 平静)",'
             '"state":"她此刻在做什么(如 在休息/在床上/刚忙完，基于最近对话，不要虚构时间与地点)",'
@@ -1767,7 +1767,7 @@ class MainWindow(QMainWindow):
             client = DeepSeekClient()
             try:
                 return await client.chat(
-                    [{"role": "system", "content": "你是小晚的成长记录助理，只回 JSON。"},
+                    [{"role": "system", "content": f"你是{runtime.GIRLFRIEND_NAME}的成长记录助理，只回 JSON。"},
                      {"role": "user", "content": prompt}],
                     temperature=0.3, max_tokens=240, disable_thinking=True,
                 )
