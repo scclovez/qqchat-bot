@@ -96,7 +96,11 @@ async def generate(workflow_file: str, prompt: str, base_url: str = "http://127.
     import httpx
     base = base_url.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # trust_env=False：强制直连本地 ComfyUI，不走系统代理。
+        # 症状：开着 Clash 等系统代理时，httpx 把 127.0.0.1:8188 也丢给代理
+        # （httpx 用 getproxies() 读代理，但不尊重 ProxyOverride 里的 127.* 绕过列表），
+        # 代理转发到远端连不回本机 → POST /prompt 恒 502，GET 却正常。
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False) as client:
             r = await _post_prompt(client, base, workflow)
             if r is None:
                 return ""
