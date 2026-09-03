@@ -23,6 +23,39 @@ SAVE_DIR = data_path("晚晚", "图片", "生成图片")
 # 生成图片目录保留上限：超出后删除最旧的 comfy_* 文件（控制磁盘占用）
 MAX_SAVED_IMAGES = 200
 
+# 提交瞬时失败自动重试：ComfyUI 忙（正在跑长任务/视频生成）时 /prompt 可能短暂 5xx/无响应，
+# 一次失败就放弃会让 bot 白白道歉。共尝试 MAX_POST_RETRIES+1 次，间隔递增。
+MAX_POST_RETRIES = 2
+POST_RETRY_DELAYS = (3.0, 6.0)
+
+
+async def _post_prompt(client, base: str, workflow: dict):
+    """提交工作流到 /prompt；5xx/429/网络异常自动重试，4xx 直接返回（工作流本身问题，重试无意义）。
+
+    返回: 成功时的 httpx.Response（status 200）；重试耗尽返回 None。
+    """
+    last_err = ""
+    for i in range(MAX_POST_RETRIES + 1):
+        try:
+            r = await client.post(f"{base}/prompt", json={"prompt": workflow})
+            if r.status_code == 200:
+                return r
+            if r.status_code < 500 and r.status_code != 429:
+                logger.error("ComfyUI 提交被拒（工作流问题，不重试）%s: %s",
+                             r.status_code, r.text[:300])
+                return r  # 4xx：工作流校验失败，重试无用，原样交回上层报错
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            logger.warning("ComfyUI 提交返回 %s（第 %d/%d 次）: %s",
+                           r.status_code, i + 1, MAX_POST_RETRIES + 1, r.text[:100])
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            logger.warning("ComfyUI 提交网络异常（第 %d/%d 次）: %s",
+                           i + 1, MAX_POST_RETRIES + 1, e)
+        if i < MAX_POST_RETRIES:
+            await asyncio.sleep(POST_RETRY_DELAYS[min(i, len(POST_RETRY_DELAYS) - 1)])
+    logger.error("ComfyUI 提交失败（已重试 %d 次仍失败）: %s", MAX_POST_RETRIES, last_err)
+    return None
+
 
 def _prune_save_dir():
     """删除 生成图片 目录中最旧的 comfy_* 文件，保持目录规模受控。"""
@@ -64,9 +97,8 @@ async def generate(workflow_file: str, prompt: str, base_url: str = "http://127.
     base = base_url.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.post(f"{base}/prompt", json={"prompt": workflow})
-            if r.status_code != 200:
-                logger.error("ComfyUI 提交失败 %s: %s", r.status_code, r.text[:300])
+            r = await _post_prompt(client, base, workflow)
+            if r is None:
                 return ""
             prompt_id = (r.json() or {}).get("prompt_id")
             if not prompt_id:
@@ -74,7 +106,10 @@ async def generate(workflow_file: str, prompt: str, base_url: str = "http://127.
                 return ""
             for _ in range(max(1, int(timeout // 2))):
                 await asyncio.sleep(2)
-                hr = await client.get(f"{base}/history/{prompt_id}")
+                try:
+                    hr = await client.get(f"{base}/history/{prompt_id}")
+                except Exception:
+                    continue  # 轮询瞬时网络抖动：跳过本次，继续等
                 if hr.status_code != 200:
                     continue
                 hist = (hr.json() or {}).get(prompt_id) or {}
