@@ -134,22 +134,31 @@ def init_db(db_path: str | None = None):
 
 
 def prune_chat_history(keep_per_user: int = CHAT_HISTORY_KEEP_PER_USER):
-    """删除每个用户超出保留上限的最旧聊天记录；启动时调用一次。"""
+    """删除每个用户超出保留上限、且**已提炼过**的最旧聊天记录；启动时调用一次。
+
+    只删 id <= 该用户 memory_checkpoint.last_processed_chat_id 的记录：
+    未提炼（checkpoint 之后）的消息是"待提炼原料"，绝不裁剪，
+    否则提炼失败/停摆期间积压超过上限会被静默删除 → 记忆丢失（不变量：每条消息必被提炼一次）。
+    """
     conn = _get_conn()
     try:
         with _lock:
             conn.execute(
                 """DELETE FROM chat_history WHERE id IN (
                        SELECT id FROM (
-                           SELECT id, ROW_NUMBER() OVER (
-                               PARTITION BY user_id ORDER BY id DESC
-                           ) AS rn FROM chat_history
-                       ) WHERE rn > ?
+                           SELECT h.id,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY h.user_id ORDER BY h.id DESC
+                                  ) AS rn,
+                                  COALESCE(mc.last_processed_chat_id, 0) AS cp
+                           FROM chat_history h
+                           LEFT JOIN memory_checkpoint mc ON mc.user_id = h.user_id
+                       ) WHERE rn > ? AND id <= cp
                    )""",
                 (keep_per_user,),
             )
             conn.commit()
-            logger.info("聊天记录已按每用户 %d 条上限清理", keep_per_user)
+            logger.info("聊天记录已按每用户 %d 条上限清理（仅删已提炼记录）", keep_per_user)
     except Exception as e:
         logger.warning("聊天记录清理失败: %s", e)
 

@@ -388,6 +388,12 @@ class QQGirlfriendBot:
         self._running = False
         self._echo_counter = 0
         self._locks = {}
+        self._media_locks = {}  # user_id -> asyncio.Lock：图片/自拍等慢任务串行（防同用户并发双生图扣费）
+        # 自动插图（"我画了X/给你看X"）频控：每用户每日生成上限 + 同主题短时去重
+        # （真人不会一天画几十张给同一个人看；也防模型回复反复带出同一句"我画了X"触发刷图）
+        self._auto_draw_day = {}  # user_id -> "YYYY-MM-DD"
+        self._auto_draw_count = {}  # user_id -> 当日已自动插图张数
+        self._auto_draw_last_subject = {}  # user_id -> (subject, 时间戳)
         self._proactive_task = None
         self._last_user_msg = {}  # user_id -> 最后一条用户消息时间戳（主动消息防打扰用）
         self._last_outgoing = {}  # user_id -> 我最后一次发出的消息时间戳（空闲碎碎念/沉默判断用）
@@ -421,6 +427,17 @@ class QQGirlfriendBot:
         if user_id not in self._locks:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
+
+    def _get_media_lock(self, user_id):
+        """图片/自拍等慢任务专用锁（与文本回复锁分开）：
+
+        文本回复（_get_lock）控制同一用户消息按序处理；图片分支在文本锁之外
+        （避免慢任务阻塞聊天），但同用户的两个图片请求若不互斥会并发触发两次
+        生图/扣费 → 这里用独立的媒体锁把同用户的慢任务串行化。
+        """
+        if user_id not in self._media_locks:
+            self._media_locks[user_id] = asyncio.Lock()
+        return self._media_locks[user_id]
 
     @staticmethod
     def _sync_llm_bridge(messages, temperature=None, max_tokens=None):
@@ -609,6 +626,12 @@ class QQGirlfriendBot:
         # 记录机器人自己的 QQ 号（空间功能排除自己用）
         if data.get("self_id"):
             self._self_id = str(data.get("self_id"))
+        # 自消息回环防护：机器人自己发出去的消息被 NapCat 回推（自身消息回传/群回传开启时）
+        # 会以 user_id == self_id 重新进入本函数 → 自问自答死循环、无限烧 API。
+        # 一旦识别出是自己 → 直接丢弃（不做任何记录/回复）。
+        if self._self_id and user_id == self._self_id:
+            logger.debug("收到机器人自身消息（self_id=%s），跳过防回环", self._self_id)
+            return
         # 私聊：显示"对方正在输入"（set_input_status，仅 C2C；固定开启，真人感）
         if msg_type == "private":
             await self._set_typing(user_id, 1)
@@ -668,6 +691,7 @@ class QQGirlfriendBot:
         music_share = self._extract_music_share(data)
         if music_share:
             await self._handle_music_share(msg_type, target_id, user_id, message_id, music_share)
+            await self._finish_typing(msg_type, user_id)
             return
         # 晚安静默：用户道晚安 → 记录时间，之后 NIGHT_SILENCE_HOURS 小时内
         # 不主动发消息/撩人/追问（模拟真人已睡）；被动的回复不受影响
@@ -704,19 +728,26 @@ class QQGirlfriendBot:
             await self._reply_split(msg_type, target_id, user_id, message_id, reply, force_voice=False)
             self._memory.add_message(user_id, "assistant", reply)
             longterm_memory.add_chat_history(user_id, "assistant", reply)
+            await self._finish_typing(msg_type, user_id)
             return
         # 图片生成：用户想看bot长相 → 按外貌设定生成自拍；说"画一张xxx"→ 按描述生成
         if runtime.IMAGE_GEN_ENABLED:
-            # 空间图请求优先：涉及"空间发的那张图"时先拉空间取图再基于内容生成
-            if self._is_qzone_image_request(raw_message):
-                await self._handle_qzone_image_request(msg_type, target_id, user_id, raw_message)
-                return
-            if self._is_selfie_query(raw_message):
-                await self._handle_selfie(msg_type, target_id, user_id, raw_message)
-                return
-            if self._is_image_gen_query(raw_message):
-                await self._handle_image_gen(msg_type, target_id, user_id, raw_message)
-                return
+            # 慢任务媒体锁：同用户的图片请求串行处理，防止两条消息并发触发
+            # 两次生图/扣费（图片分支不占文本回复锁，慢任务不阻塞聊天）
+            async with self._get_media_lock(user_id):
+                # 空间图请求优先：涉及"空间发的那张图"时先拉空间取图再基于内容生成
+                if self._is_qzone_image_request(raw_message):
+                    await self._handle_qzone_image_request(msg_type, target_id, user_id, raw_message)
+                    await self._finish_typing(msg_type, user_id)
+                    return
+                if self._is_selfie_query(raw_message):
+                    await self._handle_selfie(msg_type, target_id, user_id, raw_message)
+                    await self._finish_typing(msg_type, user_id)
+                    return
+                if self._is_image_gen_query(raw_message):
+                    await self._handle_image_gen(msg_type, target_id, user_id, raw_message)
+                    await self._finish_typing(msg_type, user_id)
+                    return
         lock = self._get_lock(user_id)
         async with lock:
             await self._memory.compress(user_id, self._deepseek)
@@ -1235,27 +1266,12 @@ class QQGirlfriendBot:
                 logger.warning("读取本地图片失败 %s: %s", local, e)
 
         # 2) 外部 URL（模型也能直接收 URL，但 base64 更稳）
+        # 走 live_info.download_bytes_safe：重定向逐跳校验主机（防 SSRF 跳内网）
         if url and url.startswith(("http://", "https://")):
             try:
-                host = (url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]).lower()
-                if self._is_private_host(host):
-                    logger.warning("拒绝下载内网/回环地址: %s", url)
-                    return None, None
-                import httpx
-                async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                    async with client.stream("GET", url) as resp:
-                        if resp.status_code != 200:
-                            logger.warning("下载图片 URL HTTP %s: %s", resp.status_code, url)
-                            return None, None
-                        content = b""
-                        async for chunk in resp.aiter_bytes():
-                            content += chunk
-                            if len(content) > max_bytes:
-                                logger.warning("图片 URL 过大，中止下载: %s", url)
-                                return None, None
-                        if content:
-                            mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-                            return base64.b64encode(content).decode("ascii"), mime
+                content, mime = await live_info.download_bytes_safe(url, max_bytes=max_bytes)
+                if content:
+                    return base64.b64encode(content).decode("ascii"), mime or self._guess_mime(url)
             except Exception as e:
                 logger.warning("下载图片 URL 失败: %s", e)
 
@@ -1534,13 +1550,12 @@ class QQGirlfriendBot:
             except OSError as e:
                 logger.warning("读取图片失败 %s: %s", path_or_url, e)
         elif path_or_url.startswith(("http://", "https://")):
+            # 走安全下载：重定向逐跳校验主机，防 SSRF 跳进内网
             try:
-                import httpx
-                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                    resp = await client.get(path_or_url)
-                    if resp.status_code == 200 and resp.content:
-                        mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-                        return base64.b64encode(resp.content).decode("ascii"), mime
+                content, mime = await live_info.download_bytes_safe(
+                    path_or_url, max_bytes=25 * 1024 * 1024, timeout=30)
+                if content:
+                    return base64.b64encode(content).decode("ascii"), mime or self._guess_mime(path_or_url)
             except Exception as e:
                 logger.warning("下载图片失败: %s", e)
         return None, None
@@ -1692,7 +1707,7 @@ class QQGirlfriendBot:
 
     @staticmethod
     def _is_her_subject(text):
-        """判断画面主体是否为"bot本人"（而非画别的东西）。
+        """判断画面主体是否为"她本人"（而非画别的东西）。
 
         注意"我的X"（我的午饭/我的猫/我的画）：主体是 X，不是本人自拍；
         只有明确描述"她本人状态"（我在/我穿/我坐…）或"我的样子/自拍"才算自拍。
@@ -1700,9 +1715,16 @@ class QQGirlfriendBot:
         但明显的"东西"描述（一只/一杯/桌上/窗外/一条裙子…）即使含外观词也是物品。
         """
         t = (text or "").strip()
-        keys = ("bot", "晚晚", "自拍", "我本人", "你本人", "她本人",
+        # 名字识别用配置的人设名（GUI 可改）+ 常见称呼兜底，避免硬编码旧名
+        try:
+            from config import runtime as _rt
+            name = str(getattr(_rt, "GIRLFRIEND_NAME", "") or "").strip()
+        except Exception:
+            name = ""
+        keys = (name, "晚晚", "自拍", "我本人", "你本人", "她本人",
                 "我在", "你在", "我穿", "你穿", "我站", "你站", "我坐", "你坐",
                 "我扎", "你扎", "我戴", "你戴", "我抱", "你抱", "我的样子", "你的样子")
+        keys = tuple(k for k in keys if k)  # 去掉空名
         if any(k in t for k in keys) or t in ("我", "你", "她"):
             return True
         # "我的X"开头：主体是 X（我的午饭/我的画/我的猫），不是本人自拍
@@ -1855,7 +1877,6 @@ class QQGirlfriendBot:
             return requirement
 
     @staticmethod
-    @staticmethod
     def _extract_illustration_tag(text):
         """从回复文本里提取配图描述（【插图：X】或"照片内容：X/图片内容：X"）。
 
@@ -1926,7 +1947,13 @@ class QQGirlfriendBot:
         )
 
     async def _maybe_send_draw_image(self, msg_type, target_id, user_id, reply_text):
-        """回复里提到"我画了X"/"给你看X"时，生成 X 的图片发过去（美术系女友发图场景）。"""
+        """回复里提到"我画了X"/"给你看X"时，生成 X 的图片发过去（美术系女友发图场景）。
+
+        频控（与 _maybe_send_illustration 一致的三重保护，防云端生图成本失控/刷屏）：
+        1. 概率门控：复用 AUTO_ILLUSTRATE_PROBABILITY（模型"说画了" ≠ 真画）
+        2. 每用户每日自动插图上限（DRAW_IMAGE_DAILY_MAX）
+        3. 同主题短时间去重（60 秒内同一主题只发一次）
+        """
         if not runtime.IMAGE_GEN_ENABLED:
             return
         subject = self._extract_draw_subject(reply_text)
@@ -1939,6 +1966,28 @@ class QQGirlfriendBot:
         if self._is_her_subject(subject):
             logger.info("自动插图命中本人主题，跳过（避免未经指定生成她的照片）: %s", subject)
             return False
+        # 频控 1：概率门控（与自动配图一致；0=关闭自动画图）
+        prob = float(getattr(runtime, "AUTO_ILLUSTRATE_PROBABILITY", AUTO_ILLUSTRATE_PROBABILITY) or 0)
+        if prob <= 0 or random.random() > prob:
+            logger.info("自动画图未达概率（%.0f%%），跳过 [%s]: %s",
+                        prob * 100, user_id, subject[:30])
+            return False
+        # 频控 2：每用户每日上限
+        today = time.strftime("%Y-%m-%d")
+        if self._auto_draw_day.get(user_id) != today:
+            self._auto_draw_day[user_id] = today
+            self._auto_draw_count[user_id] = 0
+        if self._auto_draw_count.get(user_id, 0) >= liveness.DRAW_IMAGE_DAILY_MAX:
+            logger.info("自动画图已达今日上限（%d 张），跳过 [%s]: %s",
+                        liveness.DRAW_IMAGE_DAILY_MAX, user_id, subject[:30])
+            return False
+        # 频控 3：同主题 60 秒内去重（模型连续两句"我画了同一张"只发一次）
+        last_subj, last_ts = self._auto_draw_last_subject.get(user_id, ("", 0))
+        if last_subj == subject and time.time() - last_ts < 60:
+            logger.info("自动画图同主题 60s 内重复，跳过 [%s]: %s", user_id, subject[:30])
+            return False
+        self._auto_draw_last_subject[user_id] = (subject, time.time())
+        self._auto_draw_count[user_id] = self._auto_draw_count.get(user_id, 0) + 1
         return await self._generate_and_send_image(
             msg_type, target_id, user_id, subject,
             random.choice(FAIL_DRAW),
@@ -2156,7 +2205,13 @@ class QQGirlfriendBot:
         for seg in data.get("message", []):
             if seg.get("type") == "at" and str(seg.get("data", {}).get("qq", "")) == self_id:
                 return True
-        return "bot" in data.get("raw_message", "")
+        # 文本提及检测：用配置的人设名（GUI 可改）+ 常见称呼兜底，
+        # 避免硬编码旧名导致用户改名后群里喊她新名字不触发
+        raw = data.get("raw_message", "")
+        names = {str(getattr(runtime, "GIRLFRIEND_NAME", "") or "").strip(), "晚晚"}
+        names.discard("")
+        names.add(runtime.GIRLFRIEND_NAME)  # 若 runtime 名恰为空不生效，用上面的兜底
+        return any(n and n in raw for n in names)
 
     async def _reply_split(self, msg_type, target_id, user_id, message_id, text,
                            force_voice=None, dual_voice=False):
@@ -3302,6 +3357,19 @@ class QQGirlfriendBot:
         except Exception as e:
             logger.warning("设置输入状态失败: %s", e)
 
+    async def _finish_typing(self, msg_type, user_id):
+        """提前 return 分支的收尾：私聊时发"停止输入"。
+
+        收到消息时统一置为"正在输入"（_handle_message_inner 开头），
+        正常文本路径在回复发完后置停；而记住/音乐/图片等提前 return 的
+        分支若不停，对方会一直看到"正在输入"直到下一条消息。这里兜底置停。
+        """
+        if msg_type == "private":
+            try:
+                await self._set_typing(user_id, 2)
+            except Exception:
+                pass
+
     async def _simulate_typing(self, user_id, total):
         """模拟真人打字曲线：正在输入→停顿(消失)→再打；偶尔"删了重打"。
         避免输入状态一直亮到发完——真人会打一阵停一阵，甚至输入很久才发一小句。
@@ -3379,7 +3447,22 @@ class QQGirlfriendBot:
         req_type = data.get("request_type", "")
         flag = data.get("flag", "")
         if req_type == "friend" and flag:
+            uid = str(data.get("user_id") or "")
+            # 好友申请白名单（FRIEND_APPROVE_UIDS，逗号分隔）：
+            # 留空 = 拒绝所有好友申请（隐私安全默认，防陌生人长期私聊暴露人设/烧 API）；
+            # 配置了名单则只自动同意名单内的 QQ。无自动同意功能时由用户手动在 QQ 处理。
+            allow_raw = str(getattr(runtime, "FRIEND_APPROVE_UIDS", "") or "").strip()
+            allow = {u.strip() for u in allow_raw.split(",") if u.strip()}
+            if not allow:
+                logger.warning("好友申请被拒绝（未配置 FRIEND_APPROVE_UIDS 白名单）: %s", uid)
+                return
+            if uid not in allow:
+                logger.warning("好友申请被拒绝（不在白名单）: %s", uid)
+                await self._api_call("set_friend_add_request", {
+                    "flag": flag, "approve": False, "remark": "",
+                })
+                return
             await self._api_call("set_friend_add_request", {
                 "flag": flag, "approve": True, "remark": "男朋友",
             })
-            logger.info("已自动同意好友请求: %s", data.get("user_id"))
+            logger.info("已自动同意白名单好友请求: %s", uid)

@@ -186,15 +186,13 @@ async def _vision_describe(llm_chat, image_path_or_url: str, prompt_text: str) -
     """
     try:
         import base64
-        import httpx
         if image_path_or_url.startswith(("http://", "https://")):
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                r = await client.get(image_path_or_url)
-                if r.status_code != 200:
-                    logger.warning("视觉识别图片下载失败 HTTP %s", r.status_code)
-                    return ""
-                raw = r.content
-                mime = r.headers.get("content-type", "image/jpeg").split(";")[0]
+            # 走安全下载：重定向逐跳校验主机（防 SSRF）+ 25MB 大小上限（防内存峰值）
+            from live_info import download_bytes_safe
+            raw, mime = await download_bytes_safe(image_path_or_url, max_bytes=25 * 1024 * 1024, timeout=20)
+            if raw is None:
+                logger.warning("视觉识别图片下载失败/被拦截: %s", image_path_or_url[:120])
+                return ""
         else:
             if not os.path.isfile(image_path_or_url):
                 return ""
@@ -521,8 +519,13 @@ async def reply_new_comments(api_call, llm_chat, self_uin, boyfriend_uin=""):
                 if not reply:
                     continue
                 # 评论自己的说说：显式传 target_uin=自己（说说主人），避免 CGI 缺参
-                await api_call("comment_qzone", {"tid": tid, "content": reply,
-                                                 "target_uin": str(self_uin or "")})
+                resp = await api_call("comment_qzone", {"tid": tid, "content": reply,
+                                                        "target_uin": str(self_uin or "")})
+                # 只在真正成功后标记已处理：失败不 mark，下轮重试（防永久漏回复）
+                if resp is None or resp.get("status") == "failed" \
+                        or resp.get("retcode") not in (None, 0):
+                    logger.warning("回复空间评论失败（不标记已处理，稍后重试）: %s", tid)
+                    continue
                 mark_processed(KIND_COMMENT_REPLIED, dedup_key)
                 replied += 1
                 logger.info("已回复空间评论 [%s]: %s -> %s", uin, content[:20], reply[:30])
@@ -573,10 +576,15 @@ async def like_and_comment_feeds(api_call, llm_chat, self_uin, boyfriend_uin="")
         try:
             # 点赞（总是做，去重）
             if not is_processed(KIND_FEED_LIKED, key):
-                await api_call("like_qzone", {"tid": key, "target_uin": uin})
-                mark_processed(KIND_FEED_LIKED, key)
-                liked += 1
-                await asyncio.sleep(_gap())
+                resp = await api_call("like_qzone", {"tid": key, "target_uin": uin})
+                # 失败不 mark：下轮重试（防失败被记"已点赞"导致永久漏赞）
+                if resp is None or resp.get("status") == "failed" \
+                        or resp.get("retcode") not in (None, 0):
+                    logger.warning("点赞动态失败（不标记已处理，稍后重试）: %s", key)
+                else:
+                    mark_processed(KIND_FEED_LIKED, key)
+                    liked += 1
+                    await asyncio.sleep(_gap())
             # 评论（按概率，去重）
             if (not is_processed(KIND_FEED_COMMENTED, key)
                     and random.random() < _feed_comment_prob()):
@@ -611,8 +619,13 @@ async def like_and_comment_feeds(api_call, llm_chat, self_uin, boyfriend_uin="")
                     if comment:
                         # 评论好友动态必须带 target_uin=好友 uin（说说主人），
                         # 缺参会报 retcode=100（SnowLuma CGI 需 hostuin 定位说说）
-                        await api_call("comment_qzone", {"tid": key, "content": comment,
-                                                         "target_uin": uin})
+                        resp = await api_call("comment_qzone", {"tid": key, "content": comment,
+                                                               "target_uin": uin})
+                        # 失败不 mark：下轮重试（防失败被记"已评论"导致永久漏评）
+                        if resp is None or resp.get("status") == "failed" \
+                                or resp.get("retcode") not in (None, 0):
+                            logger.warning("评论动态失败（不标记已处理，稍后重试）: %s", key)
+                            continue
                         mark_processed(KIND_FEED_COMMENTED, key)
                         commented += 1
                         logger.info("已评论好友动态 [%s]: %s", uin, comment[:30])

@@ -13,6 +13,42 @@ if not os.path.isfile(_env_file):
     _env_file = code_path("晚晚", "配置", ".env")  # 兜底：打包资源里的初始 .env
 load_dotenv(_env_file)
 
+
+def env_file_path() -> str:
+    """当前生效的 .env 文件路径（可能不存在：开发版纯净无 .env）。"""
+    return _env_file
+
+
+def save_env_overrides(overrides: dict) -> bool:
+    """把 GUI 连接页的 Key/URL/模型等覆盖项写回 .env（**仅当 .env 已存在**）。
+
+    返回是否真的写入（.env 不存在时返回 False，调用方据此提示用户手动建 .env）。
+    空值/None 跳过（不清空已有 Key）；写入后同步更新内存 config 属性立即生效。
+    """
+    if not os.path.isfile(_env_file):
+        logger.info("未找到 .env（%s），跳过写回；需先复制 .env.example 为 .env", _env_file)
+        return False
+    from dotenv import set_key
+    changed = 0
+    for key, value in (overrides or {}).items():
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            # 默认 quote_mode=always：值含 # / 空格等特殊字符时加引号，避免被当注释截断
+            set_key(_env_file, key, str(value).strip())
+            changed += 1
+        except Exception as e:
+            logger.warning("写入 .env 失败 [%s]: %s", key, e)
+    # 同步内存：新值立即生效（无需重启）；仅当目标是 Config 类字段时覆盖，
+    # 其余键（运行时环境变量）不在此列。
+    for key, value in (overrides or {}).items():
+        if value is None or str(value).strip() == "":
+            continue
+        if hasattr(Config, key):
+            setattr(config, key, str(value).strip())
+    logger.info("已写回 %d 项连接设置到 .env", changed)
+    return True
+
 RUNTIME_CONFIG_FILE = data_path("晚晚", "配置", ".runtime_config.json")
 
 # 字段类型定义：int / float / str
@@ -50,6 +86,7 @@ _FIELD_TYPES = {
     "GIRLFRIEND_CONSTRAINTS": str,
     "GIRLFRIEND_SCENARIO": str,
     "APPEARANCE_REF_DIR": str,
+    "FRIEND_APPROVE_UIDS": str,
 }
 
 
@@ -109,6 +146,9 @@ class RuntimeConfig:
     PROACTIVE_GAP_MIN: int = 10  # 用户最近 GAP_MIN 分钟内发过消息则跳过，避免打扰
     # 只对指定 QQ 号发主动消息（主动消息/撩人/追问）；留空 = 不限（对所有用户）
     PROACTIVE_ONLY_USER_ID: str = ""
+    # 好友申请白名单：允许自动同意加好友的 QQ 号（逗号分隔，如 "10001,10002"）。
+    # 留空 = 拒绝所有好友申请（防陌生人私聊骚扰/偷看人设，隐私安全默认值）
+    FRIEND_APPROVE_UIDS: str = ""
     # 未回复追问：主动发消息后，对方长时间没回时按病娇傲娇人设追一句（真人感）
     PROACTIVE_FOLLOWUP_ENABLED: int = 1
     PROACTIVE_FOLLOWUP_HOURS: float = 2.0  # 多久没回复（小时）触发追问
@@ -182,6 +222,7 @@ class RuntimeConfig:
         "STICKER_PROBABILITY", "STICKER_DIR",
         "PROACTIVE_INTERVAL_MIN", "PROACTIVE_INTERVAL_MAX",
         "PROACTIVE_PROBABILITY", "PROACTIVE_GAP_MIN", "PROACTIVE_ONLY_USER_ID",
+        "FRIEND_APPROVE_UIDS",
         "PROACTIVE_FOLLOWUP_HOURS",
         "PROACTIVE_FOLLOWUP_MAX", "NIGHT_SILENCE_HOURS",
         "QZONE_SELF_UIN", "QZONE_FEED_COMMENT_PROB",

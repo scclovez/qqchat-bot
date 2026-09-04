@@ -249,14 +249,19 @@ def _today_str() -> str:
 
 
 def _today_chat_stats() -> dict:
-    """今日（本地日期）聊天统计：句数/字数/最长一句/提到名字/最后时间/谁先开口。"""
+    """今日（本地日期）聊天统计：句数/字数/最长一句/提到名字/最后时间/谁先开口。
+
+    chat_history.created_at 存 UTC → 必须用 date(created_at, 'localtime') 转本地，
+    否则凌晨 0-8 点的消息不计入"今天"（8 小时时区偏移）。
+    """
     import memory as longterm_memory
     try:
         conn = longterm_memory._get_conn()
         day = _today_str()
         with longterm_memory._lock:
             rows = conn.execute(
-                "SELECT role, content, created_at FROM chat_history WHERE date(created_at) = ? ORDER BY id",
+                "SELECT role, content, datetime(created_at, 'localtime') AS created_at "
+                "FROM chat_history WHERE date(created_at, 'localtime') = ? ORDER BY id",
                 (day,),
             ).fetchall()
     except Exception:
@@ -286,12 +291,18 @@ def _today_chat_stats() -> dict:
 
 
 def _last_msg_days() -> int:
-    """距最近一条消息过去的天数；无记录返回 99。"""
+    """距最近一条消息过去的天数；无记录返回 99。
+
+    created_at 存 UTC → 用 datetime(created_at, 'localtime') 转本地再与 now 相减，
+    否则会差 8 小时导致"几天没聊"判断偏移一天。
+    """
     try:
         import memory as longterm_memory
         conn = longterm_memory._get_conn()
         with longterm_memory._lock:
-            row = conn.execute("SELECT MAX(created_at) AS last FROM chat_history").fetchone()
+            row = conn.execute(
+                "SELECT MAX(datetime(created_at, 'localtime')) AS last FROM chat_history",
+            ).fetchone()
         last = row["last"] or ""
     except Exception:
         return 99
@@ -329,7 +340,8 @@ def current_mood(user_id: str = "") -> str:
         conn = longterm_memory._get_conn()
         with longterm_memory._lock:
             rows = conn.execute(
-                "SELECT content FROM chat_history WHERE date(created_at) = ? AND role='assistant' "
+                "SELECT content FROM chat_history "
+                "WHERE date(created_at, 'localtime') = ? AND role='assistant' "
                 "ORDER BY id DESC LIMIT 60",
                 (_today_str(),),
             ).fetchall()

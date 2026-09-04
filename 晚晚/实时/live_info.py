@@ -267,3 +267,73 @@ async def web_search(query: str, timeout: float = 8.0) -> str:
     except Exception as e:
         logger.warning("联网搜索失败: %s", e)
         return ""
+
+
+# =============================================================================
+# 安全下载：逐跳校验主机，防 SSRF（防止重定向跳进内网/回环地址）
+# =============================================================================
+
+def _host_is_private(url: str) -> bool:
+    """URL 主机是否为内网/回环地址；域名返回 False（不拦截，QQ 图片 CDN 都是域名）。
+
+    与 qq_bot._is_private_host 同策略，独立实现以免循环导入。
+    """
+    try:
+        import ipaddress
+        from urllib.parse import urlparse
+        host = (urlparse(url).netloc or "").split("@")[-1]
+        # 剥掉端口（IPv6 中括号形式如 [::1]:8080 单独处理）
+        if host.startswith("["):
+            host = host.split("]")[0].lstrip("[")
+        else:
+            host = host.split(":", 1)[0]
+        ip = ipaddress.ip_address(host)
+        return (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    except ValueError:
+        return False  # 域名：不拦截
+    except Exception:
+        return True
+
+
+async def download_bytes_safe(url: str, max_bytes: int = 25 * 1024 * 1024,
+                              timeout: float = 20.0) -> tuple:
+    """下载 URL 二进制内容，重定向**逐跳**校验目标主机（防 SSRF）。
+
+    - 手动处理重定向（最多 5 跳），每跳都校验主机不是内网/回环
+    - 超过 max_bytes 中止（防内存峰值/恶意大文件）
+    返回 (bytes, mime)；失败/被拦截返回 (None, None)。
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return None, None
+    import httpx
+    from urllib.parse import urljoin
+    cur = url
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
+                                     headers={"User-Agent": _UA}) as client:
+            for _hop in range(6):  # 原地址 + 最多 5 次重定向
+                if _host_is_private(cur):
+                    logger.warning("拒绝下载内网/回环地址: %s", cur)
+                    return None, None
+                async with client.stream("GET", cur) as resp:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        loc = resp.headers.get("location")
+                        if not loc:
+                            return None, None
+                        cur = urljoin(cur, loc)  # 下一跳继续校验
+                        continue
+                    if resp.status_code != 200:
+                        logger.warning("下载 URL HTTP %s: %s", resp.status_code, cur)
+                        return None, None
+                    content = b""
+                    async for chunk in resp.aiter_bytes():
+                        content += chunk
+                        if len(content) > max_bytes:
+                            logger.warning("下载 URL 过大，中止: %s", cur)
+                            return None, None
+                    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+                    return content, mime if content else (None, None)
+    except Exception as e:
+        logger.warning("下载 URL 失败: %s", e)
+    return None, None

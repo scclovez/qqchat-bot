@@ -121,7 +121,9 @@ async def run_daily_evolution(llm_call):
     except Exception as e:
         logger.warning("读取目标日日记失败（跳过日记部分）: %s", e)
 
-    tags = growth_diary.get_today_mood_tags()
+    # 目标日情绪标签：凌晨演化总结"昨天"，标签必须取昨天行（昨天白天 add_* 已持久化），
+    # 不能用 get_today_mood_tags()（那是"今天"实时状态，凌晨跨日后为空/新一天数据）
+    tags = growth_diary.get_day_mood_tags(day)
     chat_text = "\n".join(f"{'我' if r == 'user' else '她'}: {c}" for r, c in chats)
 
     prompt = (EVOLUTION_PROMPT

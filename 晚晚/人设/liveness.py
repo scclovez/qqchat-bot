@@ -673,6 +673,7 @@ SILENCE_STICKER_DAILY_MAX = 3          # 5 分钟表情每天最多 3 次
 SILENCE_STICKER_HOURS = (8, 22)        # 只在 8:00-22:00 发"哼"表情（白天/晚上正常时段）
 SILENCE_LIGHT_IMAGE_PROB = 0.45
 SILENCE_LIGHT_DAILY_MAX = 2            # 暗示图每天最多 2 张（生图有成本）
+DRAW_IMAGE_DAILY_MAX = 6               # 模型回复"我画了X"触发的自动画图：每用户每天最多 6 张（生图有成本/防刷屏）
 
 JEALOUS_LINES = (
     "你是不是在跟别人聊天？",

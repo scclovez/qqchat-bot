@@ -54,15 +54,26 @@ class UsageTracker:
             logger.debug("Token 用量统计文件不存在或损坏，从零开始: %s", e)
 
     def _save(self):
-        """把当前统计写入文件（调用方需持有锁）。"""
+        """把当前统计写入文件（调用方需持有锁）。
+
+        原子写：先写临时文件再 os.replace 覆盖——避免进程崩溃时半写 JSON，
+        下次启动 json.load 失败会把累计统计清零（曾实测丢统计）。
+        """
         try:
-            with open(self._path, "w", encoding="utf-8") as f:
+            parent = os.path.dirname(self._path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({
                     "calls": self._calls,
                     "totals": self._totals,
                     "per_model": self._per_model,
                     "local_calls": self._local_calls,
                 }, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
         except OSError as e:
             logger.warning("Token 用量统计保存失败: %s", e)
 

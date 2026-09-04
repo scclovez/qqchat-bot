@@ -808,6 +808,14 @@ class MainWindow(QMainWindow):
         r.addWidget(self._ws_token_var)
         self._conn_form.addRow(r)
 
+        # 好友申请白名单（逗号分隔的 QQ 号；空 = 拒绝所有加好友申请，隐私安全默认）
+        friend_var = QLineEdit(str(getattr(runtime, "FRIEND_APPROVE_UIDS", "") or ""))
+        friend_var.setPlaceholderText("如 10001,10002（留空则自动拒绝好友申请）")
+        r = self._conn_row("允许加好友 QQ：")
+        r.addWidget(friend_var)
+        self._conn_form.addRow(r)
+        self._entries["FRIEND_APPROVE_UIDS"] = friend_var
+
         self._conn_form.addRow(_label("图生成", "SectionTitle"))
         self._dashscope_key_var = QLineEdit(config.DASHSCOPE_API_KEY)
         self._dashscope_key_var.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1402,7 +1410,9 @@ class MainWindow(QMainWindow):
         for k, w in self._text_widgets.items():
             data[k] = w.toPlainText() if hasattr(w, "toPlainText") else ""
         data["SYSTEM_PROMPT"] = runtime.SYSTEM_PROMPT
-        data["GIRLFRIEND_SCENARIO"] = ""
+        # GIRLFRIEND_SCENARIO：GUI 人设页无此编辑框，保存时不得清空——
+        # 保留 .runtime_config.json 中已有的手工配置值（曾强制置空导致手填场景被覆盖丢失）
+        data["GIRLFRIEND_SCENARIO"] = runtime.GIRLFRIEND_SCENARIO
         for k, slider in self._sliders.items():
             data[k] = slider.value() / 100 if k == "TEMPERATURE" else slider.value()
         data["REPLY_COOLDOWN_MIN"] = self._reply_cd_min_var.value()
@@ -1461,7 +1471,35 @@ class MainWindow(QMainWindow):
                     self._entries["GIRLFRIEND_BIRTHDATE"] = f"{y}-{m}-{d}"
             except Exception:
                 pass
-            QMessageBox.information(self, "保存完成", "配置已保存。\n人设与参数立即生效；连接设置中需重启的项，在首页重启后生效。")
+            # 连接设置（Key/URL/Token/模型名）持久化到 .env：
+            # 只改内存会导致重启面板后丢失（曾"假保存"），这里一并写回；
+            # 未填的项跳过（不清空 .env 已有 Key）。
+            from config import save_env_overrides
+            conn = {}
+            for env_key, var in (
+                ("DEEPSEEK_API_KEY", "_api_key_var"),
+                ("DEEPSEEK_BASE_URL", "_base_url_var"),
+                ("DEEPSEEK_MODEL", "_model_var"),
+                ("DEEPSEEK_VISION_MODEL", "_vision_model_var"),
+                ("ONEBOT_WS_URL", "_ws_url_var"),
+                ("ONEBOT_ACCESS_TOKEN", "_ws_token_var"),
+                ("DASHSCOPE_API_KEY", "_dashscope_key_var"),
+                ("DASHSCOPE_BASE_URL", "_dashscope_base_url_var"),
+                ("DASHSCOPE_IMAGE_MODEL", "_image_model_var"),
+            ):
+                w = getattr(self, var, None)
+                if w is not None:
+                    val = (w.currentText() if isinstance(w, QComboBox) else w.text()).strip()
+                    if val:
+                        conn[env_key] = val
+            saved_env = save_env_overrides(conn)
+            msg = "人设与参数已保存并立即生效。"
+            if conn:
+                if saved_env:
+                    msg += "\n连接设置（API Key 等）已写入 .env，重启后依然有效。"
+                else:
+                    msg += "\n未找到 .env，连接设置仅本次会话生效——请将 晚晚/配置/.env.example 复制为 .env 后重填。"
+            QMessageBox.information(self, "保存完成", msg)
         except (ValueError, TypeError) as e:
             QMessageBox.critical(self, "保存失败", f"配置项数值格式不正确：{e}")
 
@@ -2003,6 +2041,22 @@ class MainWindow(QMainWindow):
         if loop and task:
             loop.call_soon_threadsafe(task.cancel)
 
+    def _stop_bot_and_wait(self, timeout: float = 10.0) -> bool:
+        """停止 bot 并等待线程真正退出（收尾 bot.stop/release_lock）。
+
+        _stop_bot 只发取消信号：daemon 线程被 QApplication.quit 强杀时，
+        _run_bot 的 finally（bot.stop / singleton.release_lock）来不及执行，
+        可能留下 bot.lock 残留、对话上下文未全量落盘。这里 join 等待，
+        超时仍放行（不阻塞 UI 退出），超时后残留锁会被下次启动清理。
+        返回是否在超时内退出。
+        """
+        thread = self._bot_thread
+        if not thread or not thread.is_alive():
+            return True
+        self._stop_bot()
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
     def _restart_bot(self):
         thread = self._bot_thread
         if not (thread and thread.is_alive()):
@@ -2449,7 +2503,10 @@ class MainWindow(QMainWindow):
     def _really_quit(self):
         """真正退出：停掉后台进程与托盘，结束程序。"""
         try:
-            self._stop_bot()
+            # 先等 bot 线程收尾（bot.stop / release_lock 落盘对话上下文、释放单实例锁），
+            # 避免 daemon 线程被强杀导致 bot.lock 残留、上下文未保存
+            if not self._stop_bot_and_wait(timeout=8.0):
+                logging.getLogger("gui_qt").warning("退出超时：bot 线程仍在运行，直接退出（残留锁下次启动会自动清理）")
         except Exception:
             pass
         try:
