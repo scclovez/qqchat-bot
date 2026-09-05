@@ -5,6 +5,7 @@
 Bot 重启后自动恢复，避免重启丢失"一部分记忆"。
 """
 import logging
+import re
 from collections import defaultdict
 from config import runtime
 from personality import build_system_prompt
@@ -16,6 +17,60 @@ logger = logging.getLogger(__name__)
 # 重启恢复的旧上下文属于"已存档"内容，不立即压缩（否则模型第一轮只看到 6 条+摘要，
 # 接不上上次对话）；等新增满该阈值，再把"恢复的原文 + 新增"一起融进摘要。
 NEW_MSG_COMPRESS_TRIGGER = 50
+
+
+def _clean_style_for_context(content: str) -> str:
+    """把 bot 自己的历史回复"压平"，只用于送进模型的上下文副本（不落盘、不改原文）。
+
+    背景：模型会模仿自己最近说过的话——一旦某几条回复染上"每句都拿……断句"
+    的省略号腔，后续回复就会照着学，越说越碎（实测：一条 7 个"……"、41% 以
+    "……"开头）。这里把历史里 bot 自己的消息做轻度净化，打断自模仿循环：
+    - 去掉"……"式断句（保留真正的句读停顿，避免一句变 N 段）；
+    - 行内多段用顿号/逗号或直接连接，不让模型看到"模板腔"作为榜样；
+    - 只影响上下文展示，聊天记录原文与摘要原文不变。
+
+    规则保守：只处理"省略号腔明显"的消息（含 ≥2 个省略号或连续 2 行以上省略号），
+    正常口语（偶尔一个"……"）原样保留。
+    """
+    if not content:
+        return content
+    if content.count("……") + content.count("…") < 2:
+        return content
+    # 行内多段：把段落间的省略号腔压掉，只留段落分隔
+    lines = re.split(r"\n+", content)
+    cleaned_lines = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        # 去掉行首多余的省略号（"……嗯"→"嗯"）
+        ln = re.sub(r"^[…\.]{1,8}\s*", "", ln)
+        # 行内的省略号：若整行几乎全由省略号断开（碎句腔），去省略号改直连/顿号
+        dots = ln.count("……") + ln.count("…")
+        if dots >= 2 and len(ln) <= 60:
+            # 例如"……你呀……是我的小狗狗……汪汪的那种……" → "你呀，是我的小狗狗，汪汪的那种"
+            ln = re.sub(r"[…\.]{1,8}", "，", ln)
+            ln = ln.strip("，、 ")
+            ln = re.sub(r"[，、]{2,}", "，", ln)
+        cleaned_lines.append(ln)
+    return "\n".join(cleaned_lines)
+
+
+def _clean_history_copy(history: list) -> list:
+    """返回清洗后的历史副本（assistant 消息做省略号腔压平；user 原样）。"""
+    out = []
+    for m in history or []:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        if m.get("role") == "assistant":
+            c = m.get("content") or ""
+            cc = _clean_style_for_context(c)
+            if cc != c:
+                out.append({"role": m["role"], "content": cc})
+                continue
+        out.append(m)
+    return out
 
 
 class ConversationMemory:
@@ -87,13 +142,17 @@ class ConversationMemory:
             logger.warning("持久化对话上下文失败 [%s]: %s", user_id, e)
 
     def get_messages(self, user_id):
-        """返回完整的消息列表。摘要合并到系统提示词中，只有一条 system 消息。"""
+        """返回完整的消息列表。摘要合并到系统提示词中，只有一条 system 消息。
+
+        注意：历史中 bot 自己的消息会先做省略号腔"压平"（_clean_history_copy），
+        防止模型模仿自己最近说过的碎句模板（自模仿放大）；原文不落盘、不改写。
+        """
         prompt = build_system_prompt()
         summary = self._summaries.get(user_id, "")
         if summary:
             prompt += f"\n\n【之前的对话摘要】{summary}"
         msgs = [{"role": "system", "content": prompt}]
-        msgs.extend(self._histories.get(user_id, []))
+        msgs.extend(_clean_history_copy(self._histories.get(user_id, [])))
         return msgs
 
     def add_message(self, user_id, role, content):
