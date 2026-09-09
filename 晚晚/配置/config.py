@@ -85,6 +85,7 @@ _FIELD_TYPES = {
     "GIRLFRIEND_SPECIAL_REACTIONS": str,
     "GIRLFRIEND_CONSTRAINTS": str,
     "GIRLFRIEND_SCENARIO": str,
+    "GUI_THEME_MODE": str,
     "APPEARANCE_REF_DIR": str,
     "FRIEND_APPROVE_UIDS": str,
 }
@@ -211,6 +212,8 @@ class RuntimeConfig:
     ASR_ENABLED: int = 1
     ASR_LANGUAGE: str = "auto"  # auto / zh / en
     ASR_MODEL: str = "mimo-v2.5-asr"
+    # 控制面板外观：twilight=暮光陪伴、night=深夜模式、system=跟随 Windows 外观。
+    GUI_THEME_MODE: str = "twilight"
 
     _PERSIST_KEYS = [
         "MAX_HISTORY_LENGTH", "TEMPERATURE", "MAX_TOKENS",
@@ -236,6 +239,7 @@ class RuntimeConfig:
         "TTS_PROBABILITY", "TTS_VOICE_DESCRIPTION", "TTS_MODEL",
         "MIMO_API_KEY", "MIMO_API_BASE_URL",
         "ASR_ENABLED", "ASR_LANGUAGE", "ASR_MODEL",
+        "GUI_THEME_MODE",
     ]
 
     @classmethod

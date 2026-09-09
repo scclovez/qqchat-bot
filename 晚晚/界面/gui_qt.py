@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""PySide6 版控制面板（天空蓝主题）。
+"""PySide6 版控制面板（暮光陪伴 / 深夜模式主题）。
 
 性能更强（Qt C++ 渲染）、QSS 美化、支持 PyInstaller 打包。
 业务逻辑复用 晚晚/ 各模块（config / llm_providers / usage / appearance_ref / personality_state 等），
@@ -29,8 +29,9 @@ from PySide6.QtGui import QAction, QIcon, QPainter  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
-    QScrollArea, QSizeGrip, QSlider, QSpinBox, QStyle, QStyleOptionTab,
+    QScrollArea, QSizeGrip, QSlider, QSpinBox, QStackedWidget, QStyle, QStyleOptionTab,
     QSystemTrayIcon, QTabBar, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QToolTip, QVBoxLayout, QWidget,
 )
@@ -41,34 +42,34 @@ from usage import usage_tracker  # noqa: E402
 logger = logging.getLogger("gui_qt")
 
 # =============================================================================
-# 天空蓝配色
+# 暮光陪伴配色（默认）
 # =============================================================================
-BG = "#f6f2ec"            # 主背景（燕麦白）
-CARD = "#fffdfa"          # 卡片暖白
-PANEL = "#efe8de"         # 面板暖灰
-INPUT_BG = "#fffdfa"      # 输入框暖白
-PRIMARY = "#a47a52"       # 奶茶棕（白底可读）
-PRIMARY_HOVER = "#8f6849" # 悬停加深棕
-PRIMARY_DARK = "#7c5a3f"  # 更深棕（强调）
-PRIMARY_LIGHT = "#efe3d3" # 浅奶茶点缀
-TEXT = "#3d352e"          # 暖黑文字
-MUTED = "#8a7d6d"         # 暖灰文字
-BORDER = "#e2d8c9"        # 暖棕边框
-SUCCESS = "#7f9d74"       # 莫兰迪绿
-WARNING = "#c99a5b"       # 莫兰迪橙
-DANGER = "#c96f6a"        # 莫兰迪红
-HEADER_BG = "#fffdfa"     # 标题栏暖白
-HEADER_BG2 = "#efe3d3"    # 浅奶茶点缀
-SOFT_BG = "#f5ede3"       # 浅奶茶底（按钮底色）
-SOFT_HOVER = "#ecdfce"    # 浅奶茶悬停
-TRACK = "#e5d5c0"         # 滑块轨道
-CELL_BG = "#f8f2ea"       # 成长状态格子
-CELL_BORDER = "#eadcc7"   # 格子边框
-HINT = "#b89a78"          # 提示图标
-LIST_BTN = "#f3eadf"      # 模型列表按钮
-LIST_BTN_HOVER = "#e9dccb"
-TIP_BG = "#4a3f35"        # 悬停提示底色（深棕黑）
-TIP_FG = "#f7f0e6"        # 悬停提示文字
+BG = "#f7f4fa"
+CARD = "#ffffff"
+PANEL = "#eee8f2"
+INPUT_BG = "#ffffff"
+PRIMARY = "#88689c"
+PRIMARY_HOVER = "#705284"
+PRIMARY_DARK = "#5d416f"
+PRIMARY_LIGHT = "#e7dcef"
+TEXT = "#342d3b"
+MUTED = "#83788d"
+BORDER = "#ded3e5"
+SUCCESS = "#719781"
+WARNING = "#c28c63"
+DANGER = "#c66d7c"
+HEADER_BG = "#ffffff"
+HEADER_BG2 = "#e7dcef"
+SOFT_BG = "#f1eaf5"
+SOFT_HOVER = "#e4d8eb"
+TRACK = "#ded2e7"
+CELL_BG = "#faf7fc"
+CELL_BORDER = "#e8dfea"
+HINT = "#a887ba"
+LIST_BTN = "#f2ebf6"
+LIST_BTN_HOVER = "#e6dbee"
+TIP_BG = "#392f42"
+TIP_FG = "#f8f4fb"
 
 # 成长状态各参数的说明（悬停 ⓘ 显示）
 GROWTH_HINTS = {
@@ -98,6 +99,8 @@ QSS = f"""
 QMainWindow, QWidget#Root {{ background: {BG}; }}
 QWidget#Header {{ background: {HEADER_BG}; border-bottom: 1px solid {BORDER}; }}
 QLabel#AppTitle {{ font-size: 17px; font-weight: bold; color: {PRIMARY}; }}
+QLabel#HeaderPill {{ color: {PRIMARY_DARK}; background: {PRIMARY_LIGHT}; border-radius: 10px; padding: 3px 9px; }}
+QLabel#SidebarTitle {{ font-size: 16px; font-weight: bold; color: {TEXT}; }}
 QLabel#PageTitle {{ font-size: 20px; font-weight: bold; color: {PRIMARY}; }}
 QLabel#SectionTitle {{ font-size: 14px; font-weight: bold; color: {PRIMARY}; }}
 QLabel#Muted {{ color: {MUTED}; font-size: 11px; }}
@@ -106,15 +109,13 @@ QLabel#CellValue {{ font-size: 15px; font-weight: bold; color: {TEXT}; }}
 QLabel#Hint {{ color: {HINT}; font-size: 10px; font-weight: bold; }}
 QLabel#BigValue {{ font-size: 15px; font-weight: bold; color: {PRIMARY}; }}
 QLabel#Status {{ font-size: 14px; font-weight: bold; }}
-QFrame#Card {{ background: {CARD}; border: 1px solid #ecdfce; border-radius: 12px; }}
+QFrame#Card {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px; }}
 QFrame#Cell {{ background: {CELL_BG}; border: 1px solid {CELL_BORDER}; border-radius: 10px; }}
 QFrame#Divider {{ background: {BORDER}; max-height: 1px; min-height: 1px; }}
-QPushButton#Primary {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-    stop:0 #b98d60, stop:1 #a47a52); color: white; border: none; border-radius: 8px;
+QPushButton#Primary {{ background: {PRIMARY}; color: white; border: none; border-radius: 8px;
     padding: 6px 14px; font-weight: bold; }}
-QPushButton#Primary:hover {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-    stop:0 #a47a52, stop:1 #8f6849); }}
-QPushButton#Primary:disabled {{ background: #cbb49a; }}
+QPushButton#Primary:hover {{ background: {PRIMARY_HOVER}; }}
+QPushButton#Primary:disabled {{ background: {BORDER}; }}
 QPushButton#Soft {{ background: {SOFT_BG}; color: {PRIMARY}; border: none; border-radius: 6px;
     padding: 4px 10px; }}
 QPushButton#Soft:hover {{ background: {SOFT_HOVER}; }}
@@ -162,11 +163,16 @@ QTabBar::tab {{ background: {PANEL}; color: {MUTED}; padding: 8px 20px;
 QTabBar::tab:selected {{ background: {CARD}; color: {PRIMARY};
     border-bottom: 2px solid {PRIMARY}; }}
 QTabBar::tab:hover {{ color: {PRIMARY_HOVER}; }}
+QWidget#Sidebar {{ background: {HEADER_BG}; border-right: 1px solid {BORDER}; min-width: 172px; max-width: 172px; }}
+QListWidget#SidebarNav {{ background: transparent; border: none; outline: none; color: {MUTED}; }}
+QListWidget#SidebarNav::item {{ padding: 10px 12px; margin: 2px 8px; border-radius: 8px; }}
+QListWidget#SidebarNav::item:selected {{ background: {PRIMARY_LIGHT}; color: {PRIMARY_DARK}; font-weight: bold; }}
+QListWidget#SidebarNav::item:hover {{ background: {SOFT_BG}; color: {PRIMARY}; }}
 QScrollArea {{ border: none; background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
-QScrollBar::handle:vertical {{ background: #dccbb2; border-radius: 4px; min-height: 30px; }}
-QScrollBar::handle:vertical:hover {{ background: #cdb99a; }}
+QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px; min-height: 30px; }}
+QScrollBar::handle:vertical:hover {{ background: {PRIMARY_LIGHT}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QTableWidget {{ background: white; border: 1px solid {BORDER}; border-radius: 10px;
     gridline-color: {PANEL}; }}
@@ -177,9 +183,64 @@ QToolTip {{ background: {TIP_BG}; color: {TIP_FG}; border: none;
 QPlainTextEdit#LogView {{ background: #2f2a24; color: #e8dcc8;
     font-family: Consolas, "Microsoft YaHei UI"; font-size: 12px;
     border: 1px solid {BORDER}; border-radius: 10px; }}
-QMenu {{ background: #fffdfa; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px; }}
+QMenu {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px; }}
 QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
 QMenu::item:selected {{ background: {SOFT_BG}; color: {PRIMARY}; }}
+"""
+
+
+THEME_LABELS = {
+    "twilight": "暮光陪伴",
+    "night": "深夜模式",
+    "system": "跟随系统",
+}
+
+
+def _system_prefers_dark() -> bool:
+    """读取 Windows 的应用颜色偏好；读取失败时保留暮光陪伴。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            return int(winreg.QueryValueEx(key, "AppsUseLightTheme")[0]) == 0
+    except (OSError, ValueError):
+        return False
+
+
+def _theme_qss(is_night: bool) -> str:
+    """在暮光基础样式后覆盖深夜模式的关键表面与交互色。"""
+    if not is_night:
+        return QSS
+    return QSS + """
+QMainWindow, QWidget#Root, QWidget#PageArea { background: #17151d; color: #eee9f2; }
+QWidget#Header { background: #211d29; border-bottom: 1px solid #383143; }
+QWidget#Sidebar { background: #211d29; border-right: 1px solid #383143; }
+QLabel#AppTitle, QLabel#PageTitle, QLabel#SectionTitle, QLabel#BigValue { color: #d6b9ea; }
+QLabel#Muted, QLabel#CellName { color: #aaa1b3; }
+QLabel#CellValue, QLabel#Status { color: #eee9f2; }
+QLabel#SidebarTitle { color: #f2edf5; font-size: 16px; font-weight: bold; }
+QLabel#HeaderPill { color: #d8c0e9; background: #332b40; border-radius: 10px; padding: 3px 9px; }
+QFrame#Card { background: #24202c; border: 1px solid #383143; }
+QFrame#Cell { background: #2b2633; border: 1px solid #403849; }
+QPushButton#Primary { background: #9a75b4; color: #18131e; }
+QPushButton#Primary:hover { background: #b18bca; }
+QPushButton#Soft { background: #302a39; color: #dbc6ea; }
+QPushButton#Soft:hover, QPushButton#Ghost:hover, QPushButton#HeaderBtn:hover { background: #3b3346; }
+QPushButton#HeaderBtn, QPushButton#HeaderClose, QPushButton#Ghost { color: #eee9f2; }
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    background: #201c27; color: #eee9f2; border-color: #4a4055; }
+QComboBox QAbstractItemView, QMenu { background: #272230; color: #eee9f2; border-color: #4a4055; }
+QListWidget#SidebarNav { background: transparent; border: none; outline: none; color: #c8becf; }
+QListWidget#SidebarNav::item { padding: 10px 12px; margin: 2px 8px; border-radius: 8px; }
+QListWidget#SidebarNav::item:selected { background: #443750; color: #f5eff8; font-weight: bold; }
+QListWidget#SidebarNav::item:hover { background: #342d3e; }
+QScrollBar::handle:vertical { background: #52475e; }
+QTableWidget { background: #24202c; color: #eee9f2; border-color: #403849; gridline-color: #383143; }
+QHeaderView::section { background: #302a39; color: #cfc4d7; }
 """
 
 
@@ -234,6 +295,19 @@ class CenterTabBar(QTabBar):
         return s
 
 
+class SidebarPages(QStackedWidget):
+    """保留 addTab 调用习惯的页面容器，把主导航交给左侧列表。"""
+
+    def __init__(self, navigation, parent=None):
+        super().__init__(parent)
+        self._navigation = navigation
+
+    def addTab(self, widget, label):
+        index = self.addWidget(widget)
+        self._navigation.addItem(QListWidgetItem(label))
+        return index
+
+
 class _CellTooltip(QObject):
     """整格悬停立即显示说明（不走 Qt 原生 tooltip 的 ~700ms 延迟）。
 
@@ -268,7 +342,9 @@ class HeaderBar(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(16, 0, 8, 0)
         lay.setSpacing(4)
-        lay.addWidget(_label("控制面板", "AppTitle"))
+        lay.addWidget(_label("小晚 · 控制台", "AppTitle"))
+        self.theme_badge = _label("暮光陪伴", "HeaderPill")
+        lay.addWidget(self.theme_badge)
         lay.addStretch(1)
         self.save_btn = _btn("保存", "Primary", self._win._save_from_bar)
         self.save_btn.setFixedSize(80, 30)
@@ -301,10 +377,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.setWindowTitle("控制面板")
+        self.setWindowTitle("小晚 · 控制台")
         self.resize(1080, 780)
         self.setMinimumSize(900, 640)
-        self.setStyleSheet(QSS)
+        self._theme_mode = str(getattr(runtime, "GUI_THEME_MODE", "twilight") or "twilight")
+        if self._theme_mode not in THEME_LABELS:
+            self._theme_mode = "twilight"
+        self._is_night_theme = False
+        self.setStyleSheet(_theme_qss(False))
 
         self._entries = {}
         self._text_widgets = {}
@@ -335,17 +415,65 @@ class MainWindow(QMainWindow):
         v.setSpacing(0)
         self.header = HeaderBar(self)
         v.addWidget(self.header)
-        self.tabs = QTabWidget()
-        self.tabs.setTabBar(CenterTabBar(self.tabs))  # 页签居中
-        v.addWidget(self.tabs)
+        page_area = QWidget()
+        page_area.setObjectName("PageArea")
+        page_lay = QHBoxLayout(page_area)
+        page_lay.setContentsMargins(0, 0, 0, 0)
+        page_lay.setSpacing(0)
+        sidebar = QFrame(page_area)
+        sidebar.setObjectName("Sidebar")
+        side_lay = QVBoxLayout(sidebar)
+        side_lay.setContentsMargins(10, 18, 10, 14)
+        side_lay.setSpacing(8)
+        side_lay.addWidget(_label("导航", "SidebarTitle"))
+        side_lay.addWidget(_label("陪伴与管理", "Muted"))
+        self._navigation = QListWidget(sidebar)
+        self._navigation.setObjectName("SidebarNav")
+        self._navigation.setSpacing(2)
+        side_lay.addWidget(self._navigation, 1)
+        side_lay.addWidget(_label("外观可在「设置」调整", "Muted"))
+        self.tabs = SidebarPages(self._navigation, page_area)
+        self._navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self._navigation.setCurrentRow)
+        page_lay.addWidget(sidebar)
+        page_lay.addWidget(self.tabs, 1)
+        v.addWidget(page_area, 1)
         self.setCentralWidget(central)
 
         self._grip = QSizeGrip(self)
         self._grip.setFixedSize(18, 18)
 
         self._build_pages()
+        self._navigation.setCurrentRow(0)
+        self._apply_theme(self._theme_mode, persist=False)
         self._hook_dirty_tracking()
         self._start_timers()
+
+    def _apply_theme(self, mode: str, persist: bool = True):
+        """立即应用手选主题；“跟随系统”读取 Windows 的应用深浅色偏好。"""
+        mode = mode if mode in THEME_LABELS else "twilight"
+        is_night = mode == "night" or (mode == "system" and _system_prefers_dark())
+        self._theme_mode = mode
+        self._is_night_theme = is_night
+        self.setStyleSheet(_theme_qss(is_night))
+        shown = "深夜模式" if is_night else "暮光陪伴"
+        if hasattr(self, "header"):
+            suffix = " · 跟随系统" if mode == "system" else ""
+            self.header.theme_badge.setText(shown + suffix)
+        combo = getattr(self, "_theme_mode_var", None)
+        if combo is not None and combo.currentData() != mode:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(mode)))
+            combo.blockSignals(False)
+        if persist:
+            runtime.update({"GUI_THEME_MODE": mode})
+            runtime.save_to_file()
+
+    def _refresh_system_theme(self):
+        if self._theme_mode == "system":
+            is_night = _system_prefers_dark()
+            if is_night != self._is_night_theme:
+                self._apply_theme("system", persist=False)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -365,7 +493,8 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(14)
-        outer.addWidget(_label("控制面板", "PageTitle"))
+        outer.addWidget(_label("今天也在陪着你", "PageTitle"))
+        outer.addWidget(_label("在这里查看运行状态、成长变化与最近的陪伴记录。", "Muted"))
 
         cards = QHBoxLayout()
         cards.setSpacing(12)
@@ -418,7 +547,7 @@ class MainWindow(QMainWindow):
         bot_lay.addWidget(self._btn_restart)
         cards.addWidget(bot, 1)
 
-        growth, growth_lay = _card(tab, "成长状态")
+        growth, growth_lay = _card(tab, "今日陪伴状态")
         grid = QGridLayout()
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setSpacing(6)
@@ -1059,9 +1188,42 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(tab)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(sub)
+        self._build_appearance_tab(sub)
         self._build_params_tab(sub)
         self._build_interact_tab(sub)
         self._build_usage_tab(sub)
+
+    def _build_appearance_tab(self, sub):
+        p = QWidget()
+        sub.addTab(p, "外观")
+        lay = QVBoxLayout(p)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(14)
+        card, cl = _card(p, "界面主题")
+        cl.addWidget(_label("选择一种陪伴氛围，切换会立即生效并自动记住。", "Muted"))
+        row = QHBoxLayout()
+        row.addWidget(_label("主题模式："))
+        self._theme_mode_var = QComboBox()
+        self._theme_mode_var.addItem("暮光陪伴", "twilight")
+        self._theme_mode_var.addItem("深夜模式", "night")
+        self._theme_mode_var.addItem("跟随系统", "system")
+        self._theme_mode_var.setCurrentIndex(max(0, self._theme_mode_var.findData(self._theme_mode)))
+        self._theme_mode_var.currentIndexChanged.connect(
+            lambda _index: self._apply_theme(self._theme_mode_var.currentData()))
+        row.addWidget(self._theme_mode_var)
+        row.addStretch(1)
+        cl.addLayout(row)
+        self._theme_hint = _label(
+            "暮光陪伴：温柔浅紫与留白；深夜模式：低亮度深紫；跟随系统：跟随 Windows 应用外观。",
+            "Muted",
+        )
+        self._theme_hint.setWordWrap(True)
+        cl.addWidget(self._theme_hint)
+        lay.addWidget(card)
+        layout_card, layout_lay = _card(p, "布局说明")
+        layout_lay.addWidget(_label("左侧导航聚焦主要页面，首页优先展示运行与成长状态；详细参数集中在设置中。", "Muted"))
+        lay.addWidget(layout_card)
+        lay.addStretch(1)
 
     def _build_params_tab(self, sub):
         p = QWidget()
@@ -1341,7 +1503,7 @@ class MainWindow(QMainWindow):
         self._dirty_hooked = True
         self._dirty = False
         self._suppress_dirty = False
-        exclude = {"_log_text", "_auto_scroll_var", "_voice_output_text", "_usage_tree"}
+        exclude = {"_log_text", "_auto_scroll_var", "_voice_output_text", "_usage_tree", "_theme_mode_var"}
         for name, w in vars(self).items():
             if name in exclude or not isinstance(w, QWidget):
                 continue
@@ -1455,6 +1617,7 @@ class MainWindow(QMainWindow):
         data["ASR_ENABLED"] = 1 if self._asr_enabled_var.isChecked() else 0
         data["ASR_LANGUAGE"] = self._asr_language_var.currentText().strip() or "auto"
         data["ASR_MODEL"] = self._asr_model_var.currentText().strip() or "mimo-v2.5-asr"
+        data["GUI_THEME_MODE"] = self._theme_mode
         return data
 
     def _save_config(self):
@@ -1506,6 +1669,8 @@ class MainWindow(QMainWindow):
     def _reload_config(self):
         self._suppress_dirty = True
         runtime.load_from_file()
+        self._apply_theme(str(getattr(runtime, "GUI_THEME_MODE", "twilight") or "twilight"),
+                          persist=False)
         for k, w in self._entries.items():
             if isinstance(w, QLineEdit):
                 w.setText(str(getattr(runtime, k, "")))
@@ -1595,6 +1760,9 @@ class MainWindow(QMainWindow):
         self._growth_timer = QTimer(self)
         self._growth_timer.timeout.connect(self._growth_tick)
         self._growth_timer.start(5000)
+        self._theme_timer = QTimer(self)
+        self._theme_timer.timeout.connect(self._refresh_system_theme)
+        self._theme_timer.start(60000)
 
     def _safe_after(self, delay, fn):
         """安全调度回调到主线程（可在线程中调用）。
