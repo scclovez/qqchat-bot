@@ -95,7 +95,7 @@ def test_growth():
     import personality_state as pstate
     import liveness
     from memory import _select_relevant_memory
-    from qq_bot import split_reply_text
+    from qq_bot import QQGirlfriendBot, split_reply_text
     assert pstate.get_stage() >= 1
     assert pstate.stage_name()
     assert pstate.lewdness_tier_name() in ("害羞", "主动", "放开")
@@ -110,6 +110,11 @@ def test_growth():
     assert selected == ["他最近在准备考试"]
     parts = split_reply_text("第一句稍微有一点长，需要自然切开。\n第二句是补充。\n第三句。\n第四句不应发送。")
     assert 1 <= len(parts) <= 3 and all(len(part) <= 32 for part in parts)
+    merged = QQGirlfriendBot._merge_debounced_messages([
+        {"raw_message": "第一句", "message_id": 1},
+        {"raw_message": "第二句", "message_id": 2},
+    ])
+    assert merged["raw_message"] == "第一句\n第二句" and merged["message_id"] == 2
 
 
 def test_providers():

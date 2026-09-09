@@ -45,6 +45,9 @@ MAX_REPLY_LEN = 96
 # 这是防刷屏的保护上限，不是默认回复条数；正常回复由模型按语义决定是否分条。
 MAX_REPLY_PARTS = 3
 
+# 私聊连续消息收束：对方连续输入时，等安静 3 秒后合并为同一轮再回复。
+MESSAGE_DEBOUNCE_SECONDS = 3.0
+
 # 语音拆条：真人发语音是一条条录、一条条发的，条与条之间随机停顿（秒）。
 # 间隔要够明显（1.5s+），否则 QQ 会把相邻语音连在一起显示成"一口气发完"
 VOICE_GAP_MIN = 1.5
@@ -402,6 +405,7 @@ class QQGirlfriendBot:
         self._echo_counter = 0
         self._locks = {}
         self._media_locks = {}  # user_id -> asyncio.Lock：图片/自拍等慢任务串行（防同用户并发双生图扣费）
+        self._message_batches = {}  # user_id -> {items, task}，私聊连续文本的收束队列
         # 自动插图（"我画了X/给你看X"）频控：每用户每日生成上限 + 同主题短时去重
         # （真人不会一天画几十张给同一个人看；也防模型回复反复带出同一句"我画了X"触发刷图）
         self._auto_draw_day = {}  # user_id -> "YYYY-MM-DD"
@@ -560,6 +564,11 @@ class QQGirlfriendBot:
 
     async def stop(self):
         self._running = False
+        for batch in self._message_batches.values():
+            task = batch.get("task")
+            if task and not task.done():
+                task.cancel()
+        self._message_batches.clear()
         if self._proactive_task:
             self._proactive_task.cancel()
             self._proactive_task = None
@@ -629,7 +638,64 @@ class QQGirlfriendBot:
                          data.get("retcode"), data.get("message"))
 
     async def _handle_message(self, data):
-        """消息处理入口：兜底捕获所有异常，保证用户总能收到回应（不再静默吞异常）。"""
+        """消息处理入口：私聊连续文本先收束，其他事件即时处理。"""
+        if self._is_debounce_candidate(data):
+            self._queue_debounced_message(data)
+            return
+        await self._handle_message_now(data)
+
+    def _is_debounce_candidate(self, data) -> bool:
+        """仅收束纯文本私聊，避免图片、语音、卡片被错误拼成一条消息。"""
+        if data.get("message_type") != "private":
+            return False
+        if self._self_id and str(data.get("user_id", "")) == self._self_id:
+            return False
+        if self._extract_music_share(data):
+            return False
+        raw = (data.get("raw_message") or "").strip()
+        segments = data.get("message") or []
+        if not raw:
+            return False
+        return not segments or all(seg.get("type") == "text" for seg in segments)
+
+    def _queue_debounced_message(self, data):
+        """把连续文本放入同一轮；每次新消息都会重新开始安静计时。"""
+        user_id = str(data.get("user_id", ""))
+        batch = self._message_batches.get(user_id)
+        if batch is None:
+            batch = {"items": [], "task": None}
+            self._message_batches[user_id] = batch
+        task = batch.get("task")
+        if task and not task.done():
+            task.cancel()
+        batch["items"].append(data)
+        batch["task"] = asyncio.create_task(self._flush_debounced_messages(user_id))
+
+    @staticmethod
+    def _merge_debounced_messages(items):
+        """用最后一条事件承载元数据，原顺序合并各条文本给模型。"""
+        merged = dict(items[-1])
+        texts = [(item.get("raw_message") or "").strip() for item in items]
+        text = "\n".join(part for part in texts if part)
+        merged["raw_message"] = text
+        merged["message"] = [{"type": "text", "data": {"text": text}}]
+        return merged
+
+    async def _flush_debounced_messages(self, user_id):
+        try:
+            await asyncio.sleep(MESSAGE_DEBOUNCE_SECONDS)
+            batch = self._message_batches.pop(user_id, None)
+            if not batch or not batch.get("items"):
+                return
+            merged = self._merge_debounced_messages(batch["items"])
+            if len(batch["items"]) > 1:
+                logger.info("连续消息已收束 [%s]: %d 条", user_id, len(batch["items"]))
+            await self._handle_message_now(merged)
+        except asyncio.CancelledError:
+            return
+
+    async def _handle_message_now(self, data):
+        """实际消息处理及统一兜底。"""
         try:
             await self._handle_message_inner(data)
         except asyncio.CancelledError:
