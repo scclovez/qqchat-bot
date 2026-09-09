@@ -95,7 +95,7 @@ def test_growth():
     import personality_state as pstate
     import liveness
     from memory import _select_relevant_memory
-    from qq_bot import QQGirlfriendBot, split_reply_text
+    from qq_bot import MESSAGE_DEBOUNCE_SECONDS, QQGirlfriendBot, split_reply_text
     assert pstate.get_stage() >= 1
     assert pstate.stage_name()
     assert pstate.lewdness_tier_name() in ("害羞", "主动", "放开")
@@ -115,6 +115,7 @@ def test_growth():
         {"raw_message": "第二句", "message_id": 2},
     ])
     assert merged["raw_message"] == "第一句\n第二句" and merged["message_id"] == 2
+    assert MESSAGE_DEBOUNCE_SECONDS == 6.0
 
 
 def test_providers():

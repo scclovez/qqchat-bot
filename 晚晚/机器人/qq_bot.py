@@ -45,8 +45,8 @@ MAX_REPLY_LEN = 96
 # 这是防刷屏的保护上限，不是默认回复条数；正常回复由模型按语义决定是否分条。
 MAX_REPLY_PARTS = 3
 
-# 私聊连续消息收束：对方连续输入时，等安静 3 秒后合并为同一轮再回复。
-MESSAGE_DEBOUNCE_SECONDS = 3.0
+# 私聊连续消息收束：对方连续输入时，等安静 6 秒后合并为同一轮再回复。
+MESSAGE_DEBOUNCE_SECONDS = 6.0
 
 # 语音拆条：真人发语音是一条条录、一条条发的，条与条之间随机停顿（秒）。
 # 间隔要够明显（1.5s+），否则 QQ 会把相邻语音连在一起显示成"一口气发完"
@@ -2317,7 +2317,7 @@ class QQGirlfriendBot:
 
         - 发送前等待 REPLY_COOLDOWN 秒（模拟"正在输入"，语音同样适用）
         - 只有第一条消息引用原消息，后续作为独立消息
-        - 每条消息间隔 SPLIT_INTERVAL 秒，避免 QQ 频率限制
+        - 分条消息之间随机停 1~2 秒，避免连发
         - 开启语音回复时，把回复拆成多条语音条逐条发送（更像真人）
         - dual_voice=True：文字发完后，整条内容再合成一条语音发出（重要时刻双模态）
         """
@@ -2635,8 +2635,8 @@ class QQGirlfriendBot:
             prob = min(1.0, prob * liveness.mood_modal_factor(user_id))
         if random.random() > prob:
             return
-        # 表情包晚一点再发（隔 1.2-2s，像真人先回话再贴张图，不和文字挤在一起）
-        await asyncio.sleep(SPLIT_INTERVAL * 2)
+        # 表情包晚一点再发，像真人先回话再贴张图，不和文字挤在一起。
+        await asyncio.sleep(random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
         path = self._pick_sticker()
         if path:
             await self._send_image(msg_type, target_id, user_id, path)
