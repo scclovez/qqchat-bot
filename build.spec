@@ -28,6 +28,7 @@ PATHEX = [ROOT] + [os.path.join(ROOT, d) for d in FEATURE_DIRS]
 
 # 中文目录模块（PyInstaller 分析不到动态 sys.path，显式列出）
 HIDDEN = [
+    "PySide6.QtMultimedia",
     "config", "llm_providers", "personality", "liveness", "boundary",
     "conversation", "memory", "usage", "image_gen", "comfyui_client",
     "appearance_ref", "qq_bot", "llm_base", "openai_compat",

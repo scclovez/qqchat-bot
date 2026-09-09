@@ -24,8 +24,9 @@ if os.path.dirname(__file__) not in sys.path:
 import 路径  # noqa: E402
 from 路径 import PROJECT_ROOT, CODE_ROOT, DATA_ROOT, data_path, code_path, is_frozen  # noqa: E402
 
-from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect  # noqa: E402
-from PySide6.QtGui import QAction, QIcon, QPainter  # noqa: E402
+from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect, QUrl  # noqa: E402
+from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap  # noqa: E402
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -276,6 +277,26 @@ def _btn(text, obj="Soft", on=None):
     return b
 
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
+
+
+def _recent_media_files(folder, extensions, limit=60):
+    """按最近修改时间列出素材；目录不存在时返回空列表，不主动创建。"""
+    try:
+        items = [p for p in Path(folder).iterdir()
+                 if p.is_file() and p.suffix.lower() in extensions]
+        return sorted(items, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    except OSError:
+        return []
+
+
+def _human_size(size: int) -> str:
+    if size < 1024 * 1024:
+        return f"{max(1, round(size / 1024))} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 class CenterTabBar(QTabBar):
     """居中铺满的页签栏：setExpanding 让页签均匀铺满整个宽度并居中（QTabWidget 默认左对齐）。
 
@@ -482,6 +503,7 @@ class MainWindow(QMainWindow):
     def _build_pages(self):
         self._build_dashboard_tab()
         self._build_personality_tab()
+        self._build_media_tab()
         self._build_connection_tab()
         self._build_settings_tab()
         self._build_log_tab()
@@ -499,6 +521,16 @@ class MainWindow(QMainWindow):
         cards = QHBoxLayout()
         cards.setSpacing(12)
         outer.addLayout(cards)
+
+        quick, quick_lay = _card(tab, "快捷入口")
+        quick_lay.addWidget(_label("常用素材与外貌设定都可以从这里直接打开。", "Muted"))
+        quick_row = QHBoxLayout()
+        quick_row.addWidget(_btn("查看最新图片", "Soft", lambda: self._open_media_page(0)))
+        quick_row.addWidget(_btn("播放最近语音", "Soft", lambda: self._open_media_page(2)))
+        quick_row.addWidget(_btn("编辑外貌总结", "Soft", self._open_appearance_editor))
+        quick_row.addStretch(1)
+        quick_lay.addLayout(quick_row)
+        outer.addWidget(quick)
 
         qq, qq_lay = _card(tab, "QQ")
         qq.setMinimumHeight(190)
@@ -590,12 +622,250 @@ class MainWindow(QMainWindow):
 
         self._refresh_growth_stats()
 
+    # ===================== 素材库 =====================
+    def _build_media_tab(self):
+        tab = QWidget()
+        self.tabs.addTab(tab, "素材库")
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+        lay.addWidget(_label("素材库", "PageTitle"))
+        lay.addWidget(_label("在这里查看小晚生成的图片、外貌参考图，以及语音缓存。素材始终保留在数据目录中。", "Muted"))
+
+        self._media_tabs = QTabWidget(tab)
+        self._media_tabs.setTabBar(CenterTabBar(self._media_tabs))
+        lay.addWidget(self._media_tabs, 1)
+        self._media_gallery_layouts = {}
+        self._media_path_labels = {}
+        self._build_image_gallery_page("generated", "生成图片", "小晚生成并发送过的图片，按最近生成时间排列。")
+        self._build_image_gallery_page("appearance", "人设图片", "用于外貌总结与人物一致性的参考图。")
+        self._build_audio_library_page()
+        self._media_tabs.currentChanged.connect(self._refresh_current_media_page)
+        self._refresh_media_library()
+
+    def _build_image_gallery_page(self, kind: str, title: str, hint: str):
+        page = QWidget()
+        self._media_tabs.addTab(page, title)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 10, 0, 0)
+        lay.setSpacing(8)
+        top, top_lay = _card(page, title)
+        top_lay.addWidget(_label(hint, "Muted"))
+        path_label = _label("", "Muted")
+        path_label.setWordWrap(True)
+        top_lay.addWidget(path_label)
+        actions = QHBoxLayout()
+        actions.addWidget(_btn("刷新", "Soft", lambda _=False, k=kind: self._refresh_image_gallery(k)))
+        actions.addWidget(_btn("打开文件夹", "Soft", lambda _=False, k=kind: self._open_media_folder(k)))
+        actions.addStretch(1)
+        top_lay.addLayout(actions)
+        lay.addWidget(top)
+
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        body = QWidget(scroll)
+        grid = QGridLayout(body)
+        grid.setContentsMargins(4, 4, 4, 4)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        for col in range(3):
+            grid.setColumnStretch(col, 1)
+        scroll.setWidget(body)
+        lay.addWidget(scroll, 1)
+        self._media_gallery_layouts[kind] = grid
+        self._media_path_labels[kind] = path_label
+
+    def _build_audio_library_page(self):
+        page = QWidget()
+        self._media_tabs.addTab(page, "语音缓存")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 10, 0, 0)
+        lay.setSpacing(8)
+        card, cl = _card(page, "语音缓存")
+        cl.addWidget(_label("小晚发送过的语音会保存在这里，可直接播放。", "Muted"))
+        self._media_audio_path = _label("", "Muted")
+        self._media_audio_path.setWordWrap(True)
+        cl.addWidget(self._media_audio_path)
+        audio_actions = QHBoxLayout()
+        audio_actions.addWidget(_btn("刷新", "Soft", self._refresh_audio_library))
+        audio_actions.addWidget(_btn("停止播放", "Soft", self._stop_audio))
+        audio_actions.addWidget(_btn("打开文件夹", "Soft", lambda: self._open_media_folder("audio")))
+        audio_actions.addStretch(1)
+        cl.addLayout(audio_actions)
+        self._media_audio_state = _label("未播放", "Muted")
+        cl.addWidget(self._media_audio_state)
+        lay.addWidget(card)
+
+        self._media_audio_table = QTableWidget(0, 4, page)
+        self._media_audio_table.setHorizontalHeaderLabels(["文件", "生成时间", "大小", "操作"])
+        self._media_audio_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 4):
+            self._media_audio_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents)
+        self._media_audio_table.verticalHeader().setVisible(False)
+        self._media_audio_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._media_audio_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        lay.addWidget(self._media_audio_table, 1)
+        self._audio_output = QAudioOutput(self)
+        self._audio_player = QMediaPlayer(self)
+        self._audio_player.setAudioOutput(self._audio_output)
+        self._audio_player.playbackStateChanged.connect(self._on_audio_playback_state)
+
+    def _media_folder(self, kind: str) -> str:
+        if kind == "generated":
+            return data_path("晚晚", "图片", "生成图片")
+        if kind == "audio":
+            return data_path("晚晚", "语音", "语音缓存")
+        try:
+            from appearance_ref import get_ref_dir
+            return get_ref_dir()
+        except Exception:
+            return data_path("晚晚", "外貌", "外貌设定")
+
+    def _refresh_media_library(self):
+        self._refresh_image_gallery("generated")
+        self._refresh_image_gallery("appearance")
+        self._refresh_audio_library()
+
+    def _refresh_current_media_page(self, index):
+        if index == 0:
+            self._refresh_image_gallery("generated")
+        elif index == 1:
+            self._refresh_image_gallery("appearance")
+        elif index == 2:
+            self._refresh_audio_library()
+
+    def _refresh_image_gallery(self, kind: str):
+        grid = self._media_gallery_layouts.get(kind)
+        if grid is None:
+            return
+        while grid.count():
+            item = grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        folder = self._media_folder(kind)
+        self._media_path_labels[kind].setText(f"位置：{folder}")
+        files = _recent_media_files(folder, IMAGE_EXTS)
+        if not files:
+            empty = _label("这里还没有图片。生成图片或放入人设参考图后，会自动显示在这里。", "Muted")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(empty, 0, 0, 1, 3)
+            return
+        for index, path in enumerate(files):
+            card, card_lay = _card(None)
+            card.setMinimumHeight(190)
+            preview = QLabel(card)
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview.setFixedHeight(126)
+            pixmap = QPixmap(str(path))
+            if pixmap.isNull():
+                preview.setText("无法预览此图片")
+            else:
+                preview.setPixmap(pixmap.scaled(200, 126, Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+            card_lay.addWidget(preview)
+            name = _label(path.name)
+            name.setWordWrap(True)
+            card_lay.addWidget(name)
+            meta = _label(time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)), "Muted")
+            card_lay.addWidget(meta)
+            row = QHBoxLayout()
+            row.addWidget(_btn("预览", "Soft", lambda _=False, p=path: self._open_image_preview(p)))
+            row.addWidget(_btn("定位", "Ghost", lambda _=False, p=path: self._open_in_folder(p)))
+            row.addStretch(1)
+            card_lay.addLayout(row)
+            grid.addWidget(card, index // 3, index % 3)
+
+    def _refresh_audio_library(self):
+        if not hasattr(self, "_media_audio_table"):
+            return
+        folder = self._media_folder("audio")
+        self._media_audio_path.setText(f"位置：{folder}")
+        files = _recent_media_files(folder, AUDIO_EXTS)
+        table = self._media_audio_table
+        table.setRowCount(len(files))
+        for row, path in enumerate(files):
+            table.setItem(row, 0, QTableWidgetItem(path.name))
+            table.setItem(row, 1, QTableWidgetItem(
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))))
+            table.setItem(row, 2, QTableWidgetItem(_human_size(path.stat().st_size)))
+            table.setCellWidget(row, 3, _btn("播放", "Soft", lambda _=False, p=path: self._play_audio(p)))
+
+    def _open_media_page(self, index: int):
+        self._select_main_page("素材库")
+        self._media_tabs.setCurrentIndex(index)
+        self._refresh_current_media_page(index)
+
+    def _open_appearance_editor(self):
+        self._select_main_page("小晚")
+        if hasattr(self, "_personality_tabs"):
+            self._personality_tabs.setCurrentIndex(0)
+
+    def _select_main_page(self, label: str):
+        for row in range(self._navigation.count()):
+            if self._navigation.item(row).text() == label:
+                self._navigation.setCurrentRow(row)
+                return
+
+    def _open_image_preview(self, path: Path):
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            QMessageBox.warning(self, "图片预览", "无法读取这张图片。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(path.name)
+        dialog.resize(820, 640)
+        lay = QVBoxLayout(dialog)
+        image = QLabel(dialog)
+        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image.setPixmap(pixmap.scaled(780, 560, Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation))
+        lay.addWidget(image, 1)
+        lay.addWidget(_label(str(path), "Muted"))
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(_btn("定位文件", "Soft", lambda: self._open_in_folder(path)))
+        actions.addWidget(_btn("关闭", "Primary", dialog.accept))
+        lay.addLayout(actions)
+        dialog.exec()
+
+    def _open_media_folder(self, kind: str):
+        folder = self._media_folder(kind)
+        if not os.path.isdir(folder):
+            QMessageBox.information(self, "素材库", "该素材文件夹尚未创建；有素材生成后会自动出现。")
+            return
+        self._open_in_folder(Path(folder))
+
+    def _open_in_folder(self, path: Path):
+        try:
+            target = path if path.is_dir() else path.parent
+            if sys.platform == "win32":
+                os.startfile(str(target))
+            else:
+                QMessageBox.information(self, "素材位置", str(target))
+        except OSError as e:
+            QMessageBox.warning(self, "无法打开文件夹", str(e))
+
+    def _play_audio(self, path: Path):
+        self._audio_player.setSource(QUrl.fromLocalFile(str(path)))
+        self._audio_player.play()
+        self._media_audio_state.setText(f"正在播放：{path.name}")
+
+    def _stop_audio(self):
+        self._audio_player.stop()
+        self._media_audio_state.setText("未播放")
+
+    def _on_audio_playback_state(self, state):
+        if state == QMediaPlayer.PlaybackState.StoppedState:
+            self._media_audio_state.setText("未播放")
+
     # ===================== 人设编辑 =====================
     def _build_personality_tab(self):
         tab = QWidget()
-        self.tabs.addTab(tab, "人设编辑")
+        self.tabs.addTab(tab, "小晚")
         sub = QTabWidget(tab)
         sub.setTabBar(CenterTabBar(sub))
+        self._personality_tabs = sub
         lay = QVBoxLayout(tab)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(sub)
