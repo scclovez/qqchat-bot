@@ -667,14 +667,29 @@ class MainWindow(QMainWindow):
         tts_desc = add_text("音色描述", "TTS_VOICE_DESCRIPTION", 110)
         self._tts_voice_desc_text = tts_desc
 
-        # 外貌参考图总结
+        # 外貌参考图总结：与“外貌设定”分开保存，但可见、可编辑。
         div = QFrame()
         div.setObjectName("Divider")
         div.setFixedHeight(1)
         form.addRow(div)
+        form.addRow(_label("参考图外貌总结：", "SectionTitle"))
+        hint = _label("由参考图生成，会自动用于人物生图；你可以在这里补充或修正稳定外貌特征。", "Muted")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        self._appearance_summary_text = QTextEdit()
+        self._appearance_summary_text.setMinimumHeight(150)
+        try:
+            from appearance_ref import load_summary
+            self._appearance_summary_text.setPlainText(load_summary())
+        except Exception as e:
+            logger.warning("读取外貌总结失败: %s", e)
+        form.addRow(self._appearance_summary_text)
         app_row = QHBoxLayout()
-        self._appearance_btn = _btn("生成外貌总结（读取 外貌设定/ 文件夹）", "Primary", self._generate_appearance_summary)
+        self._appearance_btn = _btn("根据参考图重新生成", "Primary", self._generate_appearance_summary)
         app_row.addWidget(self._appearance_btn)
+        app_row.addWidget(_btn("保存手动修改", "Soft", self._save_appearance_summary))
+        app_row.addWidget(_btn("复制到外貌设定", "Soft", self._copy_appearance_summary_to_profile))
+        app_row.addStretch(1)
         form.addRow(app_row)
 
         # ---- 特殊反应 ----
@@ -2605,13 +2620,40 @@ class MainWindow(QMainWindow):
 
     def _on_appearance_summary_done(self, summary, err=""):
         self._appearance_btn.setEnabled(True)
-        self._appearance_btn.setText("生成外貌总结（读取 外貌设定/ 文件夹）")
+        self._appearance_btn.setText("根据参考图重新生成")
         if err:
             QMessageBox.critical(self, "外貌总结失败", str(err))
         elif not summary:
             QMessageBox.warning(self, "外貌总结", "没有成功生成总结（网络失败或文件夹无有效图片）。请检查网络后重试。")
         else:
-            QMessageBox.information(self, "外貌总结", f"已生成并保存：\n{summary[:200]}")
+            self._appearance_summary_text.setPlainText(summary)
+            QMessageBox.information(self, "外貌总结", "已生成并保存，可在总结框中继续修改。")
+
+    def _save_appearance_summary(self):
+        """保存可编辑的参考图总结；空文本等同于清空该生图锚点。"""
+        try:
+            from appearance_ref import save_summary
+            save_summary(self._appearance_summary_text.toPlainText())
+            QMessageBox.information(self, "外貌总结", "外貌总结已保存，后续人物生图会使用这份内容。")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"无法保存外貌总结：{e}")
+
+    def _copy_appearance_summary_to_profile(self):
+        """把参考图总结复制进手动外貌设定，方便把两类描述合并管理。"""
+        summary = self._appearance_summary_text.toPlainText().strip()
+        if not summary:
+            QMessageBox.information(self, "外貌总结", "总结框为空，暂无内容可复制。")
+            return
+        target = self._text_widgets.get("GIRLFRIEND_APPEARANCE")
+        if target is None:
+            return
+        current = target.toPlainText().strip()
+        if summary == current or summary in current:
+            QMessageBox.information(self, "外貌设定", "这份总结已经在外貌设定中了。")
+            return
+        target.setPlainText(f"{current}\n\n{summary}".strip())
+        self._on_setting_changed()
+        QMessageBox.information(self, "外貌设定", "已复制到外貌设定，点击顶部“保存”即可持久化。")
 
     # ===================== 托盘 / 关闭 =====================
     def _create_tray(self):

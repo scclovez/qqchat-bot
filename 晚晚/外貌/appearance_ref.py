@@ -94,6 +94,15 @@ def load_summary():
         return ""
 
 
+def save_summary(summary: str):
+    """保存人工修订后的外貌锚定文本，供后续人物生图直接使用。"""
+    text = (summary or "").strip()
+    ensure_ref_dir()
+    with open(get_summary_file(), "w", encoding="utf-8") as f:
+        f.write(text)
+    logger.info("外貌总结已保存到：%s", get_summary_file())
+
+
 def _image_to_data_url(path):
     """把图片转成 base64 data URL，供视觉模型读取。"""
     ext = os.path.splitext(path)[1].lower()
@@ -178,8 +187,5 @@ async def summarize_appearance(client):
     if not final or any(m in final for m in FALLBACK_REPLY_MARKS):
         final = combined
 
-    ensure_ref_dir()
-    with open(get_summary_file(), "w", encoding="utf-8") as f:
-        f.write(final)
-    logger.info("外貌总结已生成并保存到：%s", get_summary_file())
+    save_summary(final)
     return final
