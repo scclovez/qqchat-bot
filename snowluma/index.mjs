@@ -215395,6 +215395,9 @@ function mapFeeds(data) {
 			nickname: f.nickname ?? "",
 			time: Number(f.abstime ?? 0),
 			appid: Number(f.appid ?? 0),
+			// `key` 用于好友动态列表去重；评论/点赞 CGI 则必须使用原说说 tid。
+			// 两者在部分动态中不同，不能再让调用方把 key 当作 tid。
+			tid: String(f.tid ?? ""),
 			key: String(f.key ?? f.feedskey ?? ""),
 			html: f.html ?? ""
 		})),

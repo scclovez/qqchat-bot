@@ -41,6 +41,10 @@ POST_IMAGE_PROB = 0.6        # 发说说配图概率（GUI 可调；0=纯文字�
 ACTION_GAP_MIN, ACTION_GAP_MAX = 3.0, 8.0  # 操作间随机间隔（秒）
 POST_HOUR_START, POST_HOUR_END = 8, 23      # 每天发说说的时间窗口
 POST_STALE_GRACE = 2 * 3600                 # 计划时间点错过超过 2 小时则跳过（不补发旧帖）
+FEED_COMMENT_RETRY_COOLDOWN = 6 * 3600      # 同一条动态评论失败后的重试冷却（秒）
+
+# 只记录本次运行期间的失败动态，避免网络/接口异常时每轮轮询都重复请求。
+_feed_comment_retry_after: dict[str, float] = {}
 
 
 def _feed_comment_prob() -> float:
@@ -155,6 +159,22 @@ def _html_to_text(html: str) -> str:
 
 def _gap():
     return random.uniform(ACTION_GAP_MIN, ACTION_GAP_MAX)
+
+
+def _can_retry_feed_comment(feed_key: str) -> bool:
+    """同一条好友动态评论失败后，冷却期内不再请求 QQ 空间。"""
+    return time.monotonic() >= _feed_comment_retry_after.get(feed_key, 0.0)
+
+
+def _record_feed_comment_failure(feed_key: str):
+    if feed_key:
+        _feed_comment_retry_after[feed_key] = (
+            time.monotonic() + FEED_COMMENT_RETRY_COOLDOWN
+        )
+
+
+def _clear_feed_comment_failure(feed_key: str):
+    _feed_comment_retry_after.pop(feed_key, None)
 
 
 def _extract_feed_image(html: str) -> str:
@@ -568,15 +588,28 @@ async def like_and_comment_feeds(api_call, llm_chat, self_uin, boyfriend_uin="")
     liked = commented = 0
     for feed in feeds:
         key = str(feed.get("key") or "")
+        tid = str(feed.get("tid") or "")
         uin = str(feed.get("uin") or "")
         if not key or uin == str(self_uin or ""):
             continue
         if "advertisement" in key or int(feed.get("appid") or 0) == 6600:
             continue  # 广告动态
+        # 好友动态流的 key 不能替代说说 tid。缺 tid 时不提交无效请求，
+        # 并在冷却后才再次记录，避免每轮轮询重复刷警告。
+        if not tid:
+            if _can_retry_feed_comment(key):
+                logger.warning("好友动态缺少 tid，跳过点赞/评论: %s", key)
+                _record_feed_comment_failure(key)
+            continue
         try:
             # 点赞（总是做，去重）
             if not is_processed(KIND_FEED_LIKED, key):
-                resp = await api_call("like_qzone", {"tid": key, "target_uin": uin})
+                # 点赞/评论 CGI 需要说说 tid；key 只是好友动态流的去重标识。
+                resp = await api_call("like_qzone", {
+                    "tid": tid,
+                    "target_uin": uin,
+                    "abstime": int(feed.get("time") or 0),
+                })
                 # 失败不 mark：下轮重试（防失败被记"已点赞"导致永久漏赞）
                 if resp is None or resp.get("status") == "failed" \
                         or resp.get("retcode") not in (None, 0):
@@ -587,6 +620,7 @@ async def like_and_comment_feeds(api_call, llm_chat, self_uin, boyfriend_uin="")
                     await asyncio.sleep(_gap())
             # 评论（按概率，去重）
             if (not is_processed(KIND_FEED_COMMENTED, key)
+                    and _can_retry_feed_comment(key)
                     and random.random() < _feed_comment_prob()):
                 text = _html_to_text(feed.get("html") or "")
                 if text:
@@ -617,16 +651,18 @@ async def like_and_comment_feeds(api_call, llm_chat, self_uin, boyfriend_uin="")
                     )
                     comment = (comment or "").strip()
                     if comment:
-                        # 评论好友动态必须带 target_uin=好友 uin（说说主人），
-                        # 缺参会报 retcode=100（SnowLuma CGI 需 hostuin 定位说说）
-                        resp = await api_call("comment_qzone", {"tid": key, "content": comment,
+                        # 评论 CGI 的 topicId 由 owner + 原说说 tid 组成，不能传好友流 key。
+                        resp = await api_call("comment_qzone", {"tid": tid, "content": comment,
                                                                "target_uin": uin})
                         # 失败不 mark：下轮重试（防失败被记"已评论"导致永久漏评）
                         if resp is None or resp.get("status") == "failed" \
                                 or resp.get("retcode") not in (None, 0):
-                            logger.warning("评论动态失败（不标记已处理，稍后重试）: %s", key)
+                            _record_feed_comment_failure(key)
+                            logger.warning("评论动态失败，已冷却 %.0f 小时后再试: %s",
+                                           FEED_COMMENT_RETRY_COOLDOWN / 3600, key)
                             continue
                         mark_processed(KIND_FEED_COMMENTED, key)
+                        _clear_feed_comment_failure(key)
                         commented += 1
                         logger.info("已评论好友动态 [%s]: %s", uin, comment[:30])
                         await asyncio.sleep(_gap())
