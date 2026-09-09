@@ -224,6 +224,67 @@ def build_mood_injection(user_id: str, longterm_memory) -> str:
 
 
 # =============================================================================
+# 6.5) 关系节奏：只保存抽象状态，不把原话再写一份
+# =============================================================================
+
+RELATIONSHIP_KEY_PREFIX = "relationship:v1:"
+RELATIONSHIP_CALLBACK_WORDS = ("明天", "等会", "晚点", "结果", "面试", "考试", "加班", "医院", "复查", "回来")
+RELATIONSHIP_WARM_WORDS = ("谢谢", "喜欢", "爱你", "抱抱", "亲亲", "辛苦", "想你")
+RELATIONSHIP_HURT_WORDS = ("烦", "别理", "讨厌", "滚", "算了")
+
+
+def _relationship_key(user_id: str, field: str) -> str:
+    return f"{RELATIONSHIP_KEY_PREFIX}{user_id}:{field}"
+
+
+def record_relationship_turn(user_id: str, user_text: str):
+    """记录关系的轻量余温与“可回访”信号，不保存用户原话。"""
+    now = time.time()
+    temperature_key = _relationship_key(user_id, "temperature")
+    last_key = _relationship_key(user_id, "last_turn")
+    try:
+        temperature = float(_get(temperature_key, "0") or 0)
+        last_turn = float(_get(last_key, "0") or 0)
+    except (TypeError, ValueError):
+        temperature, last_turn = 0.0, 0.0
+    # 情绪会自然回落，避免一句话把关系永久锁成某种戏剧状态。
+    if last_turn:
+        temperature *= max(0.35, 1 - min((now - last_turn) / 86400, 0.65))
+    text = user_text or ""
+    if any(word in text for word in RELATIONSHIP_WARM_WORDS):
+        temperature += 0.8
+    if any(word in text for word in RELATIONSHIP_HURT_WORDS):
+        temperature -= 0.7
+    _set(temperature_key, f"{max(-2.0, min(2.0, temperature)):.2f}")
+    _set(last_key, str(now))
+    if any(word in text for word in RELATIONSHIP_CALLBACK_WORDS):
+        # 只记“有一件事等进展”，不记具体内容；实际回访仍以最近对话为依据。
+        _set(_relationship_key(user_id, "callback_until"), str(now + 36 * 3600))
+
+
+def relationship_injection(user_id: str) -> str:
+    """给主关系注入连续感：关心有余温，但不把每条消息演成剧情。"""
+    try:
+        temperature = float(_get(_relationship_key(user_id, "temperature"), "0") or 0)
+        callback_until = float(_get(_relationship_key(user_id, "callback_until"), "0") or 0)
+    except (TypeError, ValueError):
+        temperature, callback_until = 0.0, 0.0
+    parts = [
+        "你和他有连续的相处感，但不要表演关系：先回应眼前的话，再让语气带一点余温；"
+        "不要每句都撒娇、吃醋、叫亲昵称呼，也不要为了证明记得而复述旧事。"
+    ]
+    if temperature >= 0.8:
+        parts.append("这阵子相处是放松的，语气可以自然软一点，但别黏得过头。")
+    elif temperature <= -0.8:
+        parts.append("刚刚有一点小别扭还没散，别翻旧账；语气略收着，给对方台阶。")
+    if callback_until > time.time():
+        parts.append("他前面提过一件还没结束的事；只有话题自然接得上时轻轻问一次进展，别催问。")
+    elif callback_until:
+        _set(_relationship_key(user_id, "callback_until"), "")
+    return "\n（关系节奏：" + "；".join(parts) + "）"
+
+
+# =============================================================================
 # 7) 纪念日（在一起第 N 天 / 周年）
 # =============================================================================
 

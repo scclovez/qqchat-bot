@@ -93,12 +93,20 @@ def test_config():
 
 def test_growth():
     import personality_state as pstate
+    import liveness
+    from memory import _select_relevant_memory
     assert pstate.get_stage() >= 1
     assert pstate.stage_name()
     assert pstate.lewdness_tier_name() in ("害羞", "主动", "放开")
     assert pstate.get_title() is not None
     inj = pstate.build_injection()
     assert isinstance(inj, str) and inj
+    # 真人感：关系余温只记抽象状态；记忆只在话题有关时被选中。
+    liveness.record_relationship_turn("test_relationship", "明天要去考试，谢谢你陪我")
+    relation = liveness.relationship_injection("test_relationship")
+    assert "关系节奏" in relation and "轻轻问一次进展" in relation
+    selected = _select_relevant_memory(["他喜欢咖啡", "他最近在准备考试"], "考试怎么样", 2)
+    assert selected == ["他最近在准备考试"]
 
 
 def test_providers():

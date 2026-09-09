@@ -433,6 +433,18 @@ class QQGirlfriendBot:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
 
+    @staticmethod
+    def _is_intimate_user(user_id) -> bool:
+        """指定主对象后，恋爱演变与主动亲密互动不再串到其他联系人。"""
+        primary = str(getattr(runtime, "PROACTIVE_ONLY_USER_ID", "") or "").strip()
+        return not primary or str(user_id) == primary
+
+    def _relationship_prompt(self, user_id) -> str:
+        if self._is_intimate_user(user_id):
+            return pstate.build_injection() + liveness.relationship_injection(user_id)
+        return ("\n（当前是普通朋友对话：自然、友好、有分寸；不要使用恋人称呼，"
+                "不要吃醋、查岗、暧昧追问，也不要把其他人的记忆或关系状态带进来。）")
+
     def _get_media_lock(self, user_id):
         """图片/自拍等慢任务专用锁（与文本回复锁分开）：
 
@@ -692,6 +704,8 @@ class QQGirlfriendBot:
         # 用户回复了 → 结束当前沉默期，重置未回复追问计数 与 冷场层级
         self._proactive_followups[user_id] = 0
         self._silence_fired[user_id] = set()
+        if self._is_intimate_user(user_id):
+            liveness.record_relationship_turn(user_id, raw_message)
         # 音乐分享卡片（网易云/QQ音乐等 json 卡片）→ 专门识别回应，不当普通文本
         music_share = self._extract_music_share(data)
         if music_share:
@@ -700,12 +714,13 @@ class QQGirlfriendBot:
             return
         # 晚安静默：用户道晚安 → 记录时间，之后 NIGHT_SILENCE_HOURS 小时内
         # 不主动发消息/撩人/追问（模拟真人已睡）；被动的回复不受影响
-        if self._is_night_said(raw_message):
+        if self._is_intimate_user(user_id) and self._is_night_said(raw_message):
             self._last_night_said[user_id] = time.time()
             hours = float(runtime.NIGHT_SILENCE_HOURS or 0)
             logger.info("用户道晚安，进入 %s 小时静默期 [%s]", hours, user_id)
         # 成长系统：用户提及"别人/别的女生" → 醋意倾向 +2
-        if any(k in raw_message for k in ("别人", "别的女生", "别的女人", "别的朋友", "她是谁")):
+        if (self._is_intimate_user(user_id)
+                and any(k in raw_message for k in ("别人", "别的女生", "别的女人", "别的朋友", "她是谁"))):
             pstate.add_jealousy(2)
             growth_diary.add_mood_tag("吃醋")
             logger.info("检测到提及他人，醋意倾向 +2 [%s]", user_id)
@@ -713,12 +728,12 @@ class QQGirlfriendBot:
             if pstate.get_jealousy() >= 4:
                 asyncio.create_task(self._sync_signature(liveness.SIGNATURE_JEALOUS))
         # 成长系统：亲密/露骨话题 → 淫乱度 +1（只积累数值，面板只读展示）
-        if any(k in raw_message for k in INTIMATE_TRIGGERS):
+        if self._is_intimate_user(user_id) and any(k in raw_message for k in INTIMATE_TRIGGERS):
             pstate.add_lewdness(1)
             pstate.mark_intimate()  # 亲密/露骨话题：记录用于能量骤降 + 贤者时间
             logger.info("检测到亲密话题，淫乱度 +1 [%s]", user_id)
         # 活人感：哄话消气（改签名"今天天气好好"）；没哄且没在生气时低概率闹脾气（签名"哼"）
-        if runtime.LIVENESS_ENABLED:
+        if runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id):
             if liveness.soothe_angry(user_id, raw_message):
                 asyncio.create_task(self._sync_signature(liveness.SIGNATURE_HAPPY))
             elif liveness.try_trigger_angry(user_id):
@@ -761,7 +776,7 @@ class QQGirlfriendBot:
             messages = self._memory.get_messages(user_id)
             # 将长期记忆注入 system prompt（替换默认的纯人设 prompt）
             messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
-                user_id, build_system_prompt(),
+                user_id, build_system_prompt(), raw_message,
             ) + "\n\n" + SHORT_REPLY_REMINDER
             # 注入实时信息：当前时间（必带）+ 天气/联网搜索（按消息关键词触发）
             await self._inject_live_context(messages, raw_message, user_id)
@@ -770,13 +785,14 @@ class QQGirlfriendBot:
             if use_voice:
                 messages[0]["content"] += "\n\n" + VOICE_INSTRUCTION
             # 雌小鬼模式：进入亲密/暧昧状态时切换（设定级，任何方式触发）
-            messages[0]["content"] += MESUGAKI_INSTRUCTION
+            if self._is_intimate_user(user_id):
+                messages[0]["content"] += MESUGAKI_INSTRUCTION
             # 配图机制：让模型自己判断这条回复是否配图、配什么图
             messages[0]["content"] += ILLUSTRATION_INSTRUCTION
             # 阶段性格演变：每次回复前注入当前阶段/特征值描述
-            messages[0]["content"] += pstate.build_injection()
+            messages[0]["content"] += self._relationship_prompt(user_id)
             # 活人感状态注入：情绪日 / 闹脾气 / 深夜困意 / 生日 / 短消息对称 / 称呼 / 纪念日 / 翻旧账
-            if runtime.LIVENESS_ENABLED:
+            if runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id):
                 mood_inj = liveness.build_mood_injection(user_id, longterm_memory)
                 if mood_inj:
                     messages[0]["content"] += mood_inj
@@ -973,14 +989,15 @@ class QQGirlfriendBot:
         await self._reply_split(msg_type, target_id, user_id, message_id, reply_text,
                                 force_voice=use_voice, dual_voice=_dual)
         # 成长系统：正常对话 → 亲密度 +1
-        pstate.add_affection(1)
-        growth_diary.add_affection_delta(1)
+        if self._is_intimate_user(user_id):
+            pstate.add_affection(1)
+            growth_diary.add_affection_delta(1)
 
         # 表情包：按概率随机附带一张（命中关键词时概率提升）
         await self._maybe_send_sticker(msg_type, target_id, user_id, raw_message)
 
         # 回马枪：低概率安排"3-5 分钟后突然补一句"，模拟她还在想刚才的事
-        if (runtime.LIVENESS_ENABLED and msg_type == "private"
+        if (runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id) and msg_type == "private"
                 and random.random() < liveness.AFTERTHOUGHT_PROB):
             asyncio.create_task(self._afterthought_delayed(user_id, raw_message))
 
@@ -1218,8 +1235,9 @@ class QQGirlfriendBot:
             longterm_memory.add_chat_history(user_id, "assistant", reply)
         except Exception as e:
             logger.warning("记录歌曲回应失败: %s", e)
-        pstate.add_affection(1)
-        growth_diary.add_affection_delta(1)
+        if self._is_intimate_user(user_id):
+            pstate.add_affection(1)
+            growth_diary.add_affection_delta(1)
         logger.info("识别到音乐分享 %s → %r", song, reply[:40])
 
     @staticmethod
@@ -2187,7 +2205,8 @@ class QQGirlfriendBot:
         longterm_memory.add_chat_history(user_id, "user", user_text or "我想看看你")
         modifier = self._extract_selfie_modifier(user_text or "") or "日常甜美自拍"
         # 成长系统：请求睡衣/内衣/贴身等亲密穿着自拍 → 淫乱度 +2
-        if any(k in modifier for k in ("睡衣", "内衣", "贴身", "情趣", "裸", "吊带")):
+        if (self._is_intimate_user(user_id)
+                and any(k in modifier for k in ("睡衣", "内衣", "贴身", "情趣", "裸", "吊带"))):
             pstate.add_lewdness(2)
             logger.info("亲密自拍请求，淫乱度 +2 [%s]", user_id)
         pre = await self._generate_pre_reply(
@@ -3232,6 +3251,7 @@ class QQGirlfriendBot:
             messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
                 user_id, build_system_prompt(),
             ) + "\n\n" + SHORT_REPLY_REMINDER
+            messages[0]["content"] += self._relationship_prompt(user_id)
             await self._inject_live_context(messages, "", user_id)
             # 主动消息话题依据：从最近聊过的内容延伸（必须），此刻状态作辅助背景
             trigger = self._build_proactive_trigger(user_id)
@@ -3337,6 +3357,7 @@ class QQGirlfriendBot:
                 messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
                     user_id, build_system_prompt(),
                 ) + "\n\n" + SHORT_REPLY_REMINDER
+                messages[0]["content"] += self._relationship_prompt(user_id)
                 messages.append({"role": "user", "content": PROACTIVE_FOLLOWUP_TRIGGER})
                 reply = await self._deepseek.chat(messages)
                 reply = (reply or "").strip()
