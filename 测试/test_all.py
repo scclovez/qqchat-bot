@@ -95,6 +95,7 @@ def test_growth():
     import personality_state as pstate
     import liveness
     from memory import _select_relevant_memory
+    from qq_bot import split_reply_text
     assert pstate.get_stage() >= 1
     assert pstate.stage_name()
     assert pstate.lewdness_tier_name() in ("害羞", "主动", "放开")
@@ -107,6 +108,8 @@ def test_growth():
     assert "关系节奏" in relation and "轻轻问一次进展" in relation
     selected = _select_relevant_memory(["他喜欢咖啡", "他最近在准备考试"], "考试怎么样", 2)
     assert selected == ["他最近在准备考试"]
+    parts = split_reply_text("第一句稍微有一点长，需要自然切开。\n第二句是补充。\n第三句。\n第四句不应发送。")
+    assert 1 <= len(parts) <= 3 and all(len(part) <= 32 for part in parts)
 
 
 def test_providers():

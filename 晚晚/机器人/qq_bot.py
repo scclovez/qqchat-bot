@@ -32,15 +32,18 @@ import boundary
 
 logger = logging.getLogger(__name__)
 
-# 拆分发送：多条消息之间的发送间隔（秒），避免 QQ 频率限制
-# （活人感开启时实际间隔由 liveness.split_gap_seconds 按情绪抖动，这里只作兜底）
-SPLIT_INTERVAL = 0.6
+# 拆分发送：只有确实需要分条时，消息之间停 1~2 秒，像正常打字后的补充。
+SPLIT_INTERVAL_MIN = 1.0
+SPLIT_INTERVAL_MAX = 2.0
 
 # 单条消息最大字符数：超出后按句末标点二次切分，保证每条都是短消息
-MAX_MSG_LEN = 50
+MAX_MSG_LEN = 32
 
 # 单次回复总字符数上限：兜底截断，防止上下文越长回复越长
-MAX_REPLY_LEN = 150
+MAX_REPLY_LEN = 96
+
+# 这是防刷屏的保护上限，不是默认回复条数；正常回复由模型按语义决定是否分条。
+MAX_REPLY_PARTS = 3
 
 # 语音拆条：真人发语音是一条条录、一条条发的，条与条之间随机停顿（秒）。
 # 间隔要够明显（1.5s+），否则 QQ 会把相邻语音连在一起显示成"一口气发完"
@@ -64,9 +67,12 @@ QZONE_TICK_PERIOD = 6
 
 # 追加在 system prompt 末尾的短回复提醒（模型对 prompt 末尾注意力最强，对抗长对话稀释）
 SHORT_REPLY_REMINDER = (
-    "【最后提醒】无论聊了多久、记忆多长，你的回复都必须保持很短："
-    "每次只回一小段（几个字到一两句话），严禁一长串长文字；"
-    "要说的事情多，就把每条短消息单独一行，用换行分开。"
+    "【最后提醒】把每次回复当成一次自然聊天，不是在写小作文："
+    "先说最想回应的那一句，通常是 6~24 个字、完整但简短；"
+    "只有确实有补充、转折或情绪递进时才另起一条，每条都要有实际内容。"
+    "不要把一句完整的话硬拆开，不要先单独发“嗯/好吧/哼”再堆一长段；"
+    "想说很多时只挑最重要的一点，剩下的留给对方下一句再聊。"
+    "不要连续写三段以上，也不要把多句解释一次性倾倒出来。"
     "别再滥用省略号：不要用“……”开头、不要把每句话都用省略号断开——"
     "真人聊天一口气说一句是一句，只有欲言又止时才偶尔用一个省略号。"
     "句式也要自然多变：不要每条都走“哼→嘴硬→心软→催睡/明天见”的老套路，"
@@ -357,12 +363,12 @@ def _split_by_tilde(text: str) -> list[str]:
 
 def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
                      max_total: int = MAX_REPLY_LEN) -> list[str]:
-    """把 AI 回复拆成多条短消息，模拟真人逐条发送。
+    """按语义停顿拆出少量短消息，而非把一段回答机械切碎。
 
     - 先按任意换行拆分
     - 每行再按波浪号 ~ ～ 拆成多条短消息（波浪号是自然的短消息分隔符）
     - 单段超过 max_msg_len 时按句末标点二次切分
-    - 累计超过 max_total 时丢弃剩余部分（防止回复随上下文变长）
+    - 累计超过 max_total 或达到防刷屏上限时丢弃剩余部分
     """
     line_parts = [p.strip() for p in re.split(r"\n+", text)]
     line_parts = [p for p in line_parts if p]
@@ -377,6 +383,8 @@ def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
                 return result
             result.append(s)
             total += len(s)
+            if len(result) >= MAX_REPLY_PARTS:
+                return result
     return result
 
 
@@ -2294,19 +2302,10 @@ class QQGirlfriendBot:
         parts = split_reply_text(text)
         if not parts:
             return
-        # 关键句前留白：重要/情绪话前先发"……/嗯…"，停顿 2-3 秒再发正文（呼吸感）
-        if runtime.LIVENESS_ENABLED and msg_type == "private" and len(parts) >= 2:
-            lead = liveness.maybe_leadin()
-            if lead:
-                await self._reply(msg_type, target_id, user_id, 0, lead)
-                await asyncio.sleep(random.uniform(2.0, 3.0))
-        # 两条消息间的间隔随情绪变化（呼吸感）：每条间隔都随机抖动，像真人逐条打字
+        # 不自动加“嗯/……”之类的无信息前导；若模型确实分条，才留出正常打字停顿。
         for i, part in enumerate(parts):
             if i > 0:
-                if runtime.LIVENESS_ENABLED:
-                    await asyncio.sleep(liveness.split_gap_seconds(text))
-                else:
-                    await asyncio.sleep(SPLIT_INTERVAL)
+                await asyncio.sleep(random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
             await self._reply(msg_type, target_id, user_id, message_id if i == 0 else 0, part)
         # 多模态联动：dual_voice —— 文字发完后，再补一句"语音小尾巴"
         # （重要时刻：晚安/纪念日/道歉等，真人会"文字+语音"一起表达；
