@@ -24,7 +24,12 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import episodic_memory
-from sqlite_runtime import BOT_DB_LOCK, connect_bot_db
+from sqlite_runtime import (
+    BOT_DB_LOCK,
+    connect_bot_db,
+    is_database_busy,
+    rollback_quietly,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,17 +192,25 @@ atexit.register(close_db)
 # =============================================================================
 
 def add_chat_history(user_id: str, role: str, content: str) -> int:
-    """写入一条聊天记录，返回自增 id。"""
+    """写入一条聊天记录，返回自增 id；临时占锁时降级而不中断回复。"""
     if not content.strip():
         return 0
-    conn = _get_conn()
-    with _lock:
-        cur = conn.execute(
-            "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
-            (str(user_id), role, content),
-        )
-        conn.commit()
-        return cur.lastrowid
+    conn = None
+    try:
+        conn = _get_conn()
+        with _lock:
+            cur = conn.execute(
+                "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
+                (str(user_id), role, content),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.OperationalError as exc:
+        rollback_quietly(conn)
+        if not is_database_busy(exc):
+            raise
+        logger.warning("聊天记录写入遇到数据库占用，本条仅保留在对话上下文中")
+        return 0
 
 
 def get_recent_history(user_id: str, limit: int = 10) -> list[dict]:
