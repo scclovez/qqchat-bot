@@ -254,12 +254,45 @@ def test_gui():
     result = {}
 
     def verify():
+        message_box_methods = {
+            name: getattr(gui_qt.QMessageBox, name)
+            for name in ("question", "information", "warning", "critical")
+        }
+        gui_qt.QMessageBox.question = (
+            lambda *args, **kwargs: gui_qt.QMessageBox.StandardButton.Yes)
+        for name in ("information", "warning", "critical"):
+            setattr(
+                gui_qt.QMessageBox, name,
+                lambda *args, **kwargs: gui_qt.QMessageBox.StandardButton.Ok,
+            )
         try:
             result["tabs"] = win.tabs.count()
             result["growth"] = len(win._growth_labels)
             result["growth_groups"] = len(win.findChildren(QFrame, "GrowthGroup"))
             result["has_axes"] = hasattr(win, "_personality_axes_var")
+            result["compact_dashboard"] = all(
+                card.maximumHeight() <= 155 for card in win._dashboard_status_cards
+            )
             win._refresh_growth_stats()
+
+            # 模拟接口已返回模型列表：选中下拉项应立即写入模块分派。
+            provider_combo, model_combo = win._assign_vars["chat"]
+            assign_status = win._assign_status_labels["chat"]
+            requested_provider = provider_combo.currentData() or ""
+            win._on_assign_models_loaded(
+                "chat", provider_combo, model_combo, assign_status, requested_provider,
+                ["test-model-a", "test-model-b"], None, "测试提供商", True,
+            )
+            model_index = model_combo.findText("test-model-b")
+            model_combo.setCurrentIndex(model_index)
+            model_combo.activated.emit(model_index)
+            from llm_providers import get_assignment
+            result["model_selectable"] = (
+                model_combo.isEnabled()
+                and model_combo.currentText() == "test-model-b"
+                and get_assignment("chat").get("model") == "test-model-b"
+                and assign_status.text() == "已应用"
+            )
 
             generated_dir = pathlib.Path(gui_qt.data_path("晚晚", "图片", "生成图片"))
             audio_dir = pathlib.Path(gui_qt.data_path("晚晚", "语音", "语音缓存"))
@@ -287,20 +320,17 @@ def test_gui():
                 button.text() == "删除" for button in audio_actions.findChildren(QPushButton)
             )
 
-            original_question = gui_qt.QMessageBox.question
-            gui_qt.QMessageBox.question = lambda *args, **kwargs: gui_qt.QMessageBox.StandardButton.Yes
-            try:
-                result["generated_deleted"] = win._delete_media_file("generated", generated_file)
-                result["audio_deleted"] = win._delete_media_file("audio", audio_file)
-                result["appearance_protected"] = (
-                    not win._delete_media_file("appearance", appearance_file)
-                    and appearance_file.exists()
-                )
-            finally:
-                gui_qt.QMessageBox.question = original_question
+            result["generated_deleted"] = win._delete_media_file("generated", generated_file)
+            result["audio_deleted"] = win._delete_media_file("audio", audio_file)
+            result["appearance_protected"] = (
+                not win._delete_media_file("appearance", appearance_file)
+                and appearance_file.exists()
+            )
             app.processEvents()
             win.close()
         finally:
+            for name, method in message_box_methods.items():
+                setattr(gui_qt.QMessageBox, name, method)
             app.quit()
 
     QTimer.singleShot(1500, verify)
@@ -309,13 +339,15 @@ def test_gui():
     assert result.get("growth") == 16, "16 项陪伴指标必须完整保留"
     assert result.get("growth_groups") == 7, "陪伴状态应归并为 7 张分组卡片"
     assert result.get("has_axes"), "性格轮廓应位于分组卡片内"
+    assert result.get("compact_dashboard"), "首页三张运行状态卡应保持紧凑"
+    assert result.get("model_selectable"), "获取后的模型必须可选并立即保存"
     assert result.get("generated_delete_button"), "生成图片应显示删除按钮"
     assert result.get("audio_delete_button"), "语音缓存应显示删除按钮"
     assert result.get("appearance_has_no_delete"), "人设图片不应显示删除按钮"
     assert result.get("generated_deleted"), "生成图片删除功能应生效"
     assert result.get("audio_deleted"), "语音缓存删除功能应生效"
     assert result.get("appearance_protected"), "删除逻辑必须保护人设图片"
-    print("      GUI 7 页、独立陪伴状态与素材删除权限 OK")
+    print("      GUI 7 页、紧凑首页、模型分派与素材删除权限 OK")
 
 
 def main():

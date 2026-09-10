@@ -544,7 +544,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(quick)
 
         qq, qq_lay = _card(tab, "QQ")
-        qq.setMinimumHeight(190)
+        qq.setMinimumHeight(138)
+        qq.setMaximumHeight(155)
         self._qq_status_var = _label("未检测", "Status")
         qq_lay.addWidget(self._qq_status_var)
         self._qq_version_var = _label("版本：-", "Muted")
@@ -557,38 +558,48 @@ class MainWindow(QMainWindow):
         cards.addWidget(qq, 1)
 
         sl, sl_lay = _card(tab, "SNOWLUMA")
-        sl.setMinimumHeight(190)
+        sl.setMinimumHeight(138)
+        sl.setMaximumHeight(155)
         self._snowluma_status_var = _label("已停止", "Status")
         sl_lay.addWidget(self._snowluma_status_var)
         sl_lay.addStretch(1)
         self._sl_btn_start = _btn("启动", "Success", self._start_snowluma)
-        self._sl_btn_start.setFixedHeight(38)
-        sl_lay.addWidget(self._sl_btn_start)
+        self._sl_btn_start.setFixedHeight(32)
         self._sl_btn_stop = _btn("停止", "Danger", self._stop_snowluma)
-        self._sl_btn_stop.setFixedHeight(38)
+        self._sl_btn_stop.setFixedHeight(32)
         self._sl_btn_stop.setEnabled(False)
-        sl_lay.addWidget(self._sl_btn_stop)
         self._sl_btn_restart = _btn("重启", "Soft", self._restart_snowluma)
-        self._sl_btn_restart.setFixedHeight(34)
-        sl_lay.addWidget(self._sl_btn_restart)
+        self._sl_btn_restart.setFixedHeight(32)
+        sl_actions = QHBoxLayout()
+        sl_actions.setSpacing(6)
+        sl_actions.addWidget(self._sl_btn_start)
+        sl_actions.addWidget(self._sl_btn_stop)
+        sl_actions.addWidget(self._sl_btn_restart)
+        sl_lay.addLayout(sl_actions)
         cards.addWidget(sl, 1)
 
         bot, bot_lay = _card(tab, "bot")
-        bot.setMinimumHeight(190)
+        bot.setMinimumHeight(138)
+        bot.setMaximumHeight(155)
         self._status_var = _label("已停止", "Status")
         bot_lay.addWidget(self._status_var)
         bot_lay.addStretch(1)
         self._btn_start = _btn("启动", "Success", self._start_bot)
-        self._btn_start.setFixedHeight(38)
-        bot_lay.addWidget(self._btn_start)
+        self._btn_start.setFixedHeight(32)
         self._btn_stop = _btn("停止", "Danger", self._stop_bot)
-        self._btn_stop.setFixedHeight(38)
+        self._btn_stop.setFixedHeight(32)
         self._btn_stop.setEnabled(False)
-        bot_lay.addWidget(self._btn_stop)
         self._btn_restart = _btn("重启", "Soft", self._restart_bot)
-        self._btn_restart.setFixedHeight(34)
-        bot_lay.addWidget(self._btn_restart)
+        self._btn_restart.setFixedHeight(32)
+        bot_actions = QHBoxLayout()
+        bot_actions.setSpacing(6)
+        bot_actions.addWidget(self._btn_start)
+        bot_actions.addWidget(self._btn_stop)
+        bot_actions.addWidget(self._btn_restart)
+        bot_lay.addLayout(bot_actions)
         cards.addWidget(bot, 1)
+        self._dashboard_status_cards = (qq, sl, bot)
+        outer.addStretch(1)
 
     # ===================== 陪伴状态 =====================
     def _build_companion_tab(self):
@@ -1189,40 +1200,66 @@ class MainWindow(QMainWindow):
 
         # ---- 模块分派 ----
         outer.addSpacing(8)
-        outer.addWidget(_label("模块分派", "SectionTitle"))
         self._assign_vars = {}
+        self._assign_status_labels = {}
+        self._assign_apply_buttons = {}
         try:
             from llm_providers import load_providers as lp_load, get_assignment as lp_ass
             providers = lp_load()
         except Exception:
             providers = []
-        for cat, label in (("chat", "对话"), ("task", "文字任务"), ("vision", "看图")):
-            r = QHBoxLayout()
-            r.addWidget(_label("⚡ " + label + "："))
+        assign_card, assign_lay = _card(body, "模块分派")
+        assign_lay.addWidget(_label(
+            "为不同任务选择提供商和具体模型。选择下拉项会立即保存；手动输入后点击“应用”。",
+            "Muted",
+        ))
+        assign_grid = QGridLayout()
+        assign_grid.setContentsMargins(0, 4, 0, 0)
+        assign_grid.setHorizontalSpacing(8)
+        assign_grid.setVerticalSpacing(8)
+        for col, text in enumerate(("用途", "提供商", "模型", "操作", "状态")):
+            assign_grid.addWidget(_label(text, "GrowthMetricName"), 0, col)
+        for row_index, (cat, label) in enumerate(
+                (("chat", "对话"), ("task", "文字任务"), ("vision", "看图")), start=1):
+            assign_grid.addWidget(_label("⚡ " + label), row_index, 0)
             choices = [("（当前激活）", "")] + [
                 ((p.get("name") or p.get("id")), p.get("id")) for p in providers]
             cb = QComboBox()
             for name, pid in choices:
                 cb.addItem(name, pid)
-            cb.setFixedWidth(220)
-            r.addWidget(cb)
+            cb.setMinimumWidth(155)
+            assign_grid.addWidget(cb, row_index, 1)
             # 模型：可从"获取模型"列表直接下拉选择，也可手输（留空 = 用提供商默认）
             mvar = QComboBox()
             mvar.setEditable(True)
             mvar.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-            mvar.setFixedWidth(220)
+            mvar.setMinimumWidth(210)
+            mvar.setMaxVisibleItems(18)
             mvar.addItem("（提供商默认）", "")
             try:
                 saved = lp_ass(cat).get("model") or ""
                 if saved:
-                    mvar.setCurrentText(saved)
+                    mvar.setEditText(saved)
             except Exception:
                 pass
-            r.addWidget(mvar)
-            r.addWidget(_btn("获取模型", "Soft",
-                             lambda _c=False, c=cat, cbs=cb, mv=mvar: self._fill_assign_models(c, cbs, mv)))
-            r.addStretch(1)
-            outer.addLayout(r)
+            assign_grid.addWidget(mvar, row_index, 2)
+            action_box = QWidget(assign_card)
+            action_lay = QHBoxLayout(action_box)
+            action_lay.setContentsMargins(0, 0, 0, 0)
+            action_lay.setSpacing(5)
+            status = _label("已保存", "Muted")
+            fetch_btn = _btn("获取模型", "Soft")
+            apply_btn = _btn("应用", "Primary")
+            fetch_btn.clicked.connect(
+                lambda _c=False, c=cat, cbs=cb, mv=mvar, st=status:
+                self._fill_assign_models(c, cbs, mv, st))
+            apply_btn.clicked.connect(
+                lambda _c=False, c=cat, cbs=cb, mv=mvar, st=status:
+                self._on_assign(c, cbs, mv, st))
+            action_lay.addWidget(fetch_btn)
+            action_lay.addWidget(apply_btn)
+            assign_grid.addWidget(action_box, row_index, 3)
+            assign_grid.addWidget(status, row_index, 4)
             cur = ""
             try:
                 cur = lp_ass(cat).get("provider") or ""
@@ -1232,10 +1269,20 @@ class MainWindow(QMainWindow):
             cb.setCurrentIndex(idx)
             # 更换提供商 → 清空该模块的模型列表（重新获取）
             cb.currentIndexChanged.connect(
-                lambda _i, c=cat, cbs=cb, mv=mvar: self._on_assign_provider(c, cbs, mv))
-            mvar.currentTextChanged.connect(
-                lambda _t, c=cat, cbs=cb, mv=mvar: self._on_assign(c, cbs, mv))
+                lambda _i, c=cat, cbs=cb, mv=mvar, st=status:
+                self._on_assign_provider(c, cbs, mv, st))
+            # activated 只在用户从下拉列表选择时触发，避免获取列表期间误写默认项。
+            mvar.activated.connect(
+                lambda _i, c=cat, cbs=cb, mv=mvar, st=status:
+                self._on_assign(c, cbs, mv, st))
             self._assign_vars[cat] = (cb, mvar)
+            self._assign_status_labels[cat] = status
+            self._assign_apply_buttons[cat] = apply_btn
+
+        assign_grid.setColumnStretch(1, 2)
+        assign_grid.setColumnStretch(2, 3)
+        assign_lay.addLayout(assign_grid)
+        outer.addWidget(assign_card)
 
         outer.addSpacing(8)
         self._conn_form = QFormLayout()
@@ -1246,7 +1293,7 @@ class MainWindow(QMainWindow):
         outer.addStretch(1)
         self._refresh_models_tab()
 
-    def _on_assign(self, cat, cb, mv):
+    def _on_assign(self, cat, cb, mv, status=None):
         try:
             from llm_providers import set_assignment
             # 可编辑下拉：选中具体项/手输 = 模型名；"（提供商默认）"或空 = 留空（用提供商默认）
@@ -1254,10 +1301,18 @@ class MainWindow(QMainWindow):
             if not model or model == "（提供商默认）":
                 model = ""
             set_assignment(cat, cb.currentData() or "", model)
-        except Exception:
-            pass
+            if status is not None:
+                status.setText("已应用")
+                status.setStyleSheet("color: #719781;")
+            return True
+        except Exception as e:
+            logger.warning("保存模型分派失败 [%s]: %s", cat, e)
+            if status is not None:
+                status.setText("保存失败")
+                status.setStyleSheet("color: #c66d7c;")
+            return False
 
-    def _on_assign_provider(self, cat, cb, mv):
+    def _on_assign_provider(self, cat, cb, mv, status=None):
         """更换提供商：清空该模块的模型列表，回到"（提供商默认）"，并自动拉取新供应商的模型。"""
         mv.blockSignals(True)
         try:
@@ -1265,11 +1320,11 @@ class MainWindow(QMainWindow):
             mv.addItem("（提供商默认）", "")
         finally:
             mv.blockSignals(False)
-        self._on_assign(cat, cb, mv)
+        self._on_assign(cat, cb, mv, status)
         # 自动填充该供应商的模型下拉（失败静默，按钮可手动刷新）
-        self._fill_assign_models(cat, cb, mv, silent=True)
+        self._fill_assign_models(cat, cb, mv, status, silent=True)
 
-    def _fill_assign_models(self, cat, cb, mv, silent=False):
+    def _fill_assign_models(self, cat, cb, mv, status=None, silent=False):
         """获取所选提供商 的模型列表，填充到该模块的模型下拉框。
 
         silent=True（自动触发）失败时静默，不给用户弹错；按钮点击时为 False，弹正确/错误提示。
@@ -1293,6 +1348,11 @@ class MainWindow(QMainWindow):
         ptype = p.get("type")
         api_key = p.get("api_key") or ""
         base_url = p.get("base_url") or ""
+        requested_provider = pid
+        mv.setEnabled(False)
+        if status is not None:
+            status.setText("获取中…")
+            status.setStyleSheet("")
 
         def worker():
             import asyncio
@@ -1312,12 +1372,22 @@ class MainWindow(QMainWindow):
                 models = asyncio.run(_run())
             except Exception as e:
                 err = str(e)
-            self._safe_after(0, lambda: self._on_assign_models_loaded(mv, models, err, name, silent))
+            self._safe_after(0, lambda: self._on_assign_models_loaded(
+                cat, cb, mv, status, requested_provider, models, err, name, silent))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_assign_models_loaded(self, mv, models, err, name, silent=False):
+    def _on_assign_models_loaded(
+            self, cat, cb, mv, status, requested_provider, models, err, name, silent=False):
+        # 用户在请求期间切换了提供商，丢弃旧响应，避免列表被过时结果覆盖。
+        if (cb.currentData() or "") != requested_provider:
+            return
+        mv.setEnabled(True)
+        models = list(dict.fromkeys(str(model).strip() for model in (models or []) if str(model).strip()))
         if not models:
+            if status is not None:
+                status.setText("获取失败")
+                status.setStyleSheet("color: #c66d7c;")
             if not silent:
                 QMessageBox.warning(self, "获取模型", f"{name}：{err or '未返回任何模型'}")
             return
@@ -1328,12 +1398,19 @@ class MainWindow(QMainWindow):
             mv.addItem("（提供商默认）", "")
             for m in models:
                 mv.addItem(m, m)
-            if cur and cur in models:
+            if cur and cur != "（提供商默认）":
+                if mv.findText(cur) < 0:
+                    mv.addItem(cur, cur)
                 mv.setCurrentText(cur)
         finally:
             mv.blockSignals(False)
+        if status is not None:
+            status.setText(f"{len(models)} 个可选")
+            status.setStyleSheet("color: #719781;")
         if not silent:
-            QMessageBox.information(self, "模型列表", f"{name}：已获取 {len(models)} 个模型，可直接下拉选择")
+            QMessageBox.information(self, "模型列表", f"{name}：已获取 {len(models)} 个模型。关闭提示后可直接选择。")
+            mv.setFocus()
+            mv.showPopup()
 
     def _conn_row(self, label):
         """连接设置区一行：返回 (标签, 容器布局)。"""
