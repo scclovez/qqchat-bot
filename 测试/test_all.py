@@ -9,7 +9,7 @@
     2. 配置加载（.env 与 llm_providers.json 若存在则校验；纯开发版可跳过）
     3. 成长系统（性格阶段 / 淫乱度档位 / 称号 计算不抛异常）
     4. 提供商配置读写（llm_providers.json 可读写）
-    5. GUI 冒烟（PySide6 构建 6 个页面并自动关闭）
+    5. GUI 冒烟（PySide6 构建 7 个页面，校验素材删除边界并自动关闭）
 """
 import atexit
 import os
@@ -244,8 +244,8 @@ def test_providers():
 
 
 def test_gui():
-    """GUI 冒烟：真实桌面构建 6 页 + 陪伴状态分组卡片，1.5 秒后自动退出。"""
-    from PySide6.QtWidgets import QApplication, QFrame
+    """GUI 冒烟：构建 7 页，校验陪伴页与素材删除权限后自动退出。"""
+    from PySide6.QtWidgets import QApplication, QFrame, QPushButton
     from PySide6.QtCore import QTimer
     import gui_qt
     app = QApplication([])
@@ -260,6 +260,44 @@ def test_gui():
             result["growth_groups"] = len(win.findChildren(QFrame, "GrowthGroup"))
             result["has_axes"] = hasattr(win, "_personality_axes_var")
             win._refresh_growth_stats()
+
+            generated_dir = pathlib.Path(gui_qt.data_path("晚晚", "图片", "生成图片"))
+            audio_dir = pathlib.Path(gui_qt.data_path("晚晚", "语音", "语音缓存"))
+            appearance_dir = pathlib.Path(win._media_folder("appearance"))
+            for folder in (generated_dir, audio_dir, appearance_dir):
+                folder.mkdir(parents=True, exist_ok=True)
+            generated_file = generated_dir / "gui_delete_test.png"
+            audio_file = audio_dir / "gui_delete_test.wav"
+            appearance_file = appearance_dir / "gui_keep_test.png"
+            generated_file.write_bytes(b"test-image")
+            audio_file.write_bytes(b"test-audio")
+            appearance_file.write_bytes(b"test-appearance")
+            win._refresh_media_library()
+
+            generated_card = win._media_gallery_layouts["generated"].itemAt(0).widget()
+            appearance_card = win._media_gallery_layouts["appearance"].itemAt(0).widget()
+            result["generated_delete_button"] = any(
+                button.text() == "删除" for button in generated_card.findChildren(QPushButton)
+            )
+            result["appearance_has_no_delete"] = all(
+                button.text() != "删除" for button in appearance_card.findChildren(QPushButton)
+            )
+            audio_actions = win._media_audio_table.cellWidget(0, 3)
+            result["audio_delete_button"] = any(
+                button.text() == "删除" for button in audio_actions.findChildren(QPushButton)
+            )
+
+            original_question = gui_qt.QMessageBox.question
+            gui_qt.QMessageBox.question = lambda *args, **kwargs: gui_qt.QMessageBox.StandardButton.Yes
+            try:
+                result["generated_deleted"] = win._delete_media_file("generated", generated_file)
+                result["audio_deleted"] = win._delete_media_file("audio", audio_file)
+                result["appearance_protected"] = (
+                    not win._delete_media_file("appearance", appearance_file)
+                    and appearance_file.exists()
+                )
+            finally:
+                gui_qt.QMessageBox.question = original_question
             app.processEvents()
             win.close()
         finally:
@@ -267,11 +305,17 @@ def test_gui():
 
     QTimer.singleShot(1500, verify)
     app.exec()
-    assert result.get("tabs") == 6, "应有 6 个顶级页"
+    assert result.get("tabs") == 7, "陪伴状态独立后应有 7 个顶级页"
     assert result.get("growth") == 16, "16 项陪伴指标必须完整保留"
     assert result.get("growth_groups") == 7, "陪伴状态应归并为 7 张分组卡片"
     assert result.get("has_axes"), "性格轮廓应位于分组卡片内"
-    print("      GUI 6 页构建 OK，陪伴状态 16 项归并为 7 组 OK")
+    assert result.get("generated_delete_button"), "生成图片应显示删除按钮"
+    assert result.get("audio_delete_button"), "语音缓存应显示删除按钮"
+    assert result.get("appearance_has_no_delete"), "人设图片不应显示删除按钮"
+    assert result.get("generated_deleted"), "生成图片删除功能应生效"
+    assert result.get("audio_deleted"), "语音缓存删除功能应生效"
+    assert result.get("appearance_protected"), "删除逻辑必须保护人设图片"
+    print("      GUI 7 页、独立陪伴状态与素材删除权限 OK")
 
 
 def main():

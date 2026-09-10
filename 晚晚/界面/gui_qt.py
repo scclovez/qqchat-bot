@@ -513,6 +513,7 @@ class MainWindow(QMainWindow):
     def _build_pages(self):
         self._build_dashboard_tab()
         self._build_personality_tab()
+        self._build_companion_tab()
         self._build_media_tab()
         self._build_connection_tab()
         self._build_settings_tab()
@@ -526,7 +527,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(14)
         outer.addWidget(_label("今天也在陪着你", "PageTitle"))
-        outer.addWidget(_label("在这里查看运行状态、成长变化与最近的陪伴记录。", "Muted"))
+        outer.addWidget(_label("在这里管理运行状态，并快速前往常用功能。", "Muted"))
 
         cards = QHBoxLayout()
         cards.setSpacing(12)
@@ -589,7 +590,17 @@ class MainWindow(QMainWindow):
         bot_lay.addWidget(self._btn_restart)
         cards.addWidget(bot, 1)
 
-        growth, growth_lay = _card(tab, "今日陪伴状态")
+    # ===================== 陪伴状态 =====================
+    def _build_companion_tab(self):
+        tab = QWidget()
+        self.tabs.addTab(tab, "陪伴状态")
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        outer.addWidget(_label("今日陪伴状态", "PageTitle"))
+        outer.addWidget(_label("从此刻状态到长期成长，集中查看小晚今天与你相处的变化。", "Muted"))
+
+        growth, growth_lay = _card(tab, "状态总览")
         grid = QGridLayout()
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setHorizontalSpacing(8)
@@ -682,7 +693,7 @@ class MainWindow(QMainWindow):
         for c in range(3):
             grid.setColumnStretch(c, 1)
         growth_lay.addLayout(grid)
-        outer.addWidget(growth)
+        outer.addWidget(growth, 1)
 
         self._refresh_growth_stats()
 
@@ -701,8 +712,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._media_tabs, 1)
         self._media_gallery_layouts = {}
         self._media_path_labels = {}
-        self._build_image_gallery_page("generated", "生成图片", "小晚生成并发送过的图片，按最近生成时间排列。")
-        self._build_image_gallery_page("appearance", "人设图片", "用于外貌总结与人物一致性的参考图。")
+        self._build_image_gallery_page("generated", "生成图片", "小晚生成并发送过的图片，可预览或删除。")
+        self._build_image_gallery_page("appearance", "人设图片", "用于外貌总结与人物一致性的参考图，仅供查看，不提供删除。")
         self._build_audio_library_page()
         self._media_tabs.currentChanged.connect(self._refresh_current_media_page)
         self._refresh_media_library()
@@ -746,7 +757,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 10, 0, 0)
         lay.setSpacing(8)
         card, cl = _card(page, "语音缓存")
-        cl.addWidget(_label("小晚发送过的语音会保存在这里，可直接播放。", "Muted"))
+        cl.addWidget(_label("小晚发送过的语音会保存在这里，可直接播放或删除。", "Muted"))
         self._media_audio_path = _label("", "Muted")
         self._media_audio_path.setWordWrap(True)
         cl.addWidget(self._media_audio_path)
@@ -774,6 +785,7 @@ class MainWindow(QMainWindow):
         self._audio_player = QMediaPlayer(self)
         self._audio_player.setAudioOutput(self._audio_output)
         self._audio_player.playbackStateChanged.connect(self._on_audio_playback_state)
+        self._playing_audio_path = None
 
     def _media_folder(self, kind: str) -> str:
         if kind == "generated":
@@ -836,6 +848,11 @@ class MainWindow(QMainWindow):
             row = QHBoxLayout()
             row.addWidget(_btn("预览", "Soft", lambda _=False, p=path: self._open_image_preview(p)))
             row.addWidget(_btn("定位", "Ghost", lambda _=False, p=path: self._open_in_folder(p)))
+            if kind == "generated":
+                row.addWidget(_btn(
+                    "删除", "SoftRed",
+                    lambda _=False, p=path: self._delete_media_file("generated", p),
+                ))
             row.addStretch(1)
             card_lay.addLayout(row)
             grid.addWidget(card, index // 3, index % 3)
@@ -853,7 +870,16 @@ class MainWindow(QMainWindow):
             table.setItem(row, 1, QTableWidgetItem(
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))))
             table.setItem(row, 2, QTableWidgetItem(_human_size(path.stat().st_size)))
-            table.setCellWidget(row, 3, _btn("播放", "Soft", lambda _=False, p=path: self._play_audio(p)))
+            actions = QWidget(table)
+            actions_lay = QHBoxLayout(actions)
+            actions_lay.setContentsMargins(2, 1, 2, 1)
+            actions_lay.setSpacing(5)
+            actions_lay.addWidget(_btn("播放", "Soft", lambda _=False, p=path: self._play_audio(p)))
+            actions_lay.addWidget(_btn(
+                "删除", "SoftRed",
+                lambda _=False, p=path: self._delete_media_file("audio", p),
+            ))
+            table.setCellWidget(row, 3, actions)
 
     def _open_media_page(self, index: int):
         self._select_main_page("素材库")
@@ -910,17 +936,62 @@ class MainWindow(QMainWindow):
         except OSError as e:
             QMessageBox.warning(self, "无法打开文件夹", str(e))
 
+    def _delete_media_file(self, kind: str, path: Path) -> bool:
+        """仅允许从生成图片/语音缓存的直属目录删除单个媒体文件。"""
+        if kind not in {"generated", "audio"}:
+            return False
+        allowed_exts = IMAGE_EXTS if kind == "generated" else AUDIO_EXTS
+        try:
+            folder = Path(self._media_folder(kind)).resolve()
+            target = Path(path).resolve(strict=True)
+        except (OSError, RuntimeError):
+            if kind == "generated":
+                self._refresh_image_gallery("generated")
+            else:
+                self._refresh_audio_library()
+            return False
+        # 不接受子目录、软链接逃逸或伪装扩展名，避免界面误删缓存目录外的文件。
+        if target.parent != folder or target.suffix.lower() not in allowed_exts:
+            QMessageBox.warning(self, "无法删除", "该文件不在允许删除的素材缓存目录中。")
+            return False
+        media_name = "生成图片" if kind == "generated" else "语音缓存"
+        answer = QMessageBox.question(
+            self,
+            f"删除{media_name}",
+            f"确定永久删除「{target.name}」吗？\n此操作无法撤销。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            if kind == "audio" and self._playing_audio_path == target:
+                self._audio_player.stop()
+                self._audio_player.setSource(QUrl())
+                self._playing_audio_path = None
+            target.unlink()
+        except OSError as e:
+            QMessageBox.warning(self, "删除失败", str(e))
+            return False
+        if kind == "generated":
+            self._refresh_image_gallery("generated")
+        else:
+            self._refresh_audio_library()
+            self._media_audio_state.setText("已删除语音缓存")
+        return True
+
     def _play_audio(self, path: Path):
-        self._audio_player.setSource(QUrl.fromLocalFile(str(path)))
+        self._playing_audio_path = Path(path).resolve()
+        self._audio_player.setSource(QUrl.fromLocalFile(str(self._playing_audio_path)))
         self._audio_player.play()
         self._media_audio_state.setText(f"正在播放：{path.name}")
 
     def _stop_audio(self):
         self._audio_player.stop()
+        self._playing_audio_path = None
         self._media_audio_state.setText("未播放")
 
     def _on_audio_playback_state(self, state):
         if state == QMediaPlayer.PlaybackState.StoppedState:
+            self._playing_audio_path = None
             self._media_audio_state.setText("未播放")
 
     # ===================== 人设编辑 =====================
