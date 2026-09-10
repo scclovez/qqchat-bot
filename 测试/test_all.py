@@ -72,7 +72,7 @@ def check(name, fn):
 
 def test_imports():
     mods = [
-        "config", "llm_providers", "personality", "liveness", "boundary",
+        "config", "llm_providers", "personality", "liveness", "emotion_state", "boundary",
         "conversation", "dialogue_policy", "episodic_memory", "memory", "usage", "image_gen", "comfyui_client",
         "appearance_ref", "qq_bot", "llm_base", "openai_compat",
         "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
@@ -95,6 +95,7 @@ def test_growth():
     from datetime import datetime, timedelta
     import personality_state as pstate
     import liveness
+    import emotion_state
     import evolution
     import life_state
     import dialogue_policy
@@ -159,6 +160,7 @@ def test_growth():
     scheduled = life_state.get_snapshot(base_time)
     assert scheduled["activity"] and scheduled["location"]
     assert life_state.get_snapshot(base_time)["started_at"] == scheduled["started_at"]
+    assert not life_state._get_conn().in_transaction, "生活状态读取后不应遗留写事务"
     changed = life_state.observe_assistant_reply(
         "我正在画画，等下去洗澡。", base_time,
     )
@@ -184,6 +186,15 @@ def test_growth():
     mention_plan = dialogue_policy.plan_turn("我今天拍了一张照片")
     assert not mention_plan.allow_image
     assert "本轮对话策略" in playful_plan.injection()
+    mood_plan = dialogue_policy.plan_turn(
+        "宝宝", mood_state={"angry": 42, "hurt": 10, "tired": 5, "happy": 0},
+    )
+    assert mood_plan.max_parts == 1 and not mood_plan.allow_sticker
+    assert set(emotion_state.snapshot("test_emotion")) == set(emotion_state.EMOTIONS)
+    emotion_state.apply_event("test_emotion", "hurt", 45, "test_hurt")
+    assert not liveness.emotion_allows_playful_media("test_emotion")
+    assert liveness.emotion_sticker_factor("test_emotion") < 0.2
+    assert "委屈" in liveness.selfie_mood_modifier("test_emotion")
     assert len(split_reply_text("第一条。\n第二条。", max_parts=1)) == 1
     clipped = split_reply_text("这是一条明显超过极小总长度上限的回复", max_total=8)
     assert clipped and len(clipped[0]) <= 8
@@ -233,7 +244,7 @@ def test_providers():
 
 
 def test_gui():
-    """GUI 冒烟：真实桌面构建 5 页 + 成长网格，1.5 秒后自动退出（不阻塞）。"""
+    """GUI 冒烟：真实桌面构建 6 页 + 成长网格，1.5 秒后自动退出（不阻塞）。"""
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QTimer
     import gui_qt
@@ -254,9 +265,9 @@ def test_gui():
 
     QTimer.singleShot(1500, verify)
     app.exec()
-    assert result.get("tabs") == 5, "应有 5 个顶级页"
+    assert result.get("tabs") == 6, "应有 6 个顶级页"
     assert result.get("growth") == 16, "成长网格应为 16 格（4×4）"
-    print("      GUI 5 页构建 OK，成长网格 16 格 OK")
+    print("      GUI 6 页构建 OK，成长网格 16 格 OK")
 
 
 def main():

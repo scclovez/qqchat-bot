@@ -238,6 +238,9 @@ def get_snapshot(now: datetime = None) -> dict:
         ).fetchone()
         state = _row_dict(row)
         if state and float(state.get("expected_end_at") or 0) > now_ts:
+            # 上面的过期计划 UPDATE 已开启写事务；即使当前状态无需变化也必须提交，
+            # 否则该连接会长期占住 bot_memory.db，随后所有记忆/情绪写入都会 locked。
+            conn.commit()
             return state
         # 明确说过或计划产生的活动结束后，保留 20 分钟自然过渡。
         if state and (str(state.get("source", "")).startswith(("assistant", "plan:"))):

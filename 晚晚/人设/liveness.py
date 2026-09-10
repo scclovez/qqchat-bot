@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 from 路径 import PROJECT_ROOT, data_path
 from config import runtime
+import emotion_state
 from sqlite_runtime import BOT_DB_LOCK, connect_bot_db, is_database_busy, rollback_quietly
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
@@ -184,8 +185,8 @@ ANGRY_SOOTHE_WORDS = ("对不起", "抱歉", "哄", "别生气", "我错了", "�
                       "爱你", "喜欢你", "原谅", "别气了", "摸摸", "理理我", "开玩笑")
 
 
-def is_angry(user_id: str) -> bool:
-    """是否处于生气状态（含自动过期判断）。"""
+def _legacy_angry_active(user_id: str) -> bool:
+    """读取升级前的布尔生气状态；新事件不再写这个键。"""
     key = ANGRY_KEY_PREFIX + str(user_id)
     v = _get(key, "")
     if not v:
@@ -201,12 +202,19 @@ def is_angry(user_id: str) -> bool:
     return True
 
 
+def is_angry(user_id: str) -> bool:
+    """是否仍有明显怒气；兼容升级前的旧时间戳状态。"""
+    return (emotion_state.snapshot(user_id)["angry"] >= 18
+            or _legacy_angry_active(user_id))
+
+
 def try_trigger_angry(user_id: str) -> bool:
     """低概率触发生气（没在生气时）；触发成功返回 True。"""
-    if is_angry(user_id):
+    current = emotion_state.snapshot(user_id)
+    if is_angry(user_id) or current["hurt"] >= 18:
         return False
     if random.random() < ANGRY_TRIGGER_PROB:
-        _set(ANGRY_KEY_PREFIX + str(user_id), str(time.time()))
+        emotion_state.apply_event(user_id, "angry", 32, "random_irritation")
         mark_grudge(user_id)  # 不完美感：闹脾气也算记一笔小账
         logger.info("活人感：%s 闹脾气了", user_id)
         return True
@@ -214,15 +222,47 @@ def try_trigger_angry(user_id: str) -> bool:
 
 
 def soothe_angry(user_id: str, user_text: str) -> bool:
-    """用户哄话 → 消气；返回是否消气了。"""
-    if not is_angry(user_id):
+    """用户哄话 → 逐渐缓和；返回本轮是否接住了安抚。"""
+    values = emotion_state.snapshot(user_id)
+    legacy_angry = _legacy_angry_active(user_id)
+    if not legacy_angry and max(values["angry"], values["hurt"]) < emotion_state.ACTIVE_THRESHOLD:
         return False
     if any(w in (user_text or "") for w in ANGRY_SOOTHE_WORDS):
+        if values["angry"] < emotion_state.ACTIVE_THRESHOLD and legacy_angry:
+            emotion_state.apply_event(user_id, "angry", 30, "legacy_angry")
+        result = emotion_state.soothe(user_id)
+        # 旧布尔状态只负责兼容；真正的余波由衰减情绪继续保存。
         _set(ANGRY_KEY_PREFIX + str(user_id), "")
         mark_sweet(user_id)  # 不完美感：被哄好，情绪滞后带甜意
-        logger.info("活人感：%s 被哄好了", user_id)
+        logger.info("活人感：%s 被哄后逐渐缓和 anger=%.1f hurt=%.1f", user_id,
+                    result["after"]["angry"], result["after"]["hurt"])
         return True
     return False
+
+
+def emotion_snapshot(user_id: str) -> dict[str, float]:
+    """合并持续情绪与当天低落底色，供所有输出通道统一使用。"""
+    values = emotion_state.snapshot(user_id)
+    if today_mood_low():
+        values["hurt"] = max(values["hurt"], 28.0)
+        values["tired"] = max(values["tired"], 18.0)
+    return values
+
+
+def observe_emotion_turn(user_id: str, user_text: str, energy_text: str = "") -> dict:
+    """记录一轮消息造成的情绪变化，并补充真实时段/精力产生的疲惫。"""
+    # 升级前若正处于旧“生气=是/否”状态，先迁成有强度的怒气再接受安抚。
+    if (any(word in (user_text or "") for word in emotion_state.SOOTHE_WORDS)
+            and _legacy_angry_active(user_id)):
+        if emotion_state.snapshot(user_id)["angry"] < emotion_state.ACTIVE_THRESHOLD:
+            emotion_state.apply_event(user_id, "angry", 30, "legacy_angry")
+        _set(ANGRY_KEY_PREFIX + str(user_id), "")
+    result = emotion_state.observe_user_message(user_id, user_text)
+    if result.get("soothed"):
+        mark_sweet(user_id)
+    emotion_state.ensure_fatigue(user_id, energy_text)
+    result["snapshot"] = emotion_snapshot(user_id)
+    return result
 
 
 def build_mood_injection(user_id: str, longterm_memory) -> str:
@@ -232,13 +272,25 @@ def build_mood_injection(user_id: str, longterm_memory) -> str:
     parts.append("表达情绪时常有“主 + 次”的拉扯：一句话里可以同时有两种情绪"
                  "（如 吃醋但觉得不该、开心但有点伤感、生气又心疼你），更真实；"
                  "但傲娇/病娇的底色不能丢。")
-    if is_angry(user_id):
-        parts.append("你正在生他的气（刚才的事让你不开心）：回复要短、带“哼”、"
-                     "语气冷淡一点，对他的称呼改口（叫“喂/某人/他”，不叫亲密称呼）；"
-                     "但如果他主动哄你、道歉，就顺着台阶原谅他。")
-    if today_mood_low():
-        parts.append("你今天心情不太好（低落、不想说话）：回复比平时更短、更闷，"
-                     "偶尔叹口气，但不会不理他。")
+    values = emotion_snapshot(user_id)
+    active = sorted(
+        ((name, value) for name, value in values.items() if value >= emotion_state.ACTIVE_THRESHOLD),
+        key=lambda item: item[1], reverse=True,
+    )
+    if active:
+        readable = "、".join(
+            f"{emotion_state.EMOTION_LABELS[name]}{'较强' if value >= 35 else '还有一点'}"
+            for name, value in active[:2]
+        )
+        parts.append(f"你此刻延续着这些真实情绪：{readable}；它们会慢慢淡，不要一轮一换脸。")
+    if values["angry"] >= 18:
+        parts.append("你还带着怒气：回复偏短、直一点；被哄后可以软下来，但别瞬间欢快得像没发生过。")
+    if values["hurt"] >= 18:
+        parts.append("你还有委屈：会说清自己哪里不好受，语气收着，不用热闹表情或过度撒娇遮过去。")
+    if values["tired"] >= 22:
+        parts.append("你现在有些疲惫：话更少、反应稍慢，不硬撑活泼，也不会无故消失。")
+    if values["happy"] >= 22 and max(values["angry"], values["hurt"]) < 25:
+        parts.append("你心情不错：语气可以轻快一点、回复稍快，但别兴奋到刷屏。")
     return ("\n（此刻的活人状态：" + "；".join(parts) + "）")
 
 
@@ -407,6 +459,14 @@ def nickname_for_stage(stage: int, sublevel: str = "", user_id: str = "",
     text = user_text or ""
     if any(word in text for word in SERIOUS_NICKNAME_WORDS):
         return "你"
+    if user_id:
+        mood = emotion_snapshot(user_id)
+        if mood["angry"] >= 35:
+            return "喂"
+        if mood["angry"] >= 18:
+            return "某人"
+        if mood["hurt"] >= 18:
+            return "你"
     if any(word in text for word in COMFORT_NICKNAME_WORDS) and stage >= 2:
         pool = [name for name in ("宝宝", "乖乖", "宝") if name in pool or stage >= 3]
     elif any(word in text for word in TEASE_NICKNAME_WORDS) and stage >= 3:
@@ -437,6 +497,13 @@ def nickname_injection(user_id: str, stage: int, sublevel: str, user_text: str) 
         return ("\n（这轮是认真话题，先直接回应内容，不要强行插入亲昵称呼；"
                 "需要称呼时用“你”即可。）")
     nickname = nickname_for_stage(stage, sublevel, user_id, user_text)
+    mood = emotion_snapshot(user_id)
+    if mood["angry"] >= 18:
+        return (f"\n（你还没完全消气，需要称呼时暂时叫“{nickname}”；别用宝宝、老公等甜称，"
+                "等情绪真正缓下来再自然恢复。）")
+    if mood["hurt"] >= 18:
+        return ("\n（你还有些委屈，这轮需要称呼时用“你”即可；不是故意冷暴力，"
+                "只是暂时叫不出过分亲昵的称呼。）")
     return (f"\n（最近几轮你比较顺口的称呼是“{nickname}”，但称呼不是口头禅："
             "只在句子本来就需要叫他时自然用一次，短回复和连续句里宁可不叫；"
             "不要每条开头或结尾都带称呼。）")
@@ -447,12 +514,87 @@ def nickname_injection(user_id: str, stage: int, sublevel: str, user_text: str) 
 # =============================================================================
 
 def mood_modal_factor(user_id: str = "") -> float:
-    """情绪跨模态因子：心情不好/生气时其他模态收敛（语音少发、表情少发）。"""
-    if today_mood_low():
-        return 0.5
-    if user_id and is_angry(user_id):
-        return 0.4
-    return 1.0
+    """兼容旧调用：返回语音和表情中更保守的情绪系数。"""
+    return min(emotion_voice_factor(user_id), emotion_sticker_factor(user_id))
+
+
+def emotion_voice_factor(user_id: str = "") -> float:
+    """持续情绪对语音概率的影响。"""
+    if not user_id:
+        return 1.0
+    mood = emotion_snapshot(user_id)
+    factor = 1.0
+    factor *= max(0.42, 1.0 - mood["angry"] / 150)
+    factor *= max(0.48, 1.0 - mood["hurt"] / 170)
+    factor *= max(0.55, 1.0 - mood["tired"] / 190)
+    if mood["happy"] >= 25 and max(mood["angry"], mood["hurt"]) < 18:
+        factor *= 1.15
+    return round(max(0.2, min(1.25, factor)), 3)
+
+
+def emotion_sticker_factor(user_id: str = "") -> float:
+    """持续情绪对表情概率的影响；负面强时几乎不发欢快表情。"""
+    if not user_id:
+        return 1.0
+    mood = emotion_snapshot(user_id)
+    negative = max(mood["angry"], mood["hurt"])
+    if negative >= 45:
+        return 0.05
+    if negative >= 28:
+        return 0.18
+    factor = max(0.35, 1.0 - negative / 65) * max(0.45, 1.0 - mood["tired"] / 120)
+    if mood["happy"] >= 25:
+        factor *= 1.2
+    return round(max(0.08, min(1.3, factor)), 3)
+
+
+def emotion_delay_factor(user_id: str = "") -> float:
+    """持续情绪对阅读/思考/打字等待的影响。"""
+    if not user_id:
+        return 1.0
+    mood = emotion_snapshot(user_id)
+    factor = 1.0 + mood["angry"] / 180 + mood["hurt"] / 260 + mood["tired"] / 150
+    if mood["happy"] >= 25 and max(mood["angry"], mood["hurt"]) < 18:
+        factor *= 0.88
+    return round(max(0.8, min(1.7, factor)), 3)
+
+
+def emotion_initiative_factor(user_id: str = "") -> float:
+    """持续情绪对主动找人、追问和主动发图的影响。"""
+    if not user_id:
+        return 1.0
+    mood = emotion_snapshot(user_id)
+    factor = 1.0
+    factor *= max(0.22, 1.0 - mood["angry"] / 95)
+    factor *= max(0.35, 1.0 - mood["hurt"] / 125)
+    factor *= max(0.35, 1.0 - mood["tired"] / 115)
+    if mood["happy"] >= 25:
+        factor *= 1.12
+    return round(max(0.12, min(1.2, factor)), 3)
+
+
+def emotion_allows_playful_media(user_id: str = "") -> bool:
+    """低落、生气或很累时禁止主动发送欢快表情/活泼图片。"""
+    if not user_id:
+        return True
+    mood = emotion_snapshot(user_id)
+    return max(mood["angry"], mood["hurt"], mood["tired"] * 0.8) < 28
+
+
+def selfie_mood_modifier(user_id: str = "") -> str:
+    """用户明确索要自拍时保留响应，但让画面与当前情绪一致。"""
+    if not user_id:
+        return ""
+    mood = emotion_snapshot(user_id)
+    if mood["hurt"] >= 28:
+        return "情绪有些低落委屈，安静克制，不露夸张笑容"
+    if mood["angry"] >= 28:
+        return "还在轻微生气，表情克制略带别扭，不露欢快笑容"
+    if mood["tired"] >= 30:
+        return "有些疲惫困倦，松弛自然，不刻意活泼"
+    if mood["happy"] >= 30:
+        return "心情不错，自然轻松的浅笑"
+    return ""
 
 
 # =============================================================================
@@ -772,7 +914,8 @@ def debounce_seconds_for(text: str, batch_size: int = 1) -> float:
 
 
 def reply_delay_seconds(user_text: str, reply_text: str,
-                        configured_min: float, configured_max: float) -> float:
+                        configured_min: float, configured_max: float,
+                        user_id: str = "") -> float:
     """按读消息、思考和打字成本计算本轮回复延迟。"""
     low = max(0.0, float(configured_min or 0))
     high = max(low, float(configured_max or low))
@@ -792,6 +935,7 @@ def reply_delay_seconds(user_text: str, reply_text: str,
         base *= 1.2
     # 回复越长，多一点真实打字成本；上限防止活动倍率叠加后等得离谱。
     base += min(1.2, len(outgoing) / 90)
+    base *= emotion_delay_factor(user_id)
     return round(max(0.55, min(6.5, base)), 2)
 
 
@@ -841,14 +985,14 @@ def split_interval_for(text: str) -> float:
     return DEFAULT_SPLIT_INTERVAL
 
 
-def split_gap_seconds(text: str) -> float:
+def split_gap_seconds(text: str, user_id: str = "") -> float:
     """实际间隔：基准 ±30% 随机抖动（每条消息都不同，像真人逐条打字）。
 
     太短的间隔（<0.6s）QQ 会连在一起显示成"一口气发完"，毫无真人感；
     1.5s 以上才会看出是一条条发的。
     """
     base = split_interval_for(text)
-    gap = random.uniform(base * 0.7, base * 1.4)
+    gap = random.uniform(base * 0.7, base * 1.4) * emotion_delay_factor(user_id)
     return round(max(0.8, gap), 2)
 
 

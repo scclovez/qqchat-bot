@@ -77,7 +77,7 @@ GROWTH_HINTS = {
     "stage": "性格阶段：随相处推进，从礼貌试探 → 热情升温 → 深度绑定，影响她的语气与状态",
     "rel_hot": "关系温度：最近这段关系的冷热感（不是亲密度），由今日活跃与亲密度推导",
     "energy": "能量状态：她今天累不累（结合当前时段与今日聊天量）",
-    "mood": "实时情绪：从最近的聊天内容里感觉到她此刻的心情",
+    "mood": "实时情绪：优先显示会自然衰减的持续情绪，不再只看聊天关键词",
     "affection": "亲密度：每聊一句 +1，反映关系的亲密程度；到阈值进入下一阶段",
     "dependency": "依赖度：她有多依赖你；主动聊天、追问、撩人都会增加",
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
@@ -85,7 +85,7 @@ GROWTH_HINTS = {
     "nickname": "她最近几轮顺口的称呼；会随关系、语境自然变化，认真话题会收敛，也不会每句话都叫",
     "now_thought": "今天一件值得记的小事（大模型提炼，最生动/最生活感的那一件）",
     "state": "连续生活状态：包含地点、活动、开始与预计结束时间；明确说出的计划会在到点后自动推进",
-    "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
+    "mood_state": "情绪状态：开心 / 生气 / 委屈 / 疲惫的当前强度，以及今天被惹次数",
     "days": "在一起第几天（从纪念日起始日期算起）",
     "memory": "她长期记忆里关于你的事（提炼的事实 + 偏好数量）",
     "chats": "累计聊天的消息条数",
@@ -2158,7 +2158,8 @@ class MainWindow(QMainWindow):
             vals["rel_hot"] = dig.get("rel") or pstate.relationship_temperature()
             vals["energy"] = dig.get("energy") or pstate.energy_state()
             vals["now_thought"] = dig.get("moment") or pstate.current_thought(boyfriend)
-            vals["mood"] = dig.get("mood") or pstate.current_mood(boyfriend)
+            live_mood = pstate.current_mood(boyfriend) if boyfriend else "平静"
+            vals["mood"] = live_mood if live_mood != "平静" else (dig.get("mood") or live_mood)
             delta = growth_diary.get_today_affection_delta()
             vals["mood_delta"] = f"{'+' if delta > 0 else ''}{delta}" if delta else ""
             moods = []
@@ -2166,8 +2167,17 @@ class MainWindow(QMainWindow):
                 moods.append("心情低落")
             if boyfriend:
                 try:
-                    if liveness.is_angry(boyfriend):
-                        moods.append("闹脾气")
+                    import emotion_state
+                    emotion_values = liveness.emotion_snapshot(boyfriend)
+                    active_emotions = sorted(
+                        ((name, value) for name, value in emotion_values.items()
+                         if value >= emotion_state.ACTIVE_THRESHOLD),
+                        key=lambda item: item[1], reverse=True,
+                    )
+                    moods.extend(
+                        f"{emotion_state.EMOTION_LABELS[name]} {round(value):d}%"
+                        for name, value in active_emotions[:2]
+                    )
                     gr = liveness.grudge_count_today(boyfriend)
                     if gr > 0:
                         moods.append(f"被惹 {gr} 次")

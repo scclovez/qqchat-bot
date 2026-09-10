@@ -29,7 +29,7 @@ PATHEX = [ROOT] + [os.path.join(ROOT, d) for d in FEATURE_DIRS]
 # 中文目录模块（PyInstaller 分析不到动态 sys.path，显式列出）
 HIDDEN = [
     "PySide6.QtMultimedia",
-    "config", "llm_providers", "personality", "liveness", "boundary",
+    "config", "llm_providers", "personality", "liveness", "emotion_state", "boundary",
     "conversation", "dialogue_policy", "episodic_memory", "memory", "usage", "image_gen", "comfyui_client",
     "appearance_ref", "qq_bot", "llm_base", "openai_compat",
     "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
@@ -37,7 +37,7 @@ HIDDEN = [
     "active_pull", "qzone", "interact_tools", "sqlite_runtime", "tray",
     "语音.asr", "语音.tts", "图片.image_gen", "图片.comfyui_client",
     "配置.config", "配置.llm_providers", "界面.gui_qt", "界面.tray",
-    "人设.personality", "人设.liveness", "人设.boundary",
+    "人设.personality", "人设.liveness", "人设.emotion_state", "人设.boundary",
     "对话.conversation", "对话.dialogue_policy", "对话.episodic_memory", "对话.memory", "机器人.qq_bot",
     "客户端.llm_factory", "客户端.deepseek_client", "客户端.openai_compat",
     "客户端.llm_base", "实时.live_info", "实时.life_state", "工具.singleton", "用量.usage",

@@ -93,6 +93,8 @@ def should_pull(last_user_msg_ts, user_id: str = "") -> bool:
     try:
         if user_id and liveness.grudge_count_today(user_id) >= 2:
             return False
+        if user_id and liveness.emotion_initiative_factor(user_id) < 0.55:
+            return False
     except Exception:
         pass
     silence = (time.time() - last_user_msg_ts) / 3600 if last_user_msg_ts else 999
@@ -114,9 +116,12 @@ def _period_text() -> str:
     return "深夜"
 
 
-def _build_persona_prompt() -> str:
+def _build_persona_prompt(user_id: str = "") -> str:
     from personality import build_system_prompt
-    return build_system_prompt() + "\n\n" + personality_state.build_injection()
+    prompt = build_system_prompt() + "\n\n" + personality_state.build_injection()
+    if user_id:
+        prompt += liveness.build_mood_injection(user_id, None)
+    return prompt
 
 
 async def check_and_run(bot, user_id) -> bool:
@@ -132,7 +137,7 @@ async def check_and_run(bot, user_id) -> bool:
             stage=personality_state.stage_name(),
         )
         reply = await bot._deepseek.chat(
-            [{"role": "system", "content": _build_persona_prompt()}, {"role": "user", "content": prompt}],
+            [{"role": "system", "content": _build_persona_prompt(user_id)}, {"role": "user", "content": prompt}],
             max_tokens=80,
         )
         reply = (reply or "").strip()

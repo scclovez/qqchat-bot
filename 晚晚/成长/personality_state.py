@@ -419,7 +419,21 @@ _MOOD_LEXICON = [
 
 
 def current_mood(user_id: str = "") -> str:
-    """实时情绪：从今天最近的 assistant 消息里用情绪词检测她此刻的心情。"""
+    """实时情绪：优先读取可衰减状态，旧聊天词频只作无状态时的兜底。"""
+    if user_id:
+        try:
+            import emotion_state
+            import liveness
+            mood = liveness.emotion_snapshot(user_id)
+            active = sorted(
+                ((name, value) for name, value in mood.items()
+                 if value >= emotion_state.ACTIVE_THRESHOLD),
+                key=lambda item: item[1], reverse=True,
+            )
+            if active:
+                return " / ".join(emotion_state.EMOTION_LABELS[name] for name, _ in active[:2])
+        except Exception:
+            pass
     try:
         import memory as longterm_memory
         conn = longterm_memory._get_conn()
@@ -441,14 +455,6 @@ def current_mood(user_id: str = "") -> str:
     if counts:
         top = [k for k, _v in sorted(counts.items(), key=lambda x: -x[1])[:2]]
         return " / ".join(top)
-    try:
-        import liveness
-        if liveness.today_mood_low():
-            return "低落"
-        if user_id and liveness.is_angry(user_id):
-            return "生气"
-    except Exception:
-        pass
     return "平静"
 
 

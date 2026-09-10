@@ -5,9 +5,11 @@
 必须回应的重点、决定回复方式与长度，并约束这一轮可使用的互动和多模态动作。
 不额外请求大模型，不保存用户原话。
 """
+from __future__ import annotations
+
 from dataclasses import dataclass
 import re
-from typing import Iterable, Tuple
+from typing import Iterable, Mapping, Tuple
 
 
 URGENT_WORDS = (
@@ -170,7 +172,8 @@ def _classify(text: str):
 
 
 def plan_turn(user_text: str, *, user_sent_voice: bool = False,
-              user_sent_image: bool = False, is_intimate: bool = True) -> TurnPlan:
+              user_sent_image: bool = False, is_intimate: bool = True,
+              mood_state: Mapping[str, float] | None = None) -> TurnPlan:
     """生成本轮策略。返回值只存在于当前处理过程，不写数据库。"""
     text = (user_text or "").strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -233,6 +236,27 @@ def plan_turn(user_text: str, *, user_sent_voice: bool = False,
     allow_sticker = playful or intent in ("轻量应答", "回应分享")
     allow_afterthought = intent in ("亲密回应", "回应分享") and not multi
     allow_dual_voice = intent in ("亲密回应", "回应道歉") and not multi
+
+    # 她自己的持续情绪会改变这一轮的表达预算和动作出口，而不只影响提示词语气。
+    mood = dict(mood_state or {})
+    angry = float(mood.get("angry", 0) or 0)
+    hurt = float(mood.get("hurt", 0) or 0)
+    tired = float(mood.get("tired", 0) or 0)
+    happy = float(mood.get("happy", 0) or 0)
+    negative = max(angry, hurt)
+    if negative >= 18 or tired >= 28:
+        reduction = 12 if negative >= 35 or tired >= 45 else 7
+        max_len = max(min_len, max_len - reduction)
+        hard_max = max(max_len, hard_max - reduction)
+        if negative >= 35 or tired >= 45:
+            max_parts = 1
+        allow_sticker = False
+        allow_afterthought = False
+        allow_dual_voice = False
+        allowed_tools = ()
+    elif happy >= 30:
+        max_len = min(62, max_len + 4)
+        hard_max = min(72, hard_max + 4)
 
     return TurnPlan(
         intent=intent,

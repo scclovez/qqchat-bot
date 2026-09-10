@@ -413,7 +413,7 @@ def _to_qzone_image_src(path_or_url: str) -> str:
     return "file:///" + s.replace("\\", "/")
 
 
-async def send_qzone_update(api_call, llm_chat, image_gen_cb=None):
+async def send_qzone_update(api_call, llm_chat, image_gen_cb=None, mood_user_id=""):
     """生成并发送一条空间说说；达每日上限/未到计划发布时间/窗口外返回空串。
 
     成功发布返回说说内容（供"发完喊你看"等联动）；失败/跳过返回空串。
@@ -454,11 +454,17 @@ async def send_qzone_update(api_call, llm_chat, image_gen_cb=None):
             f"可以结合此刻你可能在做的事（{live_info.current_activity()}），"
             "写一句到两句话，50字以内，不要括号动作描写，不要@任何人，直接输出说说内容。"
         )
-        # 多模态联动：情绪低落日，空间说说也带同款情绪（全平台状态一致）
+        # 多模态联动：空间文案与持续情绪一致，负面强时不突然配欢快图片。
+        allow_mood_image = True
         try:
             import liveness
-            if liveness.today_mood_low():
-                prompt += "\n（你今天心情不太好，这条说说的内容可以带一点点低落的日常感，但别写得太惨。）"
+            mood = liveness.emotion_snapshot(mood_user_id) if mood_user_id else {}
+            negative = max(mood.get("angry", 0), mood.get("hurt", 0))
+            if negative >= 18 or mood.get("tired", 0) >= 28:
+                prompt += ("\n（你此刻还有低落/别扭/疲惫的余波：文案要安静克制，"
+                           "不要突然写得特别欢快，也不要强装元气。）")
+            allow_mood_image = (not mood_user_id
+                                or liveness.emotion_allows_playful_media(mood_user_id))
         except Exception:
             pass
         content = await llm_chat(
@@ -472,7 +478,8 @@ async def send_qzone_update(api_call, llm_chat, image_gen_cb=None):
         # 配图：按概率用 image_gen_cb 生成一张图随说说发布；
         # 开启质量检查时用视觉模型确认清晰/有人物，不合格重新生成（最多 3 次）
         params = {"content": content}
-        if image_gen_cb and _post_image_prob() > 0 and random.random() < _post_image_prob():
+        if (image_gen_cb and allow_mood_image and _post_image_prob() > 0
+                and random.random() < _post_image_prob()):
             img = await image_gen_cb()
             if img and _image_check_enabled():
                 for attempt in range(3):

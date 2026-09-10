@@ -837,12 +837,40 @@ class QQGirlfriendBot:
             pstate.add_lewdness(1)
             pstate.mark_intimate()  # 亲密/露骨话题：记录用于能量骤降 + 贤者时间
             logger.info("检测到亲密话题，淫乱度 +1 [%s]", user_id)
-        # 活人感：哄话消气（改签名"今天天气好好"）；没哄且没在生气时低概率闹脾气（签名"哼"）
+        # 持续情绪：从本轮事件更新强度；被哄只逐渐缓和，同类事件反复才改长期性格。
+        emotion_now = {}
         if runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id):
-            if liveness.soothe_angry(user_id, raw_message):
-                asyncio.create_task(self._sync_signature(liveness.SIGNATURE_HAPPY))
-            elif liveness.try_trigger_angry(user_id):
-                asyncio.create_task(self._sync_signature(liveness.SIGNATURE_JEALOUS))
+            try:
+                emotion_event = liveness.observe_emotion_turn(
+                    user_id, raw_message, pstate.energy_state(user_id),
+                )
+                emotion_now = emotion_event.get("snapshot") or {}
+                if emotion_event.get("soothed"):
+                    remaining = max(emotion_now.get("angry", 0), emotion_now.get("hurt", 0))
+                    if remaining < 10:
+                        asyncio.create_task(self._sync_signature(liveness.SIGNATURE_HAPPY))
+                elif liveness.try_trigger_angry(user_id):
+                    emotion_now = liveness.emotion_snapshot(user_id)
+                    asyncio.create_task(self._sync_signature(liveness.SIGNATURE_JEALOUS))
+                evolved_sources = set()
+                for repeated in emotion_event.get("milestones", ()):
+                    source = repeated.get("source", "")
+                    if source in evolved_sources:
+                        continue
+                    evolved_sources.add(source)
+                    if source in ("insult", "dismissive", "trust_hurt"):
+                        pstate.add_axis("directness", 1)
+                        pstate.add_axis("independence", 1)
+                        pstate.add_dependency(-1)
+                        growth_diary.add_mood_tag("反复受伤")
+                    elif source in ("affection", "playful"):
+                        pstate.add_axis("warmth", 1)
+                        pstate.add_dependency(1)
+                        growth_diary.add_mood_tag("反复被爱")
+                    logger.info("重复情绪事件影响长期性格 [%s]: %s x%s", user_id,
+                                source, repeated.get("repeat_count", 0))
+            except Exception as exc:
+                logger.warning("持续情绪更新失败，使用普通对话策略 [%s]: %s", user_id, exc)
         logger.info("收到 %s 消息 [%s]: %s", msg_type, user_id, raw_message[:200])
         # 明确计划或结果先即时更新情景状态；后台 LLM 之后再补全细节。
         try:
@@ -883,6 +911,7 @@ class QQGirlfriendBot:
             user_sent_voice=bool(self._first_record_seg(data)),
             user_sent_image=bool(self._first_image_seg(data)),
             is_intimate=(msg_type == "private" and self._is_intimate_user(user_id)),
+            mood_state=emotion_now,
         )
         logger.info(
             "对话策略 [%s]: intent=%s emotion=%s parts<=%d extras=%s",
@@ -2363,7 +2392,11 @@ class QQGirlfriendBot:
         # 记录用户请求，保持上下文连贯
         self._memory.add_message(user_id, "user", user_text or "我想看看你")
         longterm_memory.add_chat_history(user_id, "user", user_text or "我想看看你")
-        modifier = self._extract_selfie_modifier(user_text or "") or "日常甜美自拍"
+        modifier = self._extract_selfie_modifier(user_text or "") or "日常自然自拍"
+        if runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id):
+            mood_modifier = liveness.selfie_mood_modifier(user_id)
+            if mood_modifier:
+                modifier = f"{modifier}，{mood_modifier}"
         # 成长系统：请求睡衣/内衣/贴身等亲密穿着自拍 → 淫乱度 +2
         if (self._is_intimate_user(user_id)
                 and any(k in modifier for k in ("睡衣", "内衣", "贴身", "情趣", "裸", "吊带"))):
@@ -2372,7 +2405,8 @@ class QQGirlfriendBot:
         pre = await self._generate_pre_reply(
             "用户想看你的自拍照片。你马上就会把照片发给他。请用一句简短、符合你人设和语气的话爽快答应"
             "（可以自然带出你拍照前的状态：找角度、理头发、嫌弃前置摄像头糊之类），"
-            "绝不要说拒绝、害羞、不给看、快去睡之类的话，"
+            "语气和你此刻持续的情绪一致：低落、委屈、生气或疲惫时不要突然装得很欢快；"
+            "绝不要说拒绝、不给看、快去睡之类的话，"
             "因为你立刻就会把照片发出去。",
             random.choice(PRE_REPLY_SELFIE),
         )
@@ -2427,7 +2461,7 @@ class QQGirlfriendBot:
         # 回复冷却：先按内容决定阅读/思考/打字成本，再叠加活动与身体状态。
         cd_min = float(runtime.REPLY_COOLDOWN_MIN or 0)
         cd_max = float(runtime.REPLY_COOLDOWN_MAX or cd_min)
-        cooldown = (liveness.reply_delay_seconds(context_text, text, cd_min, cd_max)
+        cooldown = (liveness.reply_delay_seconds(context_text, text, cd_min, cd_max, user_id)
                     if runtime.LIVENESS_ENABLED and msg_type == "private"
                     else (random.uniform(cd_min, cd_max) if cd_max > 0 else 0))
         # 活人感：分场景延迟 —— 她在画室/吃饭/打游戏时回复更慢（冷却乘倍率）
@@ -2470,7 +2504,7 @@ class QQGirlfriendBot:
         sent_parts = []
         for i, part in enumerate(parts):
             if i > 0:
-                gap = (liveness.split_gap_seconds(parts[i - 1])
+                gap = (liveness.split_gap_seconds(parts[i - 1], user_id)
                        if runtime.LIVENESS_ENABLED and msg_type == "private"
                        else random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
                 await asyncio.sleep(gap)
@@ -2698,7 +2732,7 @@ class QQGirlfriendBot:
             return False
         if runtime.LIVENESS_ENABLED:
             prob = min(1.0, prob * liveness.voice_hour_factor()
-                       * liveness.mood_modal_factor(user_id)
+                       * liveness.emotion_voice_factor(user_id)
                        * liveness.grudge_voice_factor(user_id))
         return random.random() < prob
 
@@ -2763,12 +2797,12 @@ class QQGirlfriendBot:
             prob = min(0.6, prob * 3)
         # 多模态联动：心情低落/生气时表情收敛（全模态情绪一致）
         if runtime.LIVENESS_ENABLED:
-            prob = min(1.0, prob * liveness.mood_modal_factor(user_id))
+            prob = min(1.0, prob * liveness.emotion_sticker_factor(user_id))
             prob = min(1.0, prob * liveness.sticker_context_factor(user_text))
         if random.random() > prob:
             return False
         # 表情包晚一点再发，像真人先回话再贴张图，不和文字挤在一起。
-        gap = (liveness.split_gap_seconds(user_text)
+        gap = (liveness.split_gap_seconds(user_text, user_id)
                if runtime.LIVENESS_ENABLED
                else random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
         await asyncio.sleep(gap)
@@ -2946,6 +2980,10 @@ class QQGirlfriendBot:
             return
         if liveness.is_angry(target):
             return
+        if liveness.emotion_initiative_factor(target) < 0.55:
+            return  # 委屈/疲惫时不突然用表情或图片刷存在感
+        if not liveness.emotion_allows_playful_media(target):
+            return
         now = time.time()
         last_user = self._last_user_msg.get(target, 0)
         last_out = self._last_outgoing.get(target, 0)
@@ -3090,7 +3128,8 @@ class QQGirlfriendBot:
             h = time.localtime().tm_hour
             if h >= 23 or h < 6:
                 return
-            if liveness.is_angry(user_id):
+            if (liveness.is_angry(user_id)
+                    or liveness.emotion_initiative_factor(user_id) < 0.55):
                 return
             prompt = (
                 f"刚才你们聊了关于「{topic[:60]}」的话题。"
@@ -3274,12 +3313,13 @@ class QQGirlfriendBot:
         posted = ""
         try:
             posted = await qzone.send_qzone_update(
-                self._api_call, self._llm_task.chat, self._generate_qzone_image)
+                self._api_call, self._llm_task.chat, self._generate_qzone_image,
+                self._boyfriend_uin())
         except Exception as e:
             logger.warning("发说说异常: %s", e)
         # 多模态联动：发完说说后，偶尔私聊对方，结合说说主题自然喊他看
         if posted and runtime.LIVENESS_ENABLED and self._boyfriend_uin() \
-                and random.random() < 0.35:
+                and random.random() < 0.35 * liveness.emotion_initiative_factor(self._boyfriend_uin()):
             try:
                 from personality import build_system_prompt
                 note = await self._deepseek.chat(
@@ -3386,7 +3426,11 @@ class QQGirlfriendBot:
             # 最近刚主动发过 → 跳过（防打扰冷却；之前只写不读导致从未生效）
             if now - self._last_proactive_msg.get(user_id, 0) < gap:
                 continue
-            if random.random() > prob:
+            mood_probability = prob * (
+                liveness.emotion_initiative_factor(user_id)
+                if runtime.LIVENESS_ENABLED else 1.0
+            )
+            if random.random() > min(1.0, mood_probability):
                 continue
             try:
                 await self._send_proactive(user_id)
@@ -3458,12 +3502,16 @@ class QQGirlfriendBot:
             await self._memory.compress(user_id, self._deepseek)
             self._memory.trim(user_id)
             followup_event = longterm_memory.get_due_episode_followup(user_id)
+            playful_media = (not runtime.LIVENESS_ENABLED
+                              or liveness.emotion_allows_playful_media(user_id))
             messages = self._memory.get_messages(user_id)
             messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
                 user_id, build_system_prompt(),
                 query=(str(followup_event.get("topic") or "") if followup_event else ""),
             ) + "\n\n" + SHORT_REPLY_REMINDER
             messages[0]["content"] += self._relationship_prompt(user_id)
+            if runtime.LIVENESS_ENABLED:
+                messages[0]["content"] += liveness.build_mood_injection(user_id, longterm_memory)
             await self._inject_live_context(messages, "", user_id)
             # 主动消息话题依据：从最近聊过的内容延伸（必须），此刻状态作辅助背景
             trigger = self._build_proactive_trigger(user_id, followup_event)
@@ -3478,7 +3526,7 @@ class QQGirlfriendBot:
             )
             messages.append({"role": "user", "content": trigger})
             # 回访只做一次清楚的语言关心，不同时叠图片或表情；普通主动消息仍可配图。
-            if not followup_event:
+            if not followup_event and playful_media:
                 messages[0]["content"] += "\n\n" + ILLUSTRATION_INSTRUCTION
                 messages[0]["content"] += (
                     "\n（如果你这条主动消息想配一张图，就按上面的【插图】规则输出标记，"
@@ -3509,14 +3557,14 @@ class QQGirlfriendBot:
         await self._reply_split("private", user_id, user_id, 0, reply_text, force_voice=use_voice)
         if followup_event:
             longterm_memory.mark_episode_followed_up(user_id, followup_event.get("id", ""))
-        if not followup_event:
+        if not followup_event and playful_media:
             await self._maybe_send_sticker("private", user_id, user_id, "")
         # 配图：模型自主标记的插图优先；未触发再走"我画了X"正则
         if followup_event:
             illustration_desc = ""
-        elif illustration_desc:
+        elif illustration_desc and playful_media:
             await self._maybe_send_illustration("private", user_id, user_id, illustration_desc)
-        elif not followup_event:
+        elif not followup_event and playful_media:
             await self._maybe_send_draw_image("private", user_id, user_id, reply_text)
         logger.info("已主动给 %s 发消息: %s", user_id, reply_text[:50])
 
