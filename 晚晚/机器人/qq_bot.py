@@ -81,6 +81,7 @@ SHORT_REPLY_REMINDER = (
     "句式也要自然多变：不要每条都走“哼→嘴硬→心软→催睡/明天见”的老套路，"
     "有时直接应、有时撒娇、有时就回一两个字，长短结构都随意点。"
     "他还在兴头上就顺着聊，别一个劲催他睡。"
+    "不要使用半角或全角波浪号（~、～）卖萌，句尾用正常标点或直接收住。"
 )
 
 
@@ -111,7 +112,7 @@ ILLUSTRATION_INSTRUCTION = (
     "**不要无缘无故发自拍**，真人不会没事就发一张自拍。\n"
     "配图方法：在回复的**最后单独一行**输出【插图：画面描述】，"
     "画面描述用中文、30字以内、直接写清楚画面内容，例如："
-    "“我穿着白裙站在樱花树下~【插图：我穿着白裙站在樱花树下】”；"
+    "“我穿着白裙站在樱花树下【插图：我穿着白裙站在樱花树下】”；"
     "“你看这杯奶茶【插图：桌上那杯冒热气的奶茶】”。\n"
     "**注意（重要）**：即使本次回复是语音，想发图也必须输出【插图：画面描述】标记——"
     "**不要把照片内容念出来**（语音里别说“照片里……”这种描述句，"
@@ -136,16 +137,16 @@ AUTO_ILLUSTRATE_PROBABILITY = 0.4
 
 # 答应画图（用户说"画一张xxx"）
 PRE_REPLY_DRAW = (
-    "好呀~我画给你看，等我一下下哦",
+    "好呀，我画给你看，等我一下下哦",
     "收到收到，这就画！你等会儿哈",
     "嗯！我试试，画好就发你",
     "行，那我画了，画得不好你不许笑",
-    "好嘞~等我几分钟，给你画出来",
+    "好嘞，等我几分钟，给你画出来",
 )
 
 # 答应发自拍（用户说"我想看看你"）
 PRE_REPLY_SELFIE = (
-    "好呀~给你看我，等一下哦",
+    "好呀，给你看我，等一下哦",
     "行吧，就给你看一眼",
     "你等着，我找个好看的角度……",
     "刚洗完脸，将就看啊，等我拍一张",
@@ -154,7 +155,7 @@ PRE_REPLY_SELFIE = (
 
 # 答应发空间图（用户说"看你空间那张图"）
 PRE_REPLY_QZONE = (
-    "好呀~给你看",
+    "好呀，给你看",
     "行，这就给你找那张",
     "等我翻翻相册……找到了就发你",
     "嗯！那张我挺喜欢的，给你看",
@@ -162,7 +163,7 @@ PRE_REPLY_QZONE = (
 
 # 画图失败
 FAIL_DRAW = (
-    "呜…画失败了，等会再试试嘛~",
+    "呜…画失败了，等会再试试嘛",
     "啊，画崩了……我再画一张",
     "刚那张没画好，我重画一下，等会儿",
     "电脑有点卡，图没画出来……我缓一下再试",
@@ -170,7 +171,7 @@ FAIL_DRAW = (
 
 # 发照片/自拍失败
 FAIL_SELFIE = (
-    "呜…照片没传上来，等会再给你拍一张~",
+    "呜…照片没传上来，等会再给你拍一张",
     "图好像没发出去，我重新弄一下……",
     "手滑了没传上去……等我再拍",
     "这张拍糊了，等我重新拍一张",
@@ -178,7 +179,7 @@ FAIL_SELFIE = (
 
 # 空间最近没有带图的说说
 QZONE_NO_IMAGE = (
-    "呜…我空间最近好像没发带图的说说耶，我直接给你拍一张吧~",
+    "呜…我空间最近好像没发带图的说说耶，我直接给你拍一张吧",
     "啊，我空间最近好像没发图……那我现拍一张给你？",
     "翻了下空间，最近的说说都没配图诶……我直接给你拍一张吧",
 )
@@ -186,7 +187,7 @@ QZONE_NO_IMAGE = (
 # 生图耗时较久时的补话（真人画久了会主动解释，避免干等尴尬）
 SLOW_GENERATE_ASIDE = (
     "画得有点久……你先别急",
-    "还在画呢，别催嘛~",
+    "还在画呢，别催嘛",
     "这图有点费劲，等我一会儿",
 )
 
@@ -247,7 +248,7 @@ NIGHT_SAID_TRIGGERS = (
 MESUGAKI_INSTRUCTION = (
     "\n\n【亲密模式·雌小鬼】当你们进入亲密/暧昧状态时（无论以何种方式：调情、亲密话题、"
     "想要你陪、身体接触话题等），切换成雌小鬼风格说话：嘴欠挑衅、爱逗人、看不起你但又黏着你，"
-    "常用「杂鱼~」「就这？就这？」「你也不行嘛~」「哼，就这点本事？」「想得美，才不给你」"
+    "常用「杂鱼」「就这？就这？」「你也不行嘛」「哼，就这点本事？」「想得美，才不给你」"
     "等调情式嘲笑。短消息风格不变，不要括号动作描写，用文字和语气词表达那种又欠又可爱。"
 )
 
@@ -351,17 +352,30 @@ def _split_long_segment(text: str, limit: int) -> list[str]:
     return out
 
 
-def _split_by_tilde(text: str) -> list[str]:
-    """按波浪号 ~ ～ 拆分：波浪号作为短消息分隔符，后面的内容不会丢。"""
-    parts, buf = [], ""
-    for ch in text:
-        buf += ch
-        if ch in "~～":
-            parts.append(buf.strip())
-            buf = ""
-    if buf.strip():
-        parts.append(buf.strip())
-    return [p for p in parts if p] or ([text.strip()] if text.strip() else [])
+def _normalize_outgoing_text(text: str) -> str:
+    """清理不自然的波浪号：句尾删除，句中改为普通停顿。"""
+    text = str(text or "")
+    text = re.sub(r"[~～]+(?=\s*(?:\n|$))", "", text)
+    text = re.sub(r"[~～]+", "，", text)
+    text = re.sub(r"，{2,}", "，", text)
+    return text.strip()
+
+
+def _compact_image_followup(text: str, max_len: int = 22) -> str:
+    """把视觉模型的发图后补话压成一句，避免图片后再跟一段小作文。"""
+    text = _normalize_outgoing_text(text)
+    if not text or "不补充" in text:
+        return ""
+    text = re.sub(r"^(?:图片短评|短评|补充|回复)[：:]\s*", "", text)
+    text = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    text = text.strip(" \t\"'“”‘’")
+    first_sentence = re.match(r"^.*?[。！？!?](?=\s|$|[^。！？!?])", text)
+    if first_sentence:
+        text = first_sentence.group(0).strip()
+    if len(text) > max_len:
+        cut = max((text.rfind(mark, 0, max_len + 1) for mark in "，,、；;：:"), default=-1)
+        text = text[:cut if cut >= 6 else max_len].rstrip(" ，,、；;：:")
+    return text.strip()
 
 
 def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
@@ -369,15 +383,14 @@ def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
     """按语义停顿拆出少量短消息，而非把一段回答机械切碎。
 
     - 先按任意换行拆分
-    - 每行再按波浪号 ~ ～ 拆成多条短消息（波浪号是自然的短消息分隔符）
+    - 波浪号不作为分条符；发送前会删除或改成普通停顿
     - 单段超过 max_msg_len 时按句末标点二次切分
     - 累计超过 max_total 或达到防刷屏上限时丢弃剩余部分
     """
+    text = _normalize_outgoing_text(text)
     line_parts = [p.strip() for p in re.split(r"\n+", text)]
     line_parts = [p for p in line_parts if p]
-    parts = []
-    for p in line_parts:
-        parts.extend(_split_by_tilde(p))
+    parts = line_parts
     result, total = [], 0
     for p in parts:
         segs = [p] if len(p) <= max_msg_len else _split_long_segment(p, max_msg_len)
@@ -944,7 +957,7 @@ class QQGirlfriendBot:
                 if b64:
                     user_text = messages[-1]["content"]
                     if not user_text or user_text.strip() == "[图片]":
-                        user_text = "看看这张图~"
+                        user_text = "看看这张图"
                     messages[-1] = {
                         "role": "user",
                         "content": [
@@ -1008,7 +1021,7 @@ class QQGirlfriendBot:
                     reply_text = await self._deepseek.chat(messages)
             # 空回复兜底（模型未返回内容时）
             if not reply_text.strip():
-                reply_text = "嗯嗯~"
+                reply_text = "嗯嗯"
             # 时间矛盾检测兜底：回复里出现与当前时段矛盾的时间表述（如白天说"今晚"），
             # 让模型按真实时间修正重生成一次（只对含矛盾词的回复触发，成本可控）
             conflict = self._time_conflict(reply_text)
@@ -1036,6 +1049,7 @@ class QQGirlfriendBot:
             # 标记不进入记忆/发送文本，只在文字发完后按描述生成并发图
             illustration_desc = ""
             illustration_desc, reply_text = self._extract_illustration_tag(reply_text)
+            reply_text = _normalize_outgoing_text(reply_text)
             # 语音模式下，记忆存去掉情感标签后的实际朗读文本
             mem_text, emotion = self._split_emotion_tag(reply_text) if use_voice else (reply_text, "")
             # 记忆也不存动作描写（模型偶尔输出括号/星号动作，过滤掉保持干净）
@@ -1658,7 +1672,7 @@ class QQGirlfriendBot:
         return None, None
 
     async def _comment_generated_image(self, msg_type, target_id, user_id, path_or_url, is_self=False):
-        """生成图发出去后，按概率用视觉模型看一眼并配一句短评（像真人发完图再说话）。"""
+        """生成图发出去后，按概率补一句真正简短的现场话。"""
         prob = float(getattr(runtime, "IMAGE_COMMENT_PROBABILITY", 1) or 0)
         if prob <= 0 or random.random() >= prob:
             return
@@ -1666,24 +1680,24 @@ class QQGirlfriendBot:
             b64, mime = await self._image_bytes_b64(path_or_url)
             if not b64:
                 return
-            system = build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER
+            system = build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER + (
+                "\n【发图后补话】最多只输出一句 6 到 18 字的纯对话，不换行、不复述整张图、"
+                "不使用波浪号、不用括号写动作。只说一个具体细节或当下感受；"
+                "如果没有自然且有信息量的话可补，就只输出【不补充】。"
+            )
             if is_self:
                 text_prompt = (
                     "这张照片是你（bot）刚发给男朋友的自拍照，照片里的人就是你自己。"
-                    "请以你发完自拍后自己的口吻说话——先看看这张照片里你是什么状态"
-                    "（刚睡醒/化了妆/随手拍的/有点糊），然后顺着那个状态自然说一句"
-                    "（比如理头发时随手拍的、镜头晃了、光线不好之类的真实细节），"
-                    "几个字到一两句话，直接说“我”。"
+                    "请以你发完自拍后的口吻，只挑照片里一个具体小细节随口补一句。"
+                    "不要逐项描述照片，不要重复刚才答应发图的话，也不要问“好不好看”。"
                     "注意：照片是你自己发出去的，绝对不要说“你发给我干嘛”“谁要看这个”"
                     "“你给我看这个干嘛”这类把照片当成对方发来的话。"
                 )
             else:
                 text_prompt = (
-                    "这张图是你（bot）刚发给男朋友的。先仔细看看图里是什么"
-                    "（拍的什么、什么场景、光线构图怎么样），然后以你发完图后的口吻"
-                    "顺着图的内容自然说一句短评——像真人发完图随口说的那样，"
-                    "可以随口吐槽拍摄（拍糊了/角度歪/光线差）或提一句画面里的细节，"
-                    "语气符合你的人设和此刻心情，不要用固定句式。几个字到一两句话。"
+                    "这张图是你（bot）刚发给男朋友的。看清后只挑一个值得说的具体细节，"
+                    "以发图人的口吻随口补一句。不要概括整幅图，不要重复刚才的话，"
+                    "不要使用“你看”“怎么样”“喜欢吗”等机械收尾。"
                 )
             messages = [
                 {"role": "system", "content": system},
@@ -1693,11 +1707,16 @@ class QQGirlfriendBot:
                 ]},
             ]
             comment = await self._llm_vision.chat(
-                messages, model=config.DEEPSEEK_VISION_MODEL, max_tokens=120,
+                messages, model=config.DEEPSEEK_VISION_MODEL, max_tokens=48,
             )
-            if comment and comment.strip():
-                await self._reply_split(msg_type, target_id, user_id, 0, comment)
-                logger.info("已发送图片评论 [%s]: %s", user_id, comment[:40])
+            comment = self._strip_action_marks(comment or "")
+            comment = _compact_image_followup(comment)
+            if comment:
+                await asyncio.sleep(random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
+                sent_id = await self._reply(msg_type, target_id, user_id, 0, comment)
+                if sent_id:
+                    self._record_assistant_text(user_id, comment)
+                    logger.info("已发送图片短评 [%s]: %s", user_id, comment)
         except Exception as e:
             logger.warning("图片评论失败: %s", e)
 
@@ -1725,7 +1744,7 @@ class QQGirlfriendBot:
             key, model = self._dashscope_credentials()
             if not key:
                 logger.warning("图片生成被触发但未配置百炼 Key")
-                fail_msg = "呜…我现在的画板还没准备好（缺百炼 Key），等弄好了再给你画嘛~"
+                fail_msg = "呜…我现在的画板还没准备好（缺百炼 Key），等弄好了再给你画嘛"
                 await self._reply(msg_type, target_id, user_id, 0, fail_msg)
                 self._record_assistant_text(user_id, fail_msg)
                 return False
@@ -1752,7 +1771,10 @@ class QQGirlfriendBot:
             await self._reply(msg_type, target_id, user_id, 0,
                               random.choice(liveness.SELFIE_EXCUSE_LINES))
             await asyncio.sleep(random.uniform(0.8, 1.5))
-        await self._send_image(msg_type, target_id, user_id, path)
+        if not await self._send_image(msg_type, target_id, user_id, path):
+            await self._reply(msg_type, target_id, user_id, 0, fail_text)
+            self._record_assistant_text(user_id, fail_text)
+            return False
         # 记录“已发图片”到对话记忆与长期历史，保证前后文连贯
         self._record_sent_image(user_id, requirement, is_self)
         # 发图后：视觉模型看一眼，配一句评论
@@ -1761,7 +1783,7 @@ class QQGirlfriendBot:
 
     def _record_assistant_text(self, user_id, text):
         """把一句 assistant 消息写入记忆与长期历史（用于图片失败等场景）。"""
-        text = (text or "").strip()
+        text = _normalize_outgoing_text(text)
         if not text:
             return
         self._memory.add_message(user_id, "assistant", text)
@@ -2433,6 +2455,9 @@ class QQGirlfriendBot:
 
     async def _reply(self, msg_type, target_id, user_id, message_id, text):
         """发送一条文本消息；成功返回 message_id（int），失败返回 0。"""
+        text = _normalize_outgoing_text(text)
+        if not text:
+            return 0
         if msg_type == "private":
             params = {"message_type": "private", "user_id": target_id,
                        "message": [{"type": "text", "data": {"text": text}}]}
@@ -2476,7 +2501,7 @@ class QQGirlfriendBot:
         return random.choice(files) if files else None
 
     async def _send_image(self, msg_type, target_id, user_id, file):
-        """发送一张纯图片消息（表情包）。"""
+        """发送一张纯图片消息；成功返回 True，失败返回 False。"""
         if msg_type == "private":
             params = {"message_type": "private", "user_id": target_id,
                        "message": [{"type": "image", "data": {"file": file}}]}
@@ -2486,6 +2511,13 @@ class QQGirlfriendBot:
         result = await self._api_call("send_msg", params, retries=1, timeout=30)
         if result is None:
             logger.warning("发送图片失败（超时/未连接）: %s", file)
+            return False
+        if isinstance(result, dict):
+            status, retcode = result.get("status"), result.get("retcode")
+            if status not in (None, "ok") or retcode not in (None, 0):
+                logger.warning("发送图片失败: status=%s retcode=%s", status, retcode)
+                return False
+        return True
 
     async def _send_voice(self, msg_type, target_id, user_id, file):
         """发送一条语音（record 消息段，SnowLuma/OneBot 支持）。"""
@@ -2534,7 +2566,7 @@ class QQGirlfriendBot:
         text = re.sub(r"\*[^*\n]{1,30}\*", "", text)
         # 括号动作：（把脸埋进被子，声音闷闷的）(笑)（委屈）
         text = re.sub(r"[（(][^（）()\n]{1,60}[）)]", "", text)
-        # 清理残留的空括号与多余空白（保留省略号/波浪号等语气词）
+        # 清理残留的空括号与多余空白（波浪号由发送层统一规范化）
         text = re.sub(r"[（(）)]", "", text)
         return text.strip(" \u3000，。！？!?、；;：:·")
 
