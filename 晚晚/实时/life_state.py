@@ -9,16 +9,16 @@ import logging
 import random
 import re
 import sqlite3
-import threading
 from datetime import datetime, timedelta
 
 from 路径 import data_path
+from sqlite_runtime import BOT_DB_LOCK, connect_bot_db
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 STATE_KEY = "bot"
-_lock = threading.RLock()
+_lock = BOT_DB_LOCK
 _conn = None
 
 
@@ -64,10 +64,7 @@ def _get_conn() -> sqlite3.Connection:
     global _conn
     with _lock:
         if _conn is None:
-            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _conn.execute("PRAGMA journal_mode=WAL")
-            _conn.execute("PRAGMA busy_timeout=5000")
+            _conn = connect_bot_db(DB_PATH)
             _conn.execute(
                 "CREATE TABLE IF NOT EXISTS life_state ("
                 " state_key TEXT PRIMARY KEY, location TEXT NOT NULL, activity TEXT NOT NULL,"

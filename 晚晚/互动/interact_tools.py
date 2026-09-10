@@ -17,16 +17,16 @@ import json
 import logging
 import os
 import sqlite3
-import threading
 import time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 from 路径 import PROJECT_ROOT, data_path
+from sqlite_runtime import BOT_DB_LOCK, connect_bot_db
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
-_lock = threading.Lock()
+_lock = BOT_DB_LOCK
 _conn = None
 
 
@@ -34,10 +34,7 @@ def _get_conn() -> sqlite3.Connection:
     global _conn
     with _lock:
         if _conn is None:
-            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _conn.execute("PRAGMA journal_mode=WAL")
-            _conn.execute("PRAGMA busy_timeout=5000")
+            _conn = connect_bot_db(DB_PATH)
             _conn.execute(
                 "CREATE TABLE IF NOT EXISTS interact_usage ("
                 " tool TEXT NOT NULL, ref TEXT NOT NULL,"

@@ -806,7 +806,11 @@ class QQGirlfriendBot:
         self._proactive_followups[user_id] = 0
         self._silence_fired[user_id] = set()
         if self._is_intimate_user(user_id):
-            liveness.record_relationship_turn(user_id, raw_message)
+            try:
+                liveness.record_relationship_turn(user_id, raw_message)
+            except Exception as exc:
+                # 关系余温属于增强信息，数据库或状态模块异常不能阻断正常聊天。
+                logger.warning("关系状态记录失败，继续处理消息 [%s]: %s", user_id, exc)
         # 音乐分享卡片（网易云/QQ音乐等 json 卡片）→ 专门识别回应，不当普通文本
         music_share = self._extract_music_share(data)
         if music_share:

@@ -8,7 +8,6 @@ import os
 import random
 import re
 import sqlite3
-import threading
 import time
 from datetime import datetime
 
@@ -16,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 from 路径 import PROJECT_ROOT, data_path
 from config import runtime
+from sqlite_runtime import BOT_DB_LOCK, connect_bot_db, is_database_busy, rollback_quietly
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
-_lock = threading.Lock()
+_lock = BOT_DB_LOCK
 _conn = None
 
 
@@ -26,10 +26,7 @@ def _get_conn() -> sqlite3.Connection:
     global _conn
     with _lock:
         if _conn is None:
-            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _conn.execute("PRAGMA journal_mode=WAL")
-            _conn.execute("PRAGMA busy_timeout=5000")
+            _conn = connect_bot_db(DB_PATH)
             _conn.execute(
                 "CREATE TABLE IF NOT EXISTS liveness_state ("
                 " key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
@@ -39,21 +36,43 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _get(key: str, default=""):
-    conn = _get_conn()
-    with _lock:
-        row = conn.execute("SELECT value FROM liveness_state WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row else default
+    conn = None
+    try:
+        conn = _get_conn()
+        with _lock:
+            row = conn.execute("SELECT value FROM liveness_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+    except sqlite3.OperationalError as exc:
+        if not is_database_busy(exc):
+            raise
+        rollback_quietly(conn)
+        logger.warning("活人感状态读取遇到数据库占用，使用默认值: key=%s", key)
+        return default
 
 
 def _set(key: str, value):
-    conn = _get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO liveness_state (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
-            (key, str(value)),
-        )
-        conn.commit()
+    return _set_many(((key, value),))
+
+
+def _set_many(items) -> bool:
+    """原子写入一组状态；数据库被外部占用时安全降级，不中断聊天。"""
+    conn = None
+    try:
+        conn = _get_conn()
+        with _lock:
+            conn.executemany(
+                "INSERT INTO liveness_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+                [(key, str(value)) for key, value in items],
+            )
+            conn.commit()
+        return True
+    except sqlite3.OperationalError as exc:
+        rollback_quietly(conn)
+        if not is_database_busy(exc):
+            raise
+        logger.warning("活人感状态写入遇到数据库占用，本轮跳过（聊天继续）")
+        return False
 
 
 # =============================================================================
@@ -255,11 +274,14 @@ def record_relationship_turn(user_id: str, user_text: str):
         temperature += 0.8
     if any(word in text for word in RELATIONSHIP_HURT_WORDS):
         temperature -= 0.7
-    _set(temperature_key, f"{max(-2.0, min(2.0, temperature)):.2f}")
-    _set(last_key, str(now))
+    updates = [
+        (temperature_key, f"{max(-2.0, min(2.0, temperature)):.2f}"),
+        (last_key, str(now)),
+    ]
     if any(word in text for word in RELATIONSHIP_CALLBACK_WORDS):
         # 只记“有一件事等进展”，不记具体内容；实际回访仍以最近对话为依据。
-        _set(_relationship_key(user_id, "callback_until"), str(now + 36 * 3600))
+        updates.append((_relationship_key(user_id, "callback_until"), str(now + 36 * 3600)))
+    _set_many(updates)
 
 
 def relationship_injection(user_id: str) -> str:

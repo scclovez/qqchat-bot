@@ -19,19 +19,19 @@ import os
 import random
 import re
 import sqlite3
-import threading
 import time
 from datetime import datetime
 from urllib.parse import unquote
 
 from 路径 import PROJECT_ROOT, data_path
 from config import runtime
+from sqlite_runtime import BOT_DB_LOCK, connect_bot_db
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
-_lock = threading.Lock()
+_lock = BOT_DB_LOCK
 _conn = None
 
 # 每轮处理上限（防刷屏/风控）
@@ -69,10 +69,7 @@ def _get_conn() -> sqlite3.Connection:
     global _conn
     with _lock:
         if _conn is None:
-            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _conn.execute("PRAGMA journal_mode=WAL")
-            _conn.execute("PRAGMA busy_timeout=5000")
+            _conn = connect_bot_db(DB_PATH)
             # 主键必须是 (kind, ref) 复合：点赞和评论用同一个 feed key 做 ref，
             # 若 ref 单主键，feed_commented 会被同 key 的 feed_liked 顶掉（INSERT OR IGNORE
             # 静默忽略），导致评论去重失效、每次重启重复评论
@@ -90,7 +87,7 @@ def _get_conn() -> sqlite3.Connection:
 def _migrate_old_schema(conn: sqlite3.Connection):
     """把旧版单主键(ref)表迁移为复合主键(kind, ref)表；旧数据按 (kind,ref) 去重保留。
 
-    注意：调用方（_get_conn）已持有 _lock，此处不再加锁（threading.Lock 不可重入）。
+    注意：调用方（_get_conn）已持有共享的可重入锁，此处不再重复加锁。
     """
     try:
         row = conn.execute(

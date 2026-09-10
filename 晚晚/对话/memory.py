@@ -21,10 +21,10 @@ import logging
 import os
 import re
 import sqlite3
-import threading
 from datetime import datetime, timedelta
 
 import episodic_memory
+from sqlite_runtime import BOT_DB_LOCK, connect_bot_db
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def set_llm_caller(fn):
 # 线程安全基础设施
 # =============================================================================
 
-_lock = threading.Lock()
+_lock = BOT_DB_LOCK
 _conn: sqlite3.Connection | None = None
 
 
@@ -75,11 +75,8 @@ def _get_conn() -> sqlite3.Connection:
     global _conn
     with _lock:
         if _conn is None:
-            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn = connect_bot_db(DB_PATH)
             _conn.execute("PRAGMA foreign_keys=ON")
-            _conn.execute("PRAGMA busy_timeout=5000")
     return _conn
 
 
@@ -955,8 +952,7 @@ def reset_user_memory(user_id: str):
 def get_memory_stats(user_id: str) -> dict:
     """获取用户记忆统计信息。"""
     conn = _get_conn()
-    # 注意：不能用一个外层 _lock 包住 _get_checkpoint/_get_max_chat_id/get_user_memory，
-    # 它们内部会再次获取同一个 threading.Lock（非重入）→ 死锁。这里各查各的。
+    # 各查询仍分别持锁，避免把后续 LLM 调用也包进数据库临界区。
     with _lock:
         chat_count = conn.execute(
             "SELECT COUNT(*) AS cnt FROM chat_history WHERE user_id = ?",
