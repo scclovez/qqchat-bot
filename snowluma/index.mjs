@@ -215387,20 +215387,42 @@ async function getQzoneMsgList(cookieObject, targetUin, pos = 0, num = 20) {
 	}
 	return mapMsgList(data);
 }
+/** Extract the canonical post id and owner from a feeds3 HTML card. */
+function feedIdentity(feed) {
+	const html = String(feed.html ?? "").replace(/\\x22/gi, '"').replace(/\\x27/gi, "'").replace(/\\x3c/gi, "<").replace(/\\x3e/gi, ">").replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&amp;/gi, "&");
+	const tags = html.match(/<i\b[^>]*>/gi) ?? [];
+	const feedTag = tags.find((tag) => /\bname\s*=\s*(["'])feed_data\1/i.test(tag)) ?? "";
+	const attr = (tag, name) => {
+		const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const match = new RegExp(`\\b${escaped}\\s*=\\s*(["'])(.*?)\\1`, "i").exec(tag);
+		return match?.[2]?.trim() ?? "";
+	};
+	const dataKey = /<div\b[^>]*\bdata-key\s*=\s*(["'])(.*?)\1/i.exec(html)?.[2]?.trim() ?? "";
+	const encodedTid = /(?:t1_tid|t1%5Ftid)=([^&"'<>\s]+)/i.exec(html)?.[1] ?? "";
+	let paramTid = encodedTid;
+	try {
+		paramTid = decodeURIComponent(encodedTid);
+	} catch {}
+	const outerOwner = /\bid\s*=\s*(["'])feed_(\d+)_\d+_/i.exec(html)?.[2] ?? "";
+	const tid = attr(feedTag, "data-tid") || dataKey || paramTid || String(feed.key ?? feed.feedskey ?? feed.tid ?? "");
+	const owner = attr(feedTag, "data-uin") || outerOwner || String(feed.opuin ?? feed.uin ?? "");
+	return { tid, owner };
+}
 /** Pure transform from the raw feeds response into the OneBot list. */
 function mapFeeds(data) {
 	return {
-		feeds: (data.data?.data ?? []).filter((f) => !!f).map((f) => ({
-			uin: Number(f.uin ?? 0),
-			nickname: f.nickname ?? "",
-			time: Number(f.abstime ?? 0),
-			appid: Number(f.appid ?? 0),
-			// `key` 用于好友动态列表去重；评论/点赞 CGI 则必须使用原说说 tid。
-			// 两者在部分动态中不同，不能再让调用方把 key 当作 tid。
-			tid: String(f.tid ?? ""),
-			key: String(f.key ?? f.feedskey ?? ""),
-			html: f.html ?? ""
-		})),
+		feeds: (data.data?.data ?? []).filter((f) => !!f).map((f) => {
+			const identity = feedIdentity(f);
+			return {
+				uin: Number(identity.owner || 0),
+				nickname: f.nickname ?? "",
+				time: Number(f.abstime ?? 0),
+				appid: Number(f.appid ?? 0),
+				tid: identity.tid,
+				key: String(f.key ?? f.feedskey ?? ""),
+				html: f.html ?? ""
+			};
+		}),
 		has_more: Number(data.data?.hasmore ?? 0) !== 0
 	};
 }

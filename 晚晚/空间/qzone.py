@@ -13,6 +13,7 @@
 - 所有写操作带随机间隔，防 QQ 风控。
 """
 import asyncio
+import html as html_lib
 import logging
 import os
 import random
@@ -21,6 +22,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from urllib.parse import unquote
 
 from 路径 import PROJECT_ROOT, data_path
 from config import runtime
@@ -155,6 +157,67 @@ def _html_to_text(html: str) -> str:
     text = re.sub(r"\s+", " ", text)
     text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     return text.strip()
+
+
+def _decode_feed_html(raw: str) -> str:
+    """还原 feeds3 返回的 HTML，兼容实体与残留的十六进制转义。"""
+    text = html_lib.unescape(str(raw or ""))
+    return (text.replace(r"\x22", '"').replace(r"\x27", "'")
+            .replace(r"\x3C", "<").replace(r"\x3E", ">"))
+
+
+def _feed_tag_attr(tag: str, name: str) -> str:
+    match = re.search(rf"\b{re.escape(name)}\s*=\s*(['\"])(.*?)\1", tag or "", re.I)
+    return match.group(2).strip() if match else ""
+
+
+def _looks_like_qzone_tid(value: str) -> bool:
+    """过滤好友流里并非说说 ID 的短句柄。"""
+    value = str(value or "").strip()
+    return bool(re.fullmatch(r"[0-9a-fA-F]{16,}", value)
+                or re.fullmatch(r"d\d+_\d+_[^\s&]+", value))
+
+
+def _extract_feed_identity(feed: dict) -> tuple[str, str]:
+    """从 feeds3 HTML 提取 (真实说说 tid, 动态主人 uin)。
+
+    feeds3 顶层的 ``tid``/``uin`` 在不同模板中可能为空或含义不同；
+    ``<i name="feed_data" data-tid=... data-uin=...>`` 才是评论接口需要的组合。
+    """
+    decoded = _decode_feed_html(feed.get("html") or "")
+    feed_tag = ""
+    for match in re.finditer(r"<i\b[^>]*>", decoded, re.I):
+        tag = match.group(0)
+        if _feed_tag_attr(tag, "name").lower() == "feed_data":
+            feed_tag = tag
+            break
+
+    tid = _feed_tag_attr(feed_tag, "data-tid")
+    owner = _feed_tag_attr(feed_tag, "data-uin")
+
+    if not tid:
+        outer = re.search(r"<div\b[^>]*\bdata-key\s*=\s*(['\"])(.*?)\1", decoded, re.I)
+        if outer:
+            tid = outer.group(2).strip()
+    if not tid:
+        param = re.search(r"(?:t1_tid|t1%5[Ff]tid)=([^&\"'<>\s]+)", decoded, re.I)
+        if param:
+            tid = unquote(param.group(1)).strip()
+    if not owner:
+        outer_id = re.search(r"\bid\s*=\s*(['\"])feed_(\d+)_\d+_", decoded, re.I)
+        if outer_id:
+            owner = outer_id.group(2)
+
+    # 兼容已经修复的 SnowLuma；旧版则从标准说说的 key 回退。
+    mapped_tid = str(feed.get("tid") or "").strip()
+    key = str(feed.get("key") or "").strip()
+    if not _looks_like_qzone_tid(tid):
+        tid = mapped_tid if _looks_like_qzone_tid(mapped_tid) else key
+    if not _looks_like_qzone_tid(tid):
+        tid = ""
+    if not owner:
+        owner = str(feed.get("uin") or "").strip()
+    return tid, owner
 
 
 def _gap():
@@ -587,10 +650,9 @@ async def like_and_comment_feeds(api_call, llm_chat, self_uin, boyfriend_uin="")
 
     liked = commented = 0
     for feed in feeds:
-        key = str(feed.get("key") or "")
-        tid = str(feed.get("tid") or "")
-        uin = str(feed.get("uin") or "")
-        if not key or uin == str(self_uin or ""):
+        tid, uin = _extract_feed_identity(feed)
+        key = str(feed.get("key") or tid or "")
+        if not key or not uin or uin == str(self_uin or ""):
             continue
         if "advertisement" in key or int(feed.get("appid") or 0) == 6600:
             continue  # 广告动态

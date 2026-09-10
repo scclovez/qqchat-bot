@@ -95,6 +95,7 @@ def test_growth():
     import personality_state as pstate
     import liveness
     from memory import _select_relevant_memory
+    from qzone import _extract_feed_identity
     from qq_bot import (
         MESSAGE_DEBOUNCE_SECONDS, QQGirlfriendBot, _compact_image_followup,
         split_reply_text,
@@ -119,6 +120,14 @@ def test_growth():
     )
     assert image_followup and len(image_followup) <= 22 and "~" not in image_followup
     assert _compact_image_followup("【不补充】") == ""
+    feed_html = (
+        '<div id="feed_123456_311_0_1789000000_0_1" data-key="abcdef0123456789abcdef01">'
+        '<i name="feed_data" data-tid="abcdef0123456789abcdef01" data-uin="123456"></i></div>'
+    )
+    assert _extract_feed_identity({
+        "tid": "wrongshort", "key": "abcdef0123456789abcdef01",
+        "uin": "999999", "html": feed_html,
+    }) == ("abcdef0123456789abcdef01", "123456")
     merged = QQGirlfriendBot._merge_debounced_messages([
         {"raw_message": "第一句", "message_id": 1},
         {"raw_message": "第二句", "message_id": 2},

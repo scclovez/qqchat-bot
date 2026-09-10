@@ -9075,6 +9075,10 @@ var actions$3 = [
 								type: "integer",
 								description: "发表时间（unix 秒）"
 							},
+							tid: {
+								type: "string",
+								description: "真实说说 ID（评论与点赞使用）"
+							},
 							comment_num: {
 								type: "integer",
 								description: "评论数"
@@ -9162,6 +9166,7 @@ var actions$3 = [
 							"uin",
 							"nickname",
 							"time",
+							"tid",
 							"appid",
 							"key",
 							"html"
