@@ -107,11 +107,17 @@ QLabel#SectionTitle {{ font-size: 14px; font-weight: bold; color: {PRIMARY}; }}
 QLabel#Muted {{ color: {MUTED}; font-size: 11px; }}
 QLabel#CellName {{ color: {MUTED}; font-size: 11px; }}
 QLabel#CellValue {{ font-size: 15px; font-weight: bold; color: {TEXT}; }}
+QLabel#GrowthGroupTitle {{ color: {PRIMARY}; font-size: 13px; font-weight: bold; }}
+QLabel#GrowthMetricName {{ color: {MUTED}; font-size: 11px; }}
+QLabel#GrowthMetricValue {{ color: {TEXT}; font-size: 12px; font-weight: bold; }}
+QLabel#GrowthBody {{ color: {TEXT}; font-size: 12px; line-height: 1.35; }}
 QLabel#Hint {{ color: {HINT}; font-size: 10px; font-weight: bold; }}
 QLabel#BigValue {{ font-size: 15px; font-weight: bold; color: {PRIMARY}; }}
 QLabel#Status {{ font-size: 14px; font-weight: bold; }}
 QFrame#Card {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px; }}
 QFrame#Cell {{ background: {CELL_BG}; border: 1px solid {CELL_BORDER}; border-radius: 10px; }}
+QFrame#GrowthGroup {{ background: {CELL_BG}; border: 1px solid {CELL_BORDER}; border-radius: 11px; }}
+QFrame#GrowthDivider {{ background: {CELL_BORDER}; min-height: 1px; max-height: 1px; border: none; }}
 QFrame#Divider {{ background: {BORDER}; max-height: 1px; min-height: 1px; }}
 QPushButton#Primary {{ background: {PRIMARY}; color: white; border: none; border-radius: 8px;
     padding: 6px 14px; font-weight: bold; }}
@@ -222,11 +228,15 @@ QWidget#Header { background: #211d29; border-bottom: 1px solid #383143; }
 QWidget#Sidebar { background: #211d29; border-right: 1px solid #383143; }
 QLabel#AppTitle, QLabel#PageTitle, QLabel#SectionTitle, QLabel#BigValue { color: #d6b9ea; }
 QLabel#Muted, QLabel#CellName { color: #aaa1b3; }
-QLabel#CellValue, QLabel#Status { color: #eee9f2; }
+QLabel#CellValue, QLabel#Status, QLabel#GrowthMetricValue, QLabel#GrowthBody { color: #eee9f2; }
+QLabel#GrowthGroupTitle { color: #d6b9ea; }
+QLabel#GrowthMetricName { color: #aaa1b3; }
 QLabel#SidebarTitle { color: #f2edf5; font-size: 16px; font-weight: bold; }
 QLabel#HeaderPill { color: #d8c0e9; background: #332b40; border-radius: 10px; padding: 3px 9px; }
 QFrame#Card { background: #24202c; border: 1px solid #383143; }
 QFrame#Cell { background: #2b2633; border: 1px solid #403849; }
+QFrame#GrowthGroup { background: #2b2633; border: 1px solid #403849; }
+QFrame#GrowthDivider { background: #403849; }
 QPushButton#Primary { background: #9a75b4; color: #18131e; }
 QPushButton#Primary:hover { background: #b18bca; }
 QPushButton#Soft { background: #302a39; color: #dbc6ea; }
@@ -582,45 +592,96 @@ class MainWindow(QMainWindow):
         growth, growth_lay = _card(tab, "今日陪伴状态")
         grid = QGridLayout()
         grid.setContentsMargins(4, 4, 4, 4)
-        grid.setSpacing(6)
-        self._growth_items = [
-            ("stage", "性格阶段", True), ("rel_hot", "关系温度", True), ("energy", "能量状态", True), ("mood", "实时情绪", False),
-            ("affection", "亲密度", True), ("dependency", "依赖度", True), ("jealousy", "醋意倾向", True), ("lewdness", "淫乱度", True),
-            ("now_thought", "今天的小事", True), ("nickname", "称呼", True), ("state", "状态", True), ("mood_state", "今日心情", True),
-            ("days", "在一起", True), ("memory", "记得你", True), ("chats", "聊天记录", True), ("mood_delta", "今日亲密度", False),
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+
+        # 将原先平铺的 16 个指标按阅读语义收拢：先看此刻，再看关系与长期成长。
+        # 每个指标仍保留独立值和悬停说明，信息量不减少。
+        group_specs = [
+            ("此刻的她", [
+                ("state", "正在做"), ("energy", "能量"),
+                ("mood", "实时情绪"), ("mood_state", "情绪状态"),
+            ], 0, 0, 1, 1),
+            ("关系进度", [
+                ("stage", "性格阶段"), ("rel_hot", "关系温度"),
+                ("affection", "亲密度"), ("mood_delta", "今日变化"),
+            ], 0, 1, 1, 1),
+            ("相处倾向", [
+                ("dependency", "依赖度"), ("jealousy", "醋意倾向"),
+                ("lewdness", "亲密倾向"),
+            ], 0, 2, 1, 1),
+            ("今天留下的片段", [
+                ("now_thought", "今天的小事"),
+            ], 1, 0, 1, 2),
+            ("陪伴档案", [
+                ("nickname", "最近称呼"), ("days", "在一起"),
+                ("memory", "记得你"), ("chats", "聊天记录"),
+            ], 1, 2, 1, 1),
         ]
-        for i, (key, name, always) in enumerate(self._growth_items):
-            cell = QFrame()
-            cell.setObjectName("Cell")
-            cl = QVBoxLayout(cell)
-            cl.setContentsMargins(10, 6, 10, 6)
-            cl.setSpacing(0)
-            nr = QHBoxLayout()
-            nr.setSpacing(3)
-            nr.addWidget(_label(name, "CellName"))
-            hl = _label("ⓘ", "Hint")
-            hl.setCursor(Qt.CursorShape.WhatsThisCursor)
-            nr.addWidget(hl)
-            nr.addStretch(1)
-            cl.addLayout(nr)
-            val = _label("—", "CellValue")
-            cl.addWidget(val)
-            grid.addWidget(cell, i // 4, i % 4)
-            self._growth_labels[key] = val
-            self._growth_cell_kw[key] = (cell, i // 4, i % 4, always)
-            # 整格悬停立即显示说明（比 ⓘ 更好对准、无延迟）
-            tip = _CellTooltip(GROWTH_HINTS.get(key, ""), cell)
-            cell.installEventFilter(tip)
-            self._growth_tips[key] = tip
-        for c in range(4):
+
+        def add_metric_group(title, items, row, column, row_span=1, column_span=1):
+            panel = QFrame()
+            panel.setObjectName("GrowthGroup")
+            panel_lay = QVBoxLayout(panel)
+            panel_lay.setContentsMargins(12, 9, 12, 9)
+            panel_lay.setSpacing(5)
+            panel_lay.addWidget(_label(title, "GrowthGroupTitle"))
+            for key, name in items:
+                metric = QWidget(panel)
+                metric_lay = QHBoxLayout(metric)
+                metric_lay.setContentsMargins(0, 0, 0, 0)
+                metric_lay.setSpacing(8)
+                name_label = _label(name, "GrowthMetricName")
+                value_label = _label("—", "GrowthMetricValue")
+                value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                value_label.setWordWrap(True)
+                metric_lay.addWidget(name_label)
+                metric_lay.addStretch(1)
+                metric_lay.addWidget(value_label, 2)
+                panel_lay.addWidget(metric)
+                self._growth_labels[key] = value_label
+                tip = _CellTooltip(GROWTH_HINTS.get(key, ""), metric)
+                metric.installEventFilter(tip)
+                self._growth_tips[key] = tip
+            panel_lay.addStretch(1)
+            grid.addWidget(panel, row, column, row_span, column_span)
+
+        for spec in group_specs:
+            add_metric_group(*spec)
+
+        life_panel = QFrame()
+        life_panel.setObjectName("GrowthGroup")
+        life_lay = QVBoxLayout(life_panel)
+        life_lay.setContentsMargins(12, 9, 12, 9)
+        life_lay.setSpacing(6)
+        life_lay.addWidget(_label("生活轨迹", "GrowthGroupTitle"))
+        self._life_state_var = _label("生活线读取中...", "GrowthBody")
+        self._life_state_var.setWordWrap(True)
+        life_lay.addWidget(self._life_state_var)
+        life_lay.addStretch(1)
+        grid.addWidget(life_panel, 2, 0)
+
+        growth_panel = QFrame()
+        growth_panel.setObjectName("GrowthGroup")
+        evo_lay = QVBoxLayout(growth_panel)
+        evo_lay.setContentsMargins(12, 9, 12, 9)
+        evo_lay.setSpacing(6)
+        evo_lay.addWidget(_label("性格与成长", "GrowthGroupTitle"))
+        self._personality_axes_var = _label("性格轮廓读取中...", "GrowthBody")
+        self._personality_axes_var.setWordWrap(True)
+        evo_lay.addWidget(self._personality_axes_var)
+        divider = QFrame()
+        divider.setObjectName("GrowthDivider")
+        evo_lay.addWidget(divider)
+        self._growth_evo_var = _label("最近演化读取中...", "GrowthBody")
+        self._growth_evo_var.setWordWrap(True)
+        evo_lay.addWidget(self._growth_evo_var)
+        evo_lay.addStretch(1)
+        grid.addWidget(growth_panel, 2, 1, 1, 2)
+
+        for c in range(3):
             grid.setColumnStretch(c, 1)
         growth_lay.addLayout(grid)
-        self._life_state_var = _label("生活线读取中...", "Muted")
-        self._life_state_var.setWordWrap(True)
-        growth_lay.addWidget(self._life_state_var)
-        self._growth_evo_var = _label("读取中...", "Muted")
-        self._growth_evo_var.setWordWrap(True)
-        growth_lay.addWidget(self._growth_evo_var)
         outer.addWidget(growth)
 
         self._refresh_growth_stats()
@@ -2215,15 +2276,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             axes = pstate.get_axes()
-            axis_text = "性格轮廓：" + " / ".join(
+            axis_text = " / ".join(
                 f"{pstate.PERSONALITY_AXES[key]} {value}"
                 for key, value in axes.items()
             )
             evolution_text = "　|　".join(evo) if evo else "暂无性格演化记录"
             self._life_state_var.setText(life_state.status_line())
-            self._growth_evo_var.setText(axis_text + "\n" + evolution_text)
+            self._personality_axes_var.setText("性格轮廓　" + axis_text)
+            self._growth_evo_var.setText("最近演化　" + evolution_text)
         except Exception as e:
             self._life_state_var.setText("生活线读取失败")
+            self._personality_axes_var.setText("性格轮廓读取失败")
             self._growth_evo_var.setText(f"成长状态读取失败：{e}")
 
 

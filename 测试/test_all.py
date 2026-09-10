@@ -9,7 +9,7 @@
     2. 配置加载（.env 与 llm_providers.json 若存在则校验；纯开发版可跳过）
     3. 成长系统（性格阶段 / 淫乱度档位 / 称号 计算不抛异常）
     4. 提供商配置读写（llm_providers.json 可读写）
-    5. GUI 冒烟（PySide6 离屏构建 5 个页面，不弹窗）
+    5. GUI 冒烟（PySide6 构建 6 个页面并自动关闭）
 """
 import atexit
 import os
@@ -244,8 +244,8 @@ def test_providers():
 
 
 def test_gui():
-    """GUI 冒烟：真实桌面构建 6 页 + 成长网格，1.5 秒后自动退出（不阻塞）。"""
-    from PySide6.QtWidgets import QApplication
+    """GUI 冒烟：真实桌面构建 6 页 + 陪伴状态分组卡片，1.5 秒后自动退出。"""
+    from PySide6.QtWidgets import QApplication, QFrame
     from PySide6.QtCore import QTimer
     import gui_qt
     app = QApplication([])
@@ -257,6 +257,8 @@ def test_gui():
         try:
             result["tabs"] = win.tabs.count()
             result["growth"] = len(win._growth_labels)
+            result["growth_groups"] = len(win.findChildren(QFrame, "GrowthGroup"))
+            result["has_axes"] = hasattr(win, "_personality_axes_var")
             win._refresh_growth_stats()
             app.processEvents()
             win.close()
@@ -266,8 +268,10 @@ def test_gui():
     QTimer.singleShot(1500, verify)
     app.exec()
     assert result.get("tabs") == 6, "应有 6 个顶级页"
-    assert result.get("growth") == 16, "成长网格应为 16 格（4×4）"
-    print("      GUI 6 页构建 OK，成长网格 16 格 OK")
+    assert result.get("growth") == 16, "16 项陪伴指标必须完整保留"
+    assert result.get("growth_groups") == 7, "陪伴状态应归并为 7 张分组卡片"
+    assert result.get("has_axes"), "性格轮廓应位于分组卡片内"
+    print("      GUI 6 页构建 OK，陪伴状态 16 项归并为 7 组 OK")
 
 
 def main():
