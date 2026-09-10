@@ -3,7 +3,7 @@
 
 比"情绪标签固定加减分"更聪明：让 DeepSeek 阅读当天 90% 的对话原文 + 日记，
 自主分析今天相处经历对性格的影响，输出：
-  - 三个特征值的增减（-5~+5，代码再 clamp ±10，防失控）
+  - 三个关系特征与五个可塑性格轴的增减（通常 -2~+2）
   - personality_shift：一句性格变化描述（写入演化记录，之后每句回复都注入）
   - language_style_tweak：可选说话方式微调（同样写入演化记录）
 
@@ -33,6 +33,11 @@ EVOLUTION_PROMPT = """你是「bot」的性格演化引擎。请根据她今天�
 - 亲密度（0~51=礼貌试探期，51~151=热情升温期，151+=深度绑定期）：{affection}
 - 依赖度：{dependency}
 - 醋意倾向：{jealousy}
+- 温柔度：{warmth}
+- 俏皮度：{playfulness}
+- 主动度：{initiative}
+- 直率度：{directness}
+- 独立度：{independence}
 当前阶段：{stage}
 
 今天的情绪标签：{mood_tags}
@@ -48,14 +53,19 @@ EVOLUTION_PROMPT = """你是「bot」的性格演化引擎。请根据她今天�
   "affection_delta": 整数,
   "dependency_delta": 整数,
   "jealousy_delta": 整数,
-  "personality_shift": "一句话总结她今天性格/心态上的变化（20字以内，第一人称，如"今天开始我更依赖你了"）",
+  "warmth_delta": 整数,
+  "playfulness_delta": 整数,
+  "initiative_delta": 整数,
+  "directness_delta": 整数,
+  "independence_delta": 整数,
+  "personality_shift": "一句话总结她今天性格/心态上的变化（20字以内，第一人称，例如：今天开始我更依赖你了）",
   "language_style_tweak": "可选：一句她想在说话方式上做出的改变（30字以内，没有则空字符串）"
 }}
 
 要求：
 - 变化必须克制：大部分日子只是小幅波动（0~±2），只有发生重大事件
   （激烈争吵、甜蜜表白、长时间深度相处、吃醋风波等）才到 ±5
-- 三个 delta 都是整数
+- 八个 delta 都是整数；性格轴表示逐渐形成的习惯，不要每天都全部改变
 - personality_shift 必须对应今天聊天里的具体情节
 - 没有明显性格变化时 delta 全为 0、personality_shift 写"今天没有明显变化"
 """
@@ -82,7 +92,11 @@ def _parse_evolution_response(raw: str) -> dict:
         return {}
     # 字段归一化 + clamp
     out = {}
-    for key in ("affection_delta", "dependency_delta", "jealousy_delta"):
+    for key in (
+        "affection_delta", "dependency_delta", "jealousy_delta",
+        "warmth_delta", "playfulness_delta", "initiative_delta",
+        "directness_delta", "independence_delta",
+    ):
         try:
             out[key] = max(-DELTA_LIMIT, min(DELTA_LIMIT, int(data.get(key, 0) or 0)))
         except (TypeError, ValueError):
@@ -126,10 +140,16 @@ async def run_daily_evolution(llm_call):
     tags = growth_diary.get_day_mood_tags(day)
     chat_text = "\n".join(f"{'我' if r == 'user' else '她'}: {c}" for r, c in chats)
 
+    axes = personality_state.get_axes()
     prompt = (EVOLUTION_PROMPT
               .replace("{affection}", str(personality_state.get_affection()))
               .replace("{dependency}", str(personality_state.get_dependency()))
               .replace("{jealousy}", str(personality_state.get_jealousy()))
+              .replace("{warmth}", str(axes["warmth"]))
+              .replace("{playfulness}", str(axes["playfulness"]))
+              .replace("{initiative}", str(axes["initiative"]))
+              .replace("{directness}", str(axes["directness"]))
+              .replace("{independence}", str(axes["independence"]))
               .replace("{stage}", personality_state.stage_name())
               .replace("{mood_tags}", json.dumps(tags, ensure_ascii=False))
               .replace("{diary}", diary_content or "（今天还没有日记）")
@@ -154,6 +174,8 @@ async def run_daily_evolution(llm_call):
     personality_state.add_affection(data["affection_delta"])
     personality_state.add_dependency(data["dependency_delta"])
     personality_state.add_jealousy(data["jealousy_delta"])
+    for axis in personality_state.PERSONALITY_AXES:
+        personality_state.add_axis(axis, data[f"{axis}_delta"])
 
     # 写入演化记录（回复时注入，让变化"长进"对话里）
     shift = data["personality_shift"] or ""
@@ -165,7 +187,12 @@ async def run_daily_evolution(llm_call):
     if tweak:
         db.add_evolution_note(day, f"说话方式：{tweak}")
 
-    logger.info("性格演化完成 %s: 亲密%+d 依赖%+d 醋意%+d | %s",
+    axis_log = " ".join(
+        f"{personality_state.PERSONALITY_AXES[key]}{data[f'{key}_delta']:+d}"
+        for key in personality_state.PERSONALITY_AXES
+        if data[f"{key}_delta"]
+    ) or "性格轴无变化"
+    logger.info("性格演化完成 %s: 亲密%+d 依赖%+d 醋意%+d %s | %s",
                 day, data["affection_delta"], data["dependency_delta"],
-                data["jealousy_delta"], shift or "(无描述)")
+                data["jealousy_delta"], axis_log, shift or "(无描述)")
     return shift

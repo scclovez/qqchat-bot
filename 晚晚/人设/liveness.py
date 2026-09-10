@@ -344,26 +344,37 @@ def anniversary_years(start_date=None) -> int:
 # 8) 称呼随性格阶段
 # =============================================================================
 
-# 称呼随性格阶段（你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝）
+# 称呼随性格阶段。越亲密不是越肉麻，而是可选称呼更多、使用更松弛。
 STAGE_NICKNAMES = {
     1: ["你"],
-    2: ["宝"],
-    3: ["老公", "亲爱的"],
+    2: ["宝", "宝宝", "小朋友"],
+    3: ["老公", "亲爱的", "宝宝"],
 }
-# 深度绑定期内部细分 → 更亲昵的称呼（每天固定一种，跨天自然换）
+# 深度绑定期内部细分 → 从热恋称呼逐渐过渡到熟悉、生活化的称呼。
 NICKNAMES_SUBLEVEL = {
-    "深度绑定": ["老公", "亲爱的"],
-    "依恋": ["老公公", "亲爱的"],
-    "挚爱": ["达令", "我的宝"],
+    "深度绑定": ["老公", "亲爱的", "宝宝"],
+    "依恋": ["老公", "宝贝", "乖乖"],
+    "挚爱": ["老公", "我的宝", "小朋友"],
+    "默契相守": ["老公", "宝", "笨蛋", "小朋友"],
+    "家人相守": ["老公", "宝", "笨蛋", "你"],
 }
 
+SERIOUS_NICKNAME_WORDS = (
+    "难受", "不舒服", "疼", "医院", "生病", "害怕", "出事", "危险",
+    "对不起", "道歉", "生气", "吵架", "分手", "怎么办", "认真说",
+)
+COMFORT_NICKNAME_WORDS = ("累", "困", "哭", "委屈", "想抱", "睡不着", "失眠")
+TEASE_NICKNAME_WORDS = ("嘿嘿", "哈哈", "坏", "亲亲", "抱抱", "想我", "喜欢你")
 
-def nickname_for_stage(stage: int, sublevel: str = "") -> str:
+
+def nickname_for_stage(stage: int, sublevel: str = "", user_id: str = "",
+                       user_text: str = "") -> str:
     """按性格阶段 + 深度绑定细分返回对男友的称呼。
 
-    1 礼貌试探→你；2 热情升温→宝；3 深度绑定按细分：
-    深度绑定→老公/亲爱的、依恋→老公公/亲爱的、挚爱→达令/我的宝。
-    同一天固定一个（避免一条条消息乱换称呼），跨天自然变化。
+    1 礼貌试探→你；2 热情升温→宝/宝宝；3 深度绑定后随细分和语境扩展，
+    长期关系反而会混入“你/笨蛋/小朋友”等更生活化的叫法。
+    对话中同一称呼保持 4~9 轮，再自然换；认真话题退回“你”，避免强塞昵称。
+    未提供 user_id（例如 GUI 展示）时仍按天稳定返回，不写状态。
     """
     import random
     from datetime import datetime
@@ -371,8 +382,42 @@ def nickname_for_stage(stage: int, sublevel: str = "") -> str:
     pool = STAGE_NICKNAMES.get(stage, ["你"])
     if stage >= 3 and sublevel in NICKNAMES_SUBLEVEL:
         pool = NICKNAMES_SUBLEVEL[sublevel]
+    text = user_text or ""
+    if any(word in text for word in SERIOUS_NICKNAME_WORDS):
+        return "你"
+    if any(word in text for word in COMFORT_NICKNAME_WORDS) and stage >= 2:
+        pool = [name for name in ("宝宝", "乖乖", "宝") if name in pool or stage >= 3]
+    elif any(word in text for word in TEASE_NICKNAME_WORDS) and stage >= 3:
+        pool = ["笨蛋", "坏蛋", "宝"]
+    if user_id:
+        key = _relationship_key(user_id, "nickname")
+        remain_key = _relationship_key(user_id, "nickname_turns")
+        current = _get(key, "")
+        try:
+            remaining = int(_get(remain_key, "0") or 0)
+        except (TypeError, ValueError):
+            remaining = 0
+        if current in pool and remaining > 0:
+            _set(remain_key, remaining - 1)
+            return current
+        choices = [name for name in pool if name != current] or pool
+        chosen = random.choice(choices)
+        _set(key, chosen)
+        _set(remain_key, random.randint(4, 9))
+        return chosen
     seed = datetime.now().strftime("%Y%m%d") + sublevel + pool[0]
     return random.Random(seed).choice(pool)
+
+
+def nickname_injection(user_id: str, stage: int, sublevel: str, user_text: str) -> str:
+    """生成本轮称呼提示；称呼是可选语气资源，不是每句的必填前缀。"""
+    if any(word in (user_text or "") for word in SERIOUS_NICKNAME_WORDS):
+        return ("\n（这轮是认真话题，先直接回应内容，不要强行插入亲昵称呼；"
+                "需要称呼时用“你”即可。）")
+    nickname = nickname_for_stage(stage, sublevel, user_id, user_text)
+    return (f"\n（最近几轮你比较顺口的称呼是“{nickname}”，但称呼不是口头禅："
+            "只在句子本来就需要叫他时自然用一次，短回复和连续句里宁可不叫；"
+            "不要每条开头或结尾都带称呼。）")
 
 
 # =============================================================================
@@ -675,6 +720,84 @@ def inner_os_injection() -> str:
 # =============================================================================
 # 14) 呼吸感：动态拆条间隔 / 关键句前留白
 # =============================================================================
+
+URGENT_WORDS = ("救命", "出事", "危险", "急事", "报警", "医院", "受伤")
+DISTRESS_WORDS = ("难受", "不舒服", "害怕", "疼", "哭了", "崩溃", "睡不着")
+THOUGHTFUL_WORDS = ("为什么", "怎么办", "你觉得", "认真", "商量", "分析", "建议")
+
+
+def debounce_seconds_for(text: str, batch_size: int = 1) -> float:
+    """判断对方是否还在输入：每条新消息都会重新计时，绝不累计等待。
+
+    像“晚晚”“然后呢”这种碎片多等一会；完整问句、长消息更快进入回复。
+    """
+    value = (text or "").strip()
+    last_line = value.splitlines()[-1].strip() if value else ""
+    if any(word in value for word in URGENT_WORDS):
+        return 1.2
+    if len(last_line) <= 7 and not re.search(r"[。！？!?]$", last_line):
+        delay = 6.0
+    elif re.search(r"[。！？!?]$", last_line):
+        delay = 4.0
+    elif len(last_line) >= 28:
+        delay = 3.6
+    else:
+        delay = 5.0
+    # 已连续发了多条时，通常是在分段输入；仍从最后一条重新等待，但略早收束。
+    if batch_size >= 2:
+        delay = min(delay, 4.8)
+    return delay
+
+
+def reply_delay_seconds(user_text: str, reply_text: str,
+                        configured_min: float, configured_max: float) -> float:
+    """按读消息、思考和打字成本计算本轮回复延迟。"""
+    low = max(0.0, float(configured_min or 0))
+    high = max(low, float(configured_max or low))
+    if high <= 0:
+        return 0.0
+    incoming = user_text or ""
+    outgoing = reply_text or ""
+    base = random.uniform(low, high)
+    # 内容短并不必然慢；紧急或难受时会先尽快接住对方。
+    if any(word in incoming for word in URGENT_WORDS):
+        base = min(base, 0.9)
+    elif any(word in incoming for word in DISTRESS_WORDS):
+        base = min(base, 1.5)
+    elif incoming.strip() and len(incoming.strip()) <= 5 and len(outgoing.strip()) <= 18:
+        base *= 0.55
+    elif any(word in incoming for word in THOUGHTFUL_WORDS) or len(incoming) >= 45:
+        base *= 1.2
+    # 回复越长，多一点真实打字成本；上限防止活动倍率叠加后等得离谱。
+    base += min(1.2, len(outgoing) / 90)
+    return round(max(0.55, min(6.5, base)), 2)
+
+
+def response_style_injection(user_text: str) -> str:
+    """按本轮输入决定回复长度和组织方式，尤其识别连续多条消息。"""
+    text = (user_text or "").strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        return ("\n（他刚才连续发了多条，这些是同一轮表达。先理解整体意思，"
+                "用一份连贯回复回应最核心的情绪或问题，不要按每一行逐条作答；"
+                "通常 12~45 字，确有两个不同重点才分两条。）")
+    if len(text) <= 4:
+        return "\n（这是一句很短的聊天，你也自然回 2~12 个字，别自行扩写剧情。）"
+    if any(word in text for word in THOUGHTFUL_WORDS) or len(text) >= 45:
+        return ("\n（这轮需要认真回应，可以说清楚但仍像聊天：通常 20~60 字，"
+                "先给直接回应，再补一个最有用的细节；不要写成三段说明文。）")
+    return ("\n（这轮是普通聊天，通常 8~32 字；回应当前内容即可，"
+            "不要无缘无故追加催睡、等他回来、手酸或稿子之类固定剧情。）")
+
+
+def sticker_context_factor(user_text: str) -> float:
+    """表情适配语境：认真/不适时几乎不发，轻松互动时适当增加。"""
+    text = user_text or ""
+    if any(word in text for word in SERIOUS_NICKNAME_WORDS + DISTRESS_WORDS + URGENT_WORDS):
+        return 0.1
+    if any(word in text for word in TEASE_NICKNAME_WORDS):
+        return 1.5
+    return 1.0
 
 # 两条消息间的间隔随情绪变化（真人节奏）：情绪高点快、犹豫害羞慢、生气故意拖长。
 # 这里存的是"基准秒"；实际发送时按 ±30% 抖动（见 split_gap_seconds），模拟真人打字节奏。

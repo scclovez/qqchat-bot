@@ -37,15 +37,15 @@ SPLIT_INTERVAL_MIN = 1.0
 SPLIT_INTERVAL_MAX = 2.0
 
 # 单条消息最大字符数：超出后按句末标点二次切分，保证每条都是短消息
-MAX_MSG_LEN = 32
+MAX_MSG_LEN = 30
 
 # 单次回复总字符数上限：兜底截断，防止上下文越长回复越长
-MAX_REPLY_LEN = 96
+MAX_REPLY_LEN = 72
 
 # 这是防刷屏的保护上限，不是默认回复条数；正常回复由模型按语义决定是否分条。
 MAX_REPLY_PARTS = 3
 
-# 私聊连续消息收束：对方连续输入时，等安静 6 秒后合并为同一轮再回复。
+# 私聊连续消息收束上限：每次新消息都重新计时；完整句会更早收束，碎片最多等 6 秒。
 MESSAGE_DEBOUNCE_SECONDS = 6.0
 
 # 语音拆条：真人发语音是一条条录、一条条发的，条与条之间随机停顿（秒）。
@@ -682,7 +682,12 @@ class QQGirlfriendBot:
         if task and not task.done():
             task.cancel()
         batch["items"].append(data)
-        batch["task"] = asyncio.create_task(self._flush_debounced_messages(user_id))
+        text = (data.get("raw_message") or "").strip()
+        delay = (liveness.debounce_seconds_for(text, len(batch["items"]))
+                 if runtime.LIVENESS_ENABLED else MESSAGE_DEBOUNCE_SECONDS)
+        batch["task"] = asyncio.create_task(
+            self._flush_debounced_messages(user_id, delay)
+        )
 
     @staticmethod
     def _merge_debounced_messages(items):
@@ -694,9 +699,10 @@ class QQGirlfriendBot:
         merged["message"] = [{"type": "text", "data": {"text": text}}]
         return merged
 
-    async def _flush_debounced_messages(self, user_id):
+    async def _flush_debounced_messages(self, user_id, delay=MESSAGE_DEBOUNCE_SECONDS):
         try:
-            await asyncio.sleep(MESSAGE_DEBOUNCE_SECONDS)
+            # delay 是“最后一条之后”的安静时间；前一个任务已被 cancel，不会叠加。
+            await asyncio.sleep(delay)
             batch = self._message_batches.pop(user_id, None)
             if not batch or not batch.get("items"):
                 return
@@ -898,12 +904,13 @@ class QQGirlfriendBot:
                     messages[0]["content"] += "\n（今天是他的生日！你要祝他生日快乐，语气甜甜的。）"
                 if len(raw_message) <= 4:
                     messages[0]["content"] += "\n（他这条回得很短，你也只回几个字，别发长消息。）"
-                # 称呼随性格阶段（你→宝→老公→老公公/亲爱的→达令/我的宝），同时展示她此刻的状态
-                _nick = liveness.nickname_for_stage(pstate.get_stage(), pstate.sublevel_name())
+                # 称呼具有连续性但不是口头禅：按关系阶段、语境和最近几轮共同决定。
+                messages[0]["content"] += liveness.nickname_injection(
+                    user_id, pstate.get_stage(), pstate.sublevel_name(), raw_message,
+                )
                 messages[0]["content"] += (
-                    f"\n（你习惯叫他：{_nick}。"
-                    f"你此刻的状态：{self._current_activity(user_id)}。"
-                    "自然地体现在你的言行、语气和回复节奏里，不要解释这段提示。）"
+                    f"\n（你此刻的状态：{self._current_activity(user_id)}。"
+                    "自然地体现在语气里，不要每轮都主动解释自己在做什么。）"
                 )
                 # 纪念日：在一起第 N 天（他问起时间/在一起多久时准确回答）
                 _days = liveness.days_together()
@@ -983,6 +990,7 @@ class QQGirlfriendBot:
                     "不要说'今晚/晚上/天黑了/天亮了'等与当前时段矛盾的表述；"
                     "若剧情里涉及睡觉休息，那是午睡/小憩，不是夜晚。"
                     "回答时间类问题一律以这个真实时间为准。）"
+                    + liveness.response_style_injection(raw_message)
                 ),
             })
             if use_vision:
@@ -1075,19 +1083,12 @@ class QQGirlfriendBot:
             _dual = random.random() < (
                 liveness.DUAL_VOICE_PROB if _important else liveness.DUAL_VOICE_RANDOM_PROB)
         await self._reply_split(msg_type, target_id, user_id, message_id, reply_text,
-                                force_voice=use_voice, dual_voice=_dual)
+                                force_voice=use_voice, dual_voice=_dual,
+                                context_text=raw_message)
         # 成长系统：正常对话 → 亲密度 +1
         if self._is_intimate_user(user_id):
             pstate.add_affection(1)
             growth_diary.add_affection_delta(1)
-
-        # 表情包：按概率随机附带一张（命中关键词时概率提升）
-        await self._maybe_send_sticker(msg_type, target_id, user_id, raw_message)
-
-        # 回马枪：低概率安排"3-5 分钟后突然补一句"，模拟她还在想刚才的事
-        if (runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id) and msg_type == "private"
-                and random.random() < liveness.AFTERTHOUGHT_PROB):
-            asyncio.create_task(self._afterthought_delayed(user_id, raw_message))
 
         # 配图机制：模型自主判断的插图（优先）；未触发时再走"我画了X"正则机制
         illustrated = False
@@ -1104,12 +1105,25 @@ class QQGirlfriendBot:
         # 避免"说了发图却没发"的穿帮（语音模式下模型容易只说不发）
         if not illustrated and PHOTO_PROMISE_RE.search(reply_text or ""):
             logger.info("检测到发照片承诺但无图，兜底生成自拍 [%s]", user_id)
-            await self._generate_and_send_image(
+            illustrated = await self._generate_and_send_image(
                 msg_type, target_id, user_id, "日常自拍",
                 random.choice(FAIL_SELFIE),
                 is_self=True,
                 fallback_prompt=self._build_portrait_prompt(self._current_appearance(), "日常自拍"),
             )
+
+        # 一轮只保留一个额外动作出口：已有语音/图片时不再叠表情或回马枪；
+        # 否则先尝试语境合适的表情，仍没动作才可能安排稍后的补话。
+        rich_turn = bool(use_voice or _dual or illustrated)
+        sticker_sent = False
+        if not rich_turn:
+            sticker_sent = await self._maybe_send_sticker(
+                msg_type, target_id, user_id, raw_message,
+            )
+        if (not rich_turn and not sticker_sent and runtime.LIVENESS_ENABLED
+                and self._is_intimate_user(user_id) and msg_type == "private"
+                and random.random() < liveness.AFTERTHOUGHT_PROB):
+            asyncio.create_task(self._afterthought_delayed(user_id, raw_message))
 
         # 私聊：停止"正在输入"状态（收到消息后 QQ 通常也会自动清除，这里是双保险）
         if msg_type == "private":
@@ -2334,12 +2348,12 @@ class QQGirlfriendBot:
         return any(n and n in raw for n in names)
 
     async def _reply_split(self, msg_type, target_id, user_id, message_id, text,
-                           force_voice=None, dual_voice=False):
+                           force_voice=None, dual_voice=False, context_text=""):
         """将回复按空行拆分为多条消息逐条发送。
 
-        - 发送前等待 REPLY_COOLDOWN 秒（模拟"正在输入"，语音同样适用）
+        - 发送前按输入/回复长度和语境计算阅读、思考、打字时间
         - 只有第一条消息引用原消息，后续作为独立消息
-        - 分条消息之间随机停 1~2 秒，避免连发
+        - 分条消息之间按情绪和上一条长度动态停顿
         - 开启语音回复时，把回复拆成多条语音条逐条发送（更像真人）
         - dual_voice=True：文字发完后，整条内容再合成一条语音发出（重要时刻双模态）
         """
@@ -2359,19 +2373,24 @@ class QQGirlfriendBot:
         # 语音回复：按概率发语音条；force_voice 由调用方预判（已让模型带情感标签）
         if force_voice is None:
             force_voice = self._should_use_voice(user_id)
-        # 回复冷却：在 [最短冷却, 最长冷却] 区间内随机等待（模拟真人打字/想话节奏）
+        # 回复冷却：先按内容决定阅读/思考/打字成本，再叠加活动与身体状态。
         cd_min = float(runtime.REPLY_COOLDOWN_MIN or 0)
         cd_max = float(runtime.REPLY_COOLDOWN_MAX or cd_min)
-        cooldown = random.uniform(cd_min, cd_max) if cd_max > 0 else 0
+        cooldown = (liveness.reply_delay_seconds(context_text, text, cd_min, cd_max)
+                    if runtime.LIVENESS_ENABLED and msg_type == "private"
+                    else (random.uniform(cd_min, cd_max) if cd_max > 0 else 0))
         # 活人感：分场景延迟 —— 她在画室/吃饭/打游戏时回复更慢（冷却乘倍率）
         if runtime.LIVENESS_ENABLED and msg_type == "private":
-            cooldown *= liveness.activity_delay_factor(self._current_activity(user_id))
-            # 身体感：今天很累/精神差 → 回得更慢一点
-            _en = pstate.energy_state(user_id)
-            if "很累" in _en or "困了" in _en:
-                cooldown *= 1.35
-            elif "还可以" in _en:
-                cooldown *= 1.15
+            urgent = any(word in (context_text or "") for word in liveness.URGENT_WORDS)
+            if not urgent:
+                cooldown *= liveness.activity_delay_factor(self._current_activity(user_id))
+                # 身体感：今天很累/精神差 → 回得更慢一点；紧急消息不受此影响。
+                _en = pstate.energy_state(user_id)
+                if "很累" in _en or "困了" in _en:
+                    cooldown *= 1.35
+                elif "还可以" in _en:
+                    cooldown *= 1.15
+            cooldown = min(9.0, cooldown)
         if cooldown > 0:
             if runtime.LIVENESS_ENABLED and msg_type == "private":
                 await self._simulate_typing(user_id, cooldown)
@@ -2393,7 +2412,10 @@ class QQGirlfriendBot:
         # 不自动加“嗯/……”之类的无信息前导；若模型确实分条，才留出正常打字停顿。
         for i, part in enumerate(parts):
             if i > 0:
-                await asyncio.sleep(random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
+                gap = (liveness.split_gap_seconds(parts[i - 1])
+                       if runtime.LIVENESS_ENABLED and msg_type == "private"
+                       else random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
+                await asyncio.sleep(gap)
             await self._reply(msg_type, target_id, user_id, message_id if i == 0 else 0, part)
         # 多模态联动：dual_voice —— 文字发完后，再补一句"语音小尾巴"
         # （重要时刻：晚安/纪念日/道歉等，真人会"文字+语音"一起表达；
@@ -2656,19 +2678,23 @@ class QQGirlfriendBot:
     async def _maybe_send_sticker(self, msg_type, target_id, user_id, user_text=""):
         """按概率在回复后附带表情：图库有图发图，图库为空自动改发 QQ 原生表情。"""
         if not runtime.STICKER_ENABLED:
-            return
+            return False
         prob = float(runtime.STICKER_PROBABILITY or 0)
         if prob <= 0:
-            return
+            return False
         if any(kw in (user_text or "") for kw in STICKER_BOOST_KEYWORDS):
             prob = min(0.6, prob * 3)
         # 多模态联动：心情低落/生气时表情收敛（全模态情绪一致）
         if runtime.LIVENESS_ENABLED:
             prob = min(1.0, prob * liveness.mood_modal_factor(user_id))
+            prob = min(1.0, prob * liveness.sticker_context_factor(user_text))
         if random.random() > prob:
-            return
+            return False
         # 表情包晚一点再发，像真人先回话再贴张图，不和文字挤在一起。
-        await asyncio.sleep(random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
+        gap = (liveness.split_gap_seconds(user_text)
+               if runtime.LIVENESS_ENABLED
+               else random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
+        await asyncio.sleep(gap)
         path = self._pick_sticker()
         if path:
             await self._send_image(msg_type, target_id, user_id, path)
@@ -2678,6 +2704,7 @@ class QQGirlfriendBot:
             face_id = random.choice(FACE_IDS)
             await self._send_face(msg_type, target_id, user_id, face_id)
             logger.info("已发送 QQ 表情: id=%s", face_id)
+        return True
 
     # ===================== 主动消息 =====================
 
@@ -3500,6 +3527,11 @@ class QQGirlfriendBot:
         if total <= 0:
             return
         await self._set_typing(user_id, 1)
+        # 很短的回复直接打一会儿就发；只有确实思考较久时才出现“停下又重打”，
+        # 否则输入状态频繁闪烁反而像脚本。
+        if total <= 2.2:
+            await asyncio.sleep(total)
+            return
         el = 0.0
         while el < total:
             seg = min(random.uniform(1.0, 3.4), total - el)

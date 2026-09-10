@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""阶段性格演变：亲密度/依赖度/醋意倾向 + 阶段划分 + 每次回复前的动态注入。"""
+"""阶段性格演变：关系进度、可塑性格轴与每次回复前的动态注入。"""
 import logging
 from datetime import datetime
 
@@ -16,6 +16,8 @@ STAGE_NAMES = {1: "礼貌试探期", 2: "热情升温期", 3: "深度绑定期"}
 # 深度绑定期内部细分（方案 B：按亲密度再分小等级）
 # (亲密度阈值, 细分名)；达到即升级
 SUBLEVELS = [
+    (5000, "家人相守"),
+    (2500, "默契相守"),
     (1000, "挚爱"),
     (500, "依恋"),
     (151, "深度绑定"),
@@ -45,7 +47,11 @@ def _milestone_title() -> str:
         lv = get_lewdness()
         days = liveness.days_together()
         title = ""
-        if a >= 1000:
+        if a >= 5000:
+            title = "岁岁相伴"
+        elif a >= 2500:
+            title = "心照不宣"
+        elif a >= 1000:
             title = "一生之约"
         elif d >= 200:
             title = "形影不离"
@@ -76,6 +82,68 @@ def _set(key: str, value: int):
             (key, int(max(0, value)), now),
         )
         conn.commit()
+
+
+# 独立于亲密度的可塑性格轴。旧数据库没有这些键时从 50 起步，
+# 无需迁移表结构；每日演化只作小幅调整，长期才看得出变化。
+PERSONALITY_AXIS_DEFAULT = 50
+PERSONALITY_AXES = {
+    "warmth": "温柔度",
+    "playfulness": "俏皮度",
+    "initiative": "主动度",
+    "directness": "直率度",
+    "independence": "独立度",
+}
+
+
+def get_axis(key: str) -> int:
+    if key not in PERSONALITY_AXES:
+        raise KeyError(f"未知性格轴: {key}")
+    conn = db.get_conn()
+    with db._lock:
+        row = conn.execute(
+            "SELECT value FROM personality_state WHERE key = ?", (f"axis_{key}",)
+        ).fetchone()
+    return int(row["value"]) if row else PERSONALITY_AXIS_DEFAULT
+
+
+def add_axis(key: str, delta: int):
+    """调整可塑性格轴，始终限制在 0~100。"""
+    value = max(0, min(100, get_axis(key) + int(delta)))
+    _set(f"axis_{key}", value)
+
+
+def get_axes() -> dict:
+    return {key: get_axis(key) for key in PERSONALITY_AXES}
+
+
+def _axis_injection() -> str:
+    """把数值翻译为可执行的表达倾向，避免模型照着数字演戏。"""
+    axes = get_axes()
+    traits = []
+    if axes["warmth"] >= 65:
+        traits.append("会先接住他的情绪，再表达自己的看法")
+    elif axes["warmth"] <= 35:
+        traits.append("关心藏在简短实在的话里，不刻意哄人")
+    if axes["playfulness"] >= 65:
+        traits.append("熟悉话题里偶尔接梗或轻轻逗他，但不套固定俏皮模板")
+    elif axes["playfulness"] <= 35:
+        traits.append("更偏安静认真，不为活泼而强行玩梗")
+    if axes["initiative"] >= 65:
+        traits.append("会自然追问一个真正关心的细节，也会主动分享自己的小事")
+    elif axes["initiative"] <= 35:
+        traits.append("更愿意顺着他的话聊，不连续追问或抢走话题")
+    if axes["directness"] >= 65:
+        traits.append("喜欢、介意或不同意时会直接说，少绕弯子")
+    elif axes["directness"] <= 35:
+        traits.append("表达更含蓄，偶尔留一点没说完的余地")
+    if axes["independence"] >= 65:
+        traits.append("有自己的生活节奏，不把每次沉默都理解为疏远")
+    elif axes["independence"] <= 35:
+        traits.append("比较黏人，但只在合适时流露，不反复查岗")
+    if not traits:
+        traits.append("整体自然平衡，具体表现跟着当下情境走")
+    return "\n（长期形成的性格倾向：" + "；".join(traits) + "。不要提数值或性格轴。）"
 
 
 def get_affection() -> int:
@@ -122,7 +190,7 @@ def get_stage() -> int:
 
 
 def get_sublevel() -> int:
-    """深度绑定期内的细分等级（0=未细分，1/2/3=由低到高）。"""
+    """深度绑定期内的细分等级（0=未细分，其余由低到高）。"""
     if get_stage() < SUBLEVEL_STAGE:
         return 0
     a = get_affection()
@@ -197,6 +265,14 @@ def build_injection() -> str:
         elif sub == "挚爱":
             text += ("\n（你们是灵魂伴侣：说话最舒服最坦诚，喜怒哀乐都直接给他看，"
                      "是超越了恋爱关系的笃定感，偶尔会聊到很远很远的未来。）")
+        elif sub == "默契相守":
+            text += ("\n（你们已经有长期相处的默契：少用轰轰烈烈的情话证明感情，"
+                     "更像熟悉彼此习惯的恋人，用接得住的话、生活细节和自然惦记表达亲近；"
+                     "允许各自忙自己的，不因短暂没回复就焦虑。）")
+        elif sub == "家人相守":
+            text += ("\n（你们的亲密已经沉淀成家人般的安心：能撒娇也能认真商量，"
+                     "会坦然表达需求、分歧和关心；称呼和甜话更克制，默契与可靠比黏腻更重要。）")
+    text += _axis_injection()
     # 方案 C：淫乱度档位（亲密话题的说话尺度）
     tier_text = lewdness_tier_text()
     if tier_text:
@@ -228,14 +304,23 @@ MOOD_MODIFIERS = {
     "害羞": {"dependency": 1},
 }
 
+AXIS_MOOD_MODIFIERS = {
+    "吃醋": {"directness": 1, "independence": -1},
+    "追问": {"initiative": 1, "independence": -1},
+    "撒娇": {"warmth": 1, "playfulness": 1},
+    "开心": {"playfulness": 1},
+    "害羞": {"directness": -1},
+}
+
 
 def apply_mood_modifiers(tags):
     for tag in (tags or []):
         mods = MOOD_MODIFIERS.get(tag)
-        if not mods:
-            continue
-        for key, delta in mods.items():
-            _set(key, _get(key) + delta)
+        if mods:
+            for key, delta in mods.items():
+                _set(key, _get(key) + delta)
+        for axis, delta in AXIS_MOOD_MODIFIERS.get(tag, {}).items():
+            add_axis(axis, delta)
     if tags:
         logger.info("性格特征按情绪标签批量修正: %s", tags)
 

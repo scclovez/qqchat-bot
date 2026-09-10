@@ -94,6 +94,7 @@ def test_config():
 def test_growth():
     import personality_state as pstate
     import liveness
+    import evolution
     from memory import _select_relevant_memory
     from qzone import _extract_feed_identity
     from qq_bot import (
@@ -104,6 +105,8 @@ def test_growth():
     assert pstate.stage_name()
     assert pstate.lewdness_tier_name() in ("害羞", "主动", "放开")
     assert pstate.get_title() is not None
+    assert set(pstate.get_axes()) == set(pstate.PERSONALITY_AXES)
+    assert all(0 <= value <= 100 for value in pstate.get_axes().values())
     inj = pstate.build_injection()
     assert isinstance(inj, str) and inj
     # 真人感：关系余温只记抽象状态；记忆只在话题有关时被选中。
@@ -134,6 +137,18 @@ def test_growth():
     ])
     assert merged["raw_message"] == "第一句\n第二句" and merged["message_id"] == 2
     assert MESSAGE_DEBOUNCE_SECONDS == 6.0
+    assert liveness.debounce_seconds_for("晚晚") == 6.0
+    assert liveness.debounce_seconds_for("你在吗？") < 6.0
+    assert liveness.debounce_seconds_for("救命，我受伤了") <= 1.2
+    assert "同一轮表达" in liveness.response_style_injection("第一句\n第二句")
+    nick1 = liveness.nickname_for_stage(3, "默契相守", "test_relationship", "嘿嘿")
+    nick2 = liveness.nickname_for_stage(3, "默契相守", "test_relationship", "嘿嘿")
+    assert nick1 == nick2
+    parsed = evolution._parse_evolution_response(
+        '{"affection_delta":1,"warmth_delta":2,"initiative_delta":-1}'
+    )
+    assert parsed["warmth_delta"] == 2 and parsed["initiative_delta"] == -1
+    assert parsed["playfulness_delta"] == 0
 
 
 def test_providers():

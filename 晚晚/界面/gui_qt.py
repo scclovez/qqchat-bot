@@ -82,7 +82,7 @@ GROWTH_HINTS = {
     "dependency": "依赖度：她有多依赖你；主动聊天、追问、撩人都会增加",
     "jealousy": "醋意倾向：你提到别人、久不回复时会增加，影响她吃醋的表现",
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的尺度",
-    "nickname": "她当前对你的称呼，随性格阶段与深度绑定细分变化：你 → 宝 → 老公 → 老公公/亲爱的 → 达令/我的宝",
+    "nickname": "她最近几轮顺口的称呼；会随关系、语境自然变化，认真话题会收敛，也不会每句话都叫",
     "now_thought": "今天一件值得记的小事（大模型提炼，最生动/最生活感的那一件）",
     "state": "她此刻的状态（在睡觉/在画画/在吃饭…）：剧情优先取最近对话她自述的状态，没有则按时段兜底",
     "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
@@ -2200,7 +2200,13 @@ class MainWindow(QMainWindow):
                 evo = [f"{n['note_date']}：{n['note']}" for n in notes]
             except Exception:
                 pass
-            self._growth_evo_var.setText("　|　".join(evo) if evo else "（暂无性格演化记录）")
+            axes = pstate.get_axes()
+            axis_text = "性格轮廓：" + " / ".join(
+                f"{pstate.PERSONALITY_AXES[key]} {value}"
+                for key, value in axes.items()
+            )
+            evolution_text = "　|　".join(evo) if evo else "暂无性格演化记录"
+            self._growth_evo_var.setText(axis_text + "\n" + evolution_text)
         except Exception as e:
             self._growth_evo_var.setText(f"成长状态读取失败：{e}")
 
