@@ -16,6 +16,7 @@ from websockets.exceptions import ConnectionClosed
 from 路径 import PROJECT_ROOT, data_path
 from llm_factory import get_llm_client
 from conversation import ConversationMemory
+import dialogue_policy
 from config import config, runtime
 from personality import build_system_prompt
 import comfyui_client
@@ -380,13 +381,15 @@ def _compact_image_followup(text: str, max_len: int = 22) -> str:
 
 
 def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
-                     max_total: int = MAX_REPLY_LEN) -> list[str]:
+                     max_total: int = MAX_REPLY_LEN,
+                     max_parts: int = MAX_REPLY_PARTS) -> list[str]:
     """按语义停顿拆出少量短消息，而非把一段回答机械切碎。
 
     - 先按任意换行拆分
     - 波浪号不作为分条符；发送前会删除或改成普通停顿
     - 单段超过 max_msg_len 时按句末标点二次切分
     - 累计超过 max_total 或达到防刷屏上限时丢弃剩余部分
+    - 极小上限也至少保留一个截短后的片段，不产生空回复
     """
     text = _normalize_outgoing_text(text)
     line_parts = [p.strip() for p in re.split(r"\n+", text)]
@@ -397,10 +400,14 @@ def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
         segs = [p] if len(p) <= max_msg_len else _split_long_segment(p, max_msg_len)
         for s in segs:
             if total + len(s) > max_total:
+                if not result and max_total > 0:
+                    clipped = s[:max_total].rstrip("，。！？!?、；;：: ")
+                    if clipped:
+                        result.append(clipped)
                 return result
             result.append(s)
             total += len(s)
-            if len(result) >= MAX_REPLY_PARTS:
+            if len(result) >= max(1, int(max_parts)):
                 return result
     return result
 
@@ -862,6 +869,24 @@ class QQGirlfriendBot:
                     await self._handle_image_gen(msg_type, target_id, user_id, raw_message)
                     await self._finish_typing(msg_type, user_id)
                     return
+        turn_plan = dialogue_policy.plan_turn(
+            raw_message,
+            user_sent_voice=bool(self._first_record_seg(data)),
+            user_sent_image=bool(self._first_image_seg(data)),
+            is_intimate=(msg_type == "private" and self._is_intimate_user(user_id)),
+        )
+        logger.info(
+            "对话策略 [%s]: intent=%s emotion=%s parts<=%d extras=%s",
+            user_id, turn_plan.intent, turn_plan.emotion, turn_plan.max_parts,
+            ",".join(
+                name for name, enabled in (
+                    ("voice", turn_plan.allow_voice), ("image", turn_plan.allow_image),
+                    ("sticker", turn_plan.allow_sticker),
+                    ("afterthought", turn_plan.allow_afterthought),
+                ) if enabled
+            ) or "none",
+        )
+        tool_action_taken = False
         lock = self._get_lock(user_id)
         async with lock:
             await self._memory.compress(user_id, self._deepseek)
@@ -875,14 +900,15 @@ class QQGirlfriendBot:
             # 注入实时信息：当前时间（必带）+ 天气/联网搜索（按消息关键词触发）
             await self._inject_live_context(messages, raw_message, user_id)
             # 语音模式：先决定本次是否发语音，若是则要求模型输出情感标签
-            use_voice = self._should_use_voice(user_id)
+            use_voice = turn_plan.allow_voice and self._should_use_voice(user_id)
             if use_voice:
                 messages[0]["content"] += "\n\n" + VOICE_INSTRUCTION
             # 雌小鬼模式：进入亲密/暧昧状态时切换（设定级，任何方式触发）
             if self._is_intimate_user(user_id):
                 messages[0]["content"] += MESUGAKI_INSTRUCTION
-            # 配图机制：让模型自己判断这条回复是否配图、配什么图
-            messages[0]["content"] += ILLUSTRATION_INSTRUCTION
+            # 只有本轮策略认为视觉表达合适时，才把配图能力交给模型。
+            if turn_plan.allow_image:
+                messages[0]["content"] += ILLUSTRATION_INSTRUCTION
             # 阶段性格演变：每次回复前注入当前阶段/特征值描述
             messages[0]["content"] += self._relationship_prompt(user_id)
             # 活人感状态注入：情绪日 / 闹脾气 / 深夜困意 / 生日 / 短消息对称 / 称呼 / 纪念日 / 翻旧账
@@ -988,7 +1014,7 @@ class QQGirlfriendBot:
                     "不要说'今晚/晚上/天黑了/天亮了'等与当前时段矛盾的表述；"
                     "若剧情里涉及睡觉休息，那是午睡/小憩，不是夜晚。"
                     "回答时间类问题一律以这个真实时间为准。）"
-                    + liveness.response_style_injection(raw_message)
+                    + turn_plan.injection()
                 ),
             })
             if use_vision:
@@ -1016,13 +1042,18 @@ class QQGirlfriendBot:
             else:
                 # 自主互动工具：模型可决定戳一戳/回表情/点赞/改状态/换签名
                 # （仅普通文本对话；视觉/语音模式不接工具，避免标签冲突）
-                if runtime.INTERACT_ENABLED:
+                if (runtime.INTERACT_ENABLED and not use_voice
+                        and turn_plan.allowed_tools):
                     from interact_tools import INTERACT_TOOLS, InteractTools
                     interact = InteractTools(self._api_call, user_id, message_id)
+                    allowed = set(turn_plan.allowed_tools)
+                    tools = [tool for tool in INTERACT_TOOLS
+                             if tool.get("function", {}).get("name") in allowed]
                     reply_text = await self._deepseek.chat(
-                        messages, tools=INTERACT_TOOLS, execute_tool=interact.execute,
+                        messages, tools=tools, execute_tool=interact.execute,
                         disable_thinking=True,
                     )
+                    tool_action_taken = interact.action_taken
                 else:
                     reply_text = await self._deepseek.chat(messages)
             # 空回复兜底（模型未返回内容时）
@@ -1055,9 +1086,18 @@ class QQGirlfriendBot:
             # 标记不进入记忆/发送文本，只在文字发完后按描述生成并发图
             illustration_desc = ""
             illustration_desc, reply_text = self._extract_illustration_tag(reply_text)
+            if not turn_plan.allow_image:
+                illustration_desc = ""
             reply_text = _normalize_outgoing_text(reply_text)
-            # 语音模式下，记忆存去掉情感标签后的实际朗读文本
-            mem_text, emotion = self._split_emotion_tag(reply_text) if use_voice else (reply_text, "")
+            # 在写入记忆前落实长度和分条预算，避免“记得自己说过、实际却没发出”的内容。
+            plain_text, emotion = self._split_emotion_tag(reply_text) if use_voice else (reply_text, "")
+            planned_parts = split_reply_text(
+                plain_text,
+                max_total=max(MAX_MSG_LEN, min(MAX_REPLY_LEN, turn_plan.hard_max)),
+                max_parts=turn_plan.max_parts,
+            )
+            mem_text = "\n".join(planned_parts) or "嗯嗯"
+            reply_text = f"【{emotion}】{mem_text}" if use_voice and emotion else mem_text
             # 记忆也不存动作描写（模型偶尔输出括号/星号动作，过滤掉保持干净）
             cleaned = self._strip_action_marks(mem_text)
             if cleaned:
@@ -1074,7 +1114,8 @@ class QQGirlfriendBot:
         # 但真人不会每次都这样——按概率触发；平时普通私聊也有小概率顺手补一句语音。
         # 语音内容由 _dual_voice_supplement 生成（不重复文字，是一句更亲密的心里话）
         _dual = False
-        if runtime.LIVENESS_ENABLED and msg_type == "private":
+        if (runtime.LIVENESS_ENABLED and msg_type == "private"
+                and turn_plan.allow_dual_voice and not tool_action_taken):
             _important = (self._is_night_said(raw_message)
                           or liveness.is_anniversary_today()
                           or any(w in raw_message for w in boundary.SOOTHE_WORDS))
@@ -1082,7 +1123,7 @@ class QQGirlfriendBot:
                 liveness.DUAL_VOICE_PROB if _important else liveness.DUAL_VOICE_RANDOM_PROB)
         await self._reply_split(msg_type, target_id, user_id, message_id, reply_text,
                                 force_voice=use_voice, dual_voice=_dual,
-                                context_text=raw_message)
+                                context_text=raw_message, turn_plan=turn_plan)
         # 成长系统：正常对话 → 亲密度 +1
         if self._is_intimate_user(user_id):
             pstate.add_affection(1)
@@ -1090,18 +1131,19 @@ class QQGirlfriendBot:
 
         # 配图机制：模型自主判断的插图（优先）；未触发时再走"我画了X"正则机制
         illustrated = False
-        if illustration_desc:
+        if turn_plan.allow_image and illustration_desc:
             illustrated = await self._maybe_send_illustration(
                 msg_type, target_id, user_id, illustration_desc,
                 force=self._is_selfie_intent(raw_message),
             )
-        if not illustrated:
+        if turn_plan.allow_image and not illustrated:
             # 自动插图：回复里提到"我画了X"时生成并发图
             illustrated = await self._maybe_send_draw_image(
                 msg_type, target_id, user_id, reply_text)
         # 兜底：说了"这就把照片发给你/发给你看"却一张图都没发 → 真发一张自拍，
         # 避免"说了发图却没发"的穿帮（语音模式下模型容易只说不发）
-        if not illustrated and PHOTO_PROMISE_RE.search(reply_text or ""):
+        if (turn_plan.allow_image and not illustrated
+                and PHOTO_PROMISE_RE.search(reply_text or "")):
             logger.info("检测到发照片承诺但无图，兜底生成自拍 [%s]", user_id)
             illustrated = await self._generate_and_send_image(
                 msg_type, target_id, user_id, "日常自拍",
@@ -1112,13 +1154,14 @@ class QQGirlfriendBot:
 
         # 一轮只保留一个额外动作出口：已有语音/图片时不再叠表情或回马枪；
         # 否则先尝试语境合适的表情，仍没动作才可能安排稍后的补话。
-        rich_turn = bool(use_voice or _dual or illustrated)
+        rich_turn = bool(use_voice or _dual or illustrated or tool_action_taken)
         sticker_sent = False
-        if not rich_turn:
+        if not rich_turn and turn_plan.allow_sticker:
             sticker_sent = await self._maybe_send_sticker(
                 msg_type, target_id, user_id, raw_message,
             )
-        if (not rich_turn and not sticker_sent and runtime.LIVENESS_ENABLED
+        if (not rich_turn and not sticker_sent and turn_plan.allow_afterthought
+                and runtime.LIVENESS_ENABLED
                 and self._is_intimate_user(user_id) and msg_type == "private"
                 and random.random() < liveness.AFTERTHOUGHT_PROB):
             asyncio.create_task(self._afterthought_delayed(user_id, raw_message))
@@ -2346,7 +2389,8 @@ class QQGirlfriendBot:
         return any(n and n in raw for n in names)
 
     async def _reply_split(self, msg_type, target_id, user_id, message_id, text,
-                           force_voice=None, dual_voice=False, context_text=""):
+                           force_voice=None, dual_voice=False, context_text="",
+                           turn_plan=None):
         """将回复按空行拆分为多条消息逐条发送。
 
         - 发送前按输入/回复长度和语境计算阅读、思考、打字时间
@@ -2405,7 +2449,12 @@ class QQGirlfriendBot:
                 return
             # 语音合成失败：回退文字时去掉情感标签，避免把【撒娇】读出来/显示出来
             text, _ = self._split_emotion_tag(text)
-        parts = split_reply_text(text)
+        parts = split_reply_text(
+            text,
+            max_total=(max(MAX_MSG_LEN, min(MAX_REPLY_LEN, turn_plan.hard_max))
+                       if turn_plan is not None else MAX_REPLY_LEN),
+            max_parts=(turn_plan.max_parts if turn_plan is not None else MAX_REPLY_PARTS),
+        )
         if not parts:
             return
         # 不自动加“嗯/……”之类的无信息前导；若模型确实分条，才留出正常打字停顿。

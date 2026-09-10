@@ -73,7 +73,7 @@ def check(name, fn):
 def test_imports():
     mods = [
         "config", "llm_providers", "personality", "liveness", "boundary",
-        "conversation", "memory", "usage", "image_gen", "comfyui_client",
+        "conversation", "dialogue_policy", "memory", "usage", "image_gen", "comfyui_client",
         "appearance_ref", "qq_bot", "llm_base", "openai_compat",
         "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
         "asr", "diary", "personality_state", "evolution", "evolution_db",
@@ -97,6 +97,7 @@ def test_growth():
     import liveness
     import evolution
     import life_state
+    import dialogue_policy
     from memory import _select_relevant_memory
     from qzone import _extract_feed_identity
     from qq_bot import (
@@ -166,6 +167,24 @@ def test_growth():
     assert life_state.get_snapshot(base_time + timedelta(minutes=16))["activity"] == "洗澡"
     assert life_state.get_snapshot(base_time + timedelta(minutes=51))["activity"] == "吹头发"
     assert "生活线" in life_state.status_line(base_time + timedelta(minutes=16))
+    # 对话决策层：连续消息整体理解，严肃问题收敛动作，轻松互动才开放相应出口。
+    urgent_plan = dialogue_policy.plan_turn("我现在很难受\n有点撑不住了")
+    assert urgent_plan.multi_message and urgent_plan.intent in ("紧急关怀", "倾诉安慰")
+    assert not urgent_plan.allow_image and not urgent_plan.allow_sticker
+    assert urgent_plan.max_parts <= 2 and urgent_plan.focus
+    advice_plan = dialogue_policy.plan_turn("这个事情应该怎么办？")
+    assert advice_plan.intent == "一起解决问题"
+    assert not advice_plan.allowed_tools and not advice_plan.allow_voice
+    playful_plan = dialogue_policy.plan_turn("嘿嘿，喜欢你")
+    assert playful_plan.intent == "亲密回应" and playful_plan.allowed_tools
+    image_plan = dialogue_policy.plan_turn("发张自拍给我看看")
+    assert image_plan.allow_image and not image_plan.allowed_tools
+    mention_plan = dialogue_policy.plan_turn("我今天拍了一张照片")
+    assert not mention_plan.allow_image
+    assert "本轮对话策略" in playful_plan.injection()
+    assert len(split_reply_text("第一条。\n第二条。", max_parts=1)) == 1
+    clipped = split_reply_text("这是一条明显超过极小总长度上限的回复", max_total=8)
+    assert clipped and len(clipped[0]) <= 8
 
 
 def test_providers():

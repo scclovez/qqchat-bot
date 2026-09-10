@@ -194,12 +194,18 @@ class InteractTools:
         self._api_call = api_call
         self._user_id = str(user_id)
         self._message_id = message_id
+        self.action_taken = False
 
     async def execute(self, name: str, args: dict) -> dict:
+        if self.action_taken:
+            return {"ok": False, "error": "本轮已经执行过一个互动动作"}
         handler = getattr(self, "_do_" + name, None)
         if not handler:
             return {"ok": False, "error": f"未知工具 {name}"}
-        return await handler(args or {})
+        result = await handler(args or {})
+        if isinstance(result, dict) and result.get("ok"):
+            self.action_taken = True
+        return result
 
     async def _do_poke_user(self, args) -> dict:
         if not _can_do("poke_user", min_gap_minutes=30):
