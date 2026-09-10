@@ -73,7 +73,7 @@ def check(name, fn):
 def test_imports():
     mods = [
         "config", "llm_providers", "personality", "liveness", "boundary",
-        "conversation", "dialogue_policy", "memory", "usage", "image_gen", "comfyui_client",
+        "conversation", "dialogue_policy", "episodic_memory", "memory", "usage", "image_gen", "comfyui_client",
         "appearance_ref", "qq_bot", "llm_base", "openai_compat",
         "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
         "asr", "diary", "personality_state", "evolution", "evolution_db",
@@ -98,7 +98,9 @@ def test_growth():
     import evolution
     import life_state
     import dialogue_policy
-    from memory import _select_relevant_memory
+    import episodic_memory
+    import memory as longterm_memory
+    from memory import _drop_superseded, _select_relevant_memory
     from qzone import _extract_feed_identity
     from qq_bot import (
         MESSAGE_DEBOUNCE_SECONDS, QQGirlfriendBot, _compact_image_followup,
@@ -185,6 +187,40 @@ def test_growth():
     assert len(split_reply_text("第一条。\n第二条。", max_parts=1)) == 1
     clipped = split_reply_text("这是一条明显超过极小总长度上限的回复", max_total=8)
     assert clipped and len(clipped[0]) <= 8
+    # 情景记忆：同一事件合并进展，结果关闭事件，小事自然淡出，回访最多一次。
+    event_now = datetime(2026, 9, 10, 9, 0, 0)
+    episodes = episodic_memory.merge_episodes([], [{
+        "topic": "考试", "detail": "明天下午考试", "time_hint": "明天下午",
+        "emotion": "紧张", "status": "pending", "importance": 3,
+        "certainty": "confirmed", "follow_up_after": "2026-09-11 18:00:00",
+    }], event_now)
+    assert len(episodes) == 1 and episodes[0]["status"] == "pending"
+    assert episodic_memory.select_relevant_episodes(episodes, "考试考得怎么样", now=event_now)
+    due = episodic_memory.get_due_followup(episodes, datetime(2026, 9, 11, 19, 0, 0))
+    assert due and due["followup_count"] == 0
+    episodes = episodic_memory.mark_followed_up(episodes, due["id"], datetime(2026, 9, 11, 19, 0, 0))
+    assert episodic_memory.get_due_followup(episodes, datetime(2026, 9, 12, 19, 0, 0)) is None
+    episodes = episodic_memory.merge_episodes(episodes, [{
+        "topic": "考试", "status": "completed", "result": "考完了，发挥不错",
+        "importance": 3, "certainty": "confirmed", "replaces": "考试",
+    }], datetime(2026, 9, 11, 20, 0, 0))
+    assert len(episodes) == 1 and episodes[0]["status"] == "completed"
+    separate = episodic_memory.merge_episodes([], [
+        {"topic": "数学考试", "detail": "明天下午", "status": "pending"},
+        {"topic": "英语考试", "detail": "后天下午", "status": "pending"},
+    ], event_now)
+    assert len(separate) == 2
+    faded = episodic_memory.prune_episodes([{
+        "topic": "随口提到的小事", "status": "completed", "importance": 1,
+        "certainty": "mentioned", "updated_at": "2026-08-01 09:00:00",
+    }], event_now)
+    assert faded == []
+    assert _drop_superseded(["用户在旧公司工作", "用户喜欢咖啡"], ["用户在旧公司工作"]) == ["用户喜欢咖啡"]
+    episode_user = "test_episode_memory"
+    assert longterm_memory.observe_user_episode(episode_user, "我明天要考试，有点紧张", event_now) == "created"
+    assert longterm_memory.observe_user_episode(episode_user, "我考完了，发挥还不错", event_now + timedelta(days=1)) == "closed"
+    stored = longterm_memory.get_user_memory(episode_user).get("episodes", [])
+    assert len(stored) == 1 and stored[0]["status"] == "completed"
 
 
 def test_providers():

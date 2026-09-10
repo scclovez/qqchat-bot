@@ -4,6 +4,8 @@
 为 QQ 聊天机器人提供：
   - 按用户维度的聊天记录存储（chat_history）
   - 提炼后的长期记忆存储（user_memory）
+  - 带时间、情绪、结果和状态的情景记忆（episodes）
+  - 旧事实纠正、相关召回和低价值事件自然遗忘
   - 记忆提炼触发与合并逻辑
   - 线程安全的数据库操作
 
@@ -11,13 +13,18 @@
 add_chat_history / build_system_prompt_with_memory / maybe_update_long_term_memory 等。
 """
 
+from __future__ import annotations
+
+import atexit
 import json
 import logging
 import os
 import re
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+
+import episodic_memory
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +81,15 @@ def _get_conn() -> sqlite3.Connection:
             _conn.execute("PRAGMA foreign_keys=ON")
             _conn.execute("PRAGMA busy_timeout=5000")
     return _conn
+
+
+def close_db():
+    """进程退出或测试结束时释放 SQLite 文件句柄。"""
+    global _conn
+    with _lock:
+        conn, _conn = _conn, None
+        if conn is not None:
+            conn.close()
 
 
 # =============================================================================
@@ -166,6 +182,7 @@ def prune_chat_history(keep_per_user: int = CHAT_HISTORY_KEEP_PER_USER):
 
 # 模块导入时自动建表
 init_db()
+atexit.register(close_db)
 
 
 # =============================================================================
@@ -330,6 +347,9 @@ def save_user_memory(user_id: str, profile: dict):
     """保存或更新长期记忆。"""
     conn = _get_conn()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    profile = dict(profile or {})
+    if "episodes" in profile:
+        profile["episodes"] = episodic_memory.prune_episodes(profile.get("episodes", []))
     profile_json = json.dumps(profile, ensure_ascii=False)
     with _lock:
         conn.execute(
@@ -389,6 +409,130 @@ def add_user_preference(user_id: str, key: str, value: str):
 
 
 # =============================================================================
+# 情景记忆：即时观察 / 回访状态
+# =============================================================================
+
+_EPISODE_TOPICS = (
+    (("考试", "考研", "考证", "测验"), "考试"),
+    (("面试",), "面试"),
+    (("答辩",), "答辩"),
+    (("比赛",), "比赛"),
+    (("看医生", "去医院", "手术"), "就医"),
+    (("发烧", "生病", "不舒服", "头疼", "肚子疼"), "身体不舒服"),
+    (("开会",), "开会"),
+    (("出差",), "出差"),
+    (("旅行", "旅游"), "旅行"),
+    (("作业", "论文", "项目", "稿子"), "手头任务"),
+)
+_EPISODE_RESULT_RE = re.compile(
+    r"(?:考完|面试完|答辩完|比赛完|做完|写完|结束了|解决了|弄好了|完成了|"
+    r"通过了|成功了|失败了|取消了|不去了|没事了|好多了)"
+)
+_EPISODE_NEGATED_RESULT_RE = re.compile(r"(?:还没|没有|没).*?(?:完|结束|解决|好)")
+
+
+def _episode_topic(text: str) -> str:
+    for words, topic in _EPISODE_TOPICS:
+        if any(word in text for word in words):
+            return topic
+    return ""
+
+
+def _episode_followup_after(text: str, now: datetime) -> datetime:
+    if "后天" in text:
+        return now + timedelta(hours=54)
+    if "明天" in text:
+        return now + timedelta(hours=30)
+    if "待会" in text or "等会" in text or "一会" in text:
+        return now + timedelta(hours=3)
+    if "今天" in text or "今晚" in text:
+        return now + timedelta(hours=8)
+    if any(word in text for word in ("不舒服", "发烧", "生病", "头疼", "肚子疼")):
+        return now + timedelta(hours=4)
+    return now + timedelta(hours=12)
+
+
+def observe_user_episode(user_id: str, text: str, now=None) -> str:
+    """从每条用户消息即时更新明确事件，返回 ``created/closed/''``。
+
+    完整语义仍由后台 LLM 提炼；这里仅负责高置信度的计划和结果，使“考完了”之类
+    的结果无需再等十条消息就能关闭待办事件。
+    """
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw:
+        return ""
+    current = now if isinstance(now, datetime) else datetime.now()
+    profile = get_user_memory(user_id)
+    episodes = episodic_memory.prune_episodes(profile.get("episodes", []), current)
+    active = [item for item in episodes if item.get("status") in episodic_memory.ACTIVE_STATUSES]
+
+    if _EPISODE_RESULT_RE.search(raw) and not _EPISODE_NEGATED_RESULT_RE.search(raw):
+        relevant = episodic_memory.select_relevant_episodes(active, raw, 1, current)
+        target = relevant[0] if relevant else (active[-1] if len(active) == 1 else None)
+        if target:
+            update = {
+                "topic": target["topic"],
+                "detail": target.get("detail", ""),
+                "status": "cancelled" if any(w in raw for w in ("取消", "不去了")) else "completed",
+                "result": raw[:100],
+                "importance": target.get("importance", 2),
+                "certainty": "confirmed",
+                "replaces": target["topic"],
+            }
+            profile["episodes"] = episodic_memory.merge_episodes(episodes, [update], current)
+            save_user_memory(user_id, profile)
+            logger.info("用户 %s 的情景记忆已结束: %s", user_id, target["topic"])
+            return "closed"
+
+    topic = _episode_topic(raw)
+    if not topic:
+        return ""
+    # 避免把“你明天考试吗”误记成用户自己的经历；省略主语的陈述句仍可识别。
+    if ("?" in raw or "？" in raw) or ("你" in raw and "我" not in raw):
+        return ""
+    plan_signal = any(word in raw for word in (
+        "我", "明天", "后天", "今天", "今晚", "待会", "等会", "准备", "要去", "要考",
+        "快要", "马上", "正在", "最近", "这周", "下周",
+    ))
+    if not plan_signal:
+        return ""
+    certainty = "mentioned" if any(word in raw for word in ("可能", "也许", "好像", "不确定")) else "confirmed"
+    health = topic in ("就医", "身体不舒服")
+    status = "ongoing" if (health or any(word in raw for word in ("正在", "最近"))) else "pending"
+    time_hint_match = re.search(r"(?:今天|今晚|明天|后天|这周|下周|待会儿?|等会儿?|一会儿?)", raw)
+    emotion = next((word for word in ("紧张", "害怕", "焦虑", "难受", "期待", "开心") if word in raw), "")
+    update = {
+        "topic": topic,
+        "detail": raw[:120],
+        "time_hint": time_hint_match.group(0) if time_hint_match else "",
+        "emotion": emotion,
+        "status": status,
+        "importance": 4 if health else (3 if topic in ("考试", "面试", "答辩") else 2),
+        "certainty": certainty,
+        "follow_up_after": _episode_followup_after(raw, current).isoformat(sep=" ", timespec="seconds"),
+    }
+    profile["episodes"] = episodic_memory.merge_episodes(episodes, [update], current)
+    save_user_memory(user_id, profile)
+    logger.info("用户 %s 的情景记忆已更新: %s", user_id, topic)
+    return "created"
+
+
+def get_due_episode_followup(user_id: str, now=None) -> dict | None:
+    profile = get_user_memory(user_id)
+    return episodic_memory.get_due_followup(profile.get("episodes", []), now)
+
+
+def mark_episode_followed_up(user_id: str, episode_id: str, now=None) -> bool:
+    profile = get_user_memory(user_id)
+    episodes = profile.get("episodes", [])
+    if not any(str(item.get("id")) == str(episode_id) for item in episodes if isinstance(item, dict)):
+        return False
+    profile["episodes"] = episodic_memory.mark_followed_up(episodes, episode_id, now)
+    save_user_memory(user_id, profile)
+    return True
+
+
+# =============================================================================
 # 记忆提炼的 checkpoint 管理
 # =============================================================================
 
@@ -435,6 +579,7 @@ def _get_max_chat_id(user_id: str) -> int:
 # 注入 system prompt 时记忆的上限（防止记忆无限增长稀释人设约束）
 MEMORY_FACTS_LIMIT = 4
 MEMORY_PREFS_LIMIT = 4
+MEMORY_EPISODES_LIMIT = 2
 FIXED_FACTS_LIMIT = 8    # 固定事实上限（"必须遵守"的当前设定，高优先级注入）
 
 
@@ -517,6 +662,15 @@ def build_system_prompt_with_memory(user_id: str, base_skill_prompt: str,
                 lines.append("- 偏好：")
                 for item in selected_preferences:
                     lines.append(f"  - {item}")
+        episodes = episodic_memory.select_relevant_episodes(
+            memory.get("episodes", []), query, MEMORY_EPISODES_LIMIT,
+        )
+        if episodes:
+            lines.append("- 与当前话题有关的共同经历：")
+            for episode in episodes:
+                lines.append(f"  - {episodic_memory.render_episode(episode)}")
+            lines.append("  只接住当前有关的进展；已经结束的事不要再当作待办追问，"
+                         "仅提到但未确认的内容不要说成确定事实。")
         # 只有姓名或实际关联的记忆时才追加区块，避免空白资料卡干扰人设。
         if len(lines) > 1:
             parts.append("\n".join(lines))
@@ -537,6 +691,8 @@ def build_system_prompt_with_memory(user_id: str, base_skill_prompt: str,
 # 提炼用的提示词模板
 EXTRACT_PROMPT_TEMPLATE = """你是一个信息提炼助手。请从以下对话中提取关于该用户的重要新信息。
 
+当前真实时间：{now}
+
 已有记忆：
 {existing_memory}
 
@@ -550,20 +706,62 @@ EXTRACT_PROMPT_TEMPLATE = """你是一个信息提炼助手。请从以下对话
 4. 当前必须遵守的"固定事实/安排/情境"（如"今天已请假、没课"、"只有你们俩"、"他帮我请了假"、
    "我现在就在他身边/在他怀里/在床上"、"我们正在一起"等——这些是剧情关键设定，之后必须连续遵守、不能违背。
    只列当前依然有效、值得一直遵守的，过时/已改变的不要列）
+5. 有过程的情景事件（如考试、面试、生病、旅行、共同完成某件事）：记录主题、时间线索、当时情绪、
+   当前是 pending/ongoing/completed/cancelled、结果、重要程度 1~5，以及 confirmed/mentioned。
+   用户明确陈述或确认才是 confirmed；猜测、可能、转述或随口一提是 mentioned。
 
 注意事项：
 - 随机片段可能已过时，只提取仍然有效的重要内容；
 - 与已有记忆冲突时，以最近对话为准；
 - 已有记忆中已包含的内容无需重复提取；
+- 新信息推翻旧事实时，把旧原文放进 remove_facts，再把正确内容放进 facts；
+- 固定情境已结束或被推翻时，把旧原文放进 remove_fixed_facts；
+- 事件有新进展或结果时，用相同 topic 输出，并在 replaces 填旧 topic；不要把同一件事另建一份；
+- 普通寒暄、临时动作、AI自己编出的剧情不要保存；
 - 固定事实（第4项）要尽量具体、少而精，是"你们之间已经说定、后续要守着"的那几条。
 
 输出严格 JSON，不要有任何解释文字，格式如下：
 {
   "name": "用户名字（可选，没提取到则为空字符串）",
   "facts": ["事实1", "事实2"],
+  "remove_facts": ["已过时事实的原文"],
   "preferences": {"key": "value"},
-  "fixed_facts": ["固定事实1", "固定事实2"]
+  "fixed_facts": ["固定事实1", "固定事实2"],
+  "remove_fixed_facts": ["已结束或被推翻的固定事实原文"],
+  "episodes": [{
+    "topic": "考试",
+    "detail": "用户明天参加考试",
+    "time_hint": "明天下午",
+    "emotion": "有点紧张",
+    "status": "pending",
+    "result": "",
+    "importance": 3,
+    "certainty": "confirmed",
+    "follow_up_after": "适合询问结果的 YYYY-MM-DD HH:MM",
+    "replaces": ""
+  }]
 }"""
+
+
+def _drop_superseded(values, removals) -> list[str]:
+    """按原文或明显语义重合移除被新信息推翻的旧条目。"""
+    if not isinstance(removals, (list, tuple)):
+        removals = []
+    needles = [str(item).strip() for item in removals or [] if str(item).strip()]
+    if not needles:
+        return list(values or [])
+    out = []
+    for value in values or []:
+        text = str(value).strip()
+        stale = False
+        for needle in needles:
+            overlap = len(_memory_terms(text) & _memory_terms(needle))
+            if text == needle or (min(len(text), len(needle)) >= 4 and (text in needle or needle in text)) or overlap >= 3:
+                stale = True
+                break
+        if text and not stale:
+            out.append(text)
+    return out
 
 
 def extract_and_update_memory(user_id: str):
@@ -615,6 +813,7 @@ def _extract_and_update_memory_impl(user_id: str, msgs: list[dict]) -> bool:
     # 3. 构造提示词并调用 LLM
     # 用 replace 而非 str.format：chat_log 里的 { } 会触发 KeyError 中断提炼
     prompt = (EXTRACT_PROMPT_TEMPLATE
+              .replace("{now}", datetime.now().strftime("%Y-%m-%d %H:%M"))
               .replace("{existing_memory}", existing_json)
               .replace("{chat_log}", chat_log))
     messages = [{"role": "user", "content": prompt}]
@@ -648,9 +847,16 @@ def _extract_and_update_memory_impl(user_id: str, msgs: list[dict]) -> bool:
     # 5. 合并
     merged = {
         "name": existing.get("name", ""),
-        "facts": list(existing.get("facts", [])),
+        "facts": _drop_superseded(
+            existing.get("facts", []), extracted.get("remove_facts", []),
+        ),
         "preferences": dict(existing.get("preferences", {})),
-        "fixed_facts": list(existing.get("fixed_facts", [])),
+        "fixed_facts": _drop_superseded(
+            existing.get("fixed_facts", []), extracted.get("remove_fixed_facts", []),
+        ),
+        "episodes": episodic_memory.merge_episodes(
+            existing.get("episodes", []), extracted.get("episodes", []),
+        ),
     }
 
     # name：新值非空则覆盖
@@ -691,8 +897,9 @@ def _extract_and_update_memory_impl(user_id: str, msgs: list[dict]) -> bool:
     save_user_memory(user_id, merged)
 
     logger.info(
-        "用户 %s 记忆已提炼: name=%s, facts=%d, prefs=%d",
+        "用户 %s 记忆已提炼: name=%s, facts=%d, prefs=%d, episodes=%d",
         user_id, merged["name"], len(merged["facts"]), len(merged["preferences"]),
+        len(merged["episodes"]),
     )
     return True
 
@@ -766,4 +973,9 @@ def get_memory_stats(user_id: str) -> dict:
         "memory_name": memory.get("name", ""),
         "memory_facts_count": len(memory.get("facts", [])),
         "memory_prefs_count": len(memory.get("preferences", {})),
+        "memory_episodes_count": len(memory.get("episodes", [])),
+        "memory_open_episodes_count": sum(
+            1 for item in memory.get("episodes", [])
+            if isinstance(item, dict) and item.get("status") in episodic_memory.ACTIVE_STATUSES
+        ),
     }

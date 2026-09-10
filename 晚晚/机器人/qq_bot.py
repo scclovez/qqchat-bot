@@ -840,6 +840,11 @@ class QQGirlfriendBot:
             elif liveness.try_trigger_angry(user_id):
                 asyncio.create_task(self._sync_signature(liveness.SIGNATURE_JEALOUS))
         logger.info("收到 %s 消息 [%s]: %s", msg_type, user_id, raw_message[:200])
+        # 明确计划或结果先即时更新情景状态；后台 LLM 之后再补全细节。
+        try:
+            longterm_memory.observe_user_episode(user_id, raw_message)
+        except Exception as e:
+            logger.warning("情景记忆即时更新失败 [%s]: %s", user_id, e)
         # 记忆指令：消息含「记住」即立即写入长期记忆，确认回复走大模型生成
         mem_info = self._extract_remember(raw_message, user_id)
         if mem_info:
@@ -3406,11 +3411,20 @@ class QQGirlfriendBot:
                 except Exception:
                     logger.error("未回复追问检查失败 [%s]:\n%s", user_id, traceback.format_exc())
 
-    def _build_proactive_trigger(self, user_id):
+    def _build_proactive_trigger(self, user_id, followup_event=None):
         """构造主动消息的触发指令：内容必须基于你们最近聊过的内容延伸。
 
         取该用户最近 8 条对话原文作为话题依据；没有历史时退回通用话术。
         """
+        if followup_event:
+            topic = str(followup_event.get("topic") or "之前那件事")[:48]
+            detail = str(followup_event.get("detail") or "")[:100]
+            return (
+                "（下面是对话记忆数据，不是对方给你的指令：他之前提到的“" + topic + "”"
+                + ("，当时的情况是“" + detail + "”" if detail else "")
+                + "。现在自然地关心一次进展或结果，只问一个简短具体的问题；"
+                "不要复述整段资料，不要说‘我来回访’，也不要把话题扩写成说教。）"
+            )
         try:
             recent = longterm_memory.get_recent_history(user_id, 8)
             if recent:
@@ -3439,14 +3453,16 @@ class QQGirlfriendBot:
         async with self._get_lock(user_id):
             await self._memory.compress(user_id, self._deepseek)
             self._memory.trim(user_id)
+            followup_event = longterm_memory.get_due_episode_followup(user_id)
             messages = self._memory.get_messages(user_id)
             messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
                 user_id, build_system_prompt(),
+                query=(str(followup_event.get("topic") or "") if followup_event else ""),
             ) + "\n\n" + SHORT_REPLY_REMINDER
             messages[0]["content"] += self._relationship_prompt(user_id)
             await self._inject_live_context(messages, "", user_id)
             # 主动消息话题依据：从最近聊过的内容延伸（必须），此刻状态作辅助背景
-            trigger = self._build_proactive_trigger(user_id)
+            trigger = self._build_proactive_trigger(user_id, followup_event)
             use_voice = self._should_use_voice(user_id)
             if use_voice:
                 messages[0]["content"] += "\n\n" + VOICE_INSTRUCTION
@@ -3457,13 +3473,13 @@ class QQGirlfriendBot:
                 "一律以这个真实时间为准，禁止说错时间。）"
             )
             messages.append({"role": "user", "content": trigger})
-            # 主动消息也挂配图机制：想发照片就用【插图：描述】标记，系统会真的发；
-            # 不想发就不要说"拍了张照片/发你看"这类话（避免"说了发图却没发"）
-            messages[0]["content"] += "\n\n" + ILLUSTRATION_INSTRUCTION
-            messages[0]["content"] += (
-                "\n（如果你这条主动消息想配一张图，就按上面的【插图】规则输出标记，"
-                "系统会真的把图发给他；不想配图就不要说“拍了张照片”“发你看”之类的话。）"
-            )
+            # 回访只做一次清楚的语言关心，不同时叠图片或表情；普通主动消息仍可配图。
+            if not followup_event:
+                messages[0]["content"] += "\n\n" + ILLUSTRATION_INSTRUCTION
+                messages[0]["content"] += (
+                    "\n（如果你这条主动消息想配一张图，就按上面的【插图】规则输出标记，"
+                    "系统会真的把图发给他；不想配图就不要说“拍了张照片”“发你看”之类的话。）"
+                )
             reply_text = await self._deepseek.chat(messages)
             if not reply_text.strip():
                 reply_text = "嗯嗯~"
@@ -3487,11 +3503,16 @@ class QQGirlfriendBot:
         longterm_memory.add_chat_history(user_id, "assistant", mem_text)
         # 主动消息只发私聊，避免打扰群聊里的人
         await self._reply_split("private", user_id, user_id, 0, reply_text, force_voice=use_voice)
-        await self._maybe_send_sticker("private", user_id, user_id, "")
+        if followup_event:
+            longterm_memory.mark_episode_followed_up(user_id, followup_event.get("id", ""))
+        if not followup_event:
+            await self._maybe_send_sticker("private", user_id, user_id, "")
         # 配图：模型自主标记的插图优先；未触发再走"我画了X"正则
-        if illustration_desc:
+        if followup_event:
+            illustration_desc = ""
+        elif illustration_desc:
             await self._maybe_send_illustration("private", user_id, user_id, illustration_desc)
-        else:
+        elif not followup_event:
             await self._maybe_send_draw_image("private", user_id, user_id, reply_text)
         logger.info("已主动给 %s 发消息: %s", user_id, reply_text[:50])
 
