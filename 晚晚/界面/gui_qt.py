@@ -84,7 +84,7 @@ GROWTH_HINTS = {
     "lewdness": "淫乱度：亲密互动积累的程度；档位（害羞/主动/放开）影响亲密话题的尺度",
     "nickname": "她最近几轮顺口的称呼；会随关系、语境自然变化，认真话题会收敛，也不会每句话都叫",
     "now_thought": "今天一件值得记的小事（大模型提炼，最生动/最生活感的那一件）",
-    "state": "她此刻的状态（在睡觉/在画画/在吃饭…）：剧情优先取最近对话她自述的状态，没有则按时段兜底",
+    "state": "连续生活状态：包含地点、活动、开始与预计结束时间；明确说出的计划会在到点后自动推进",
     "mood_state": "今日心情：情绪低落日 / 闹脾气 / 今天被惹几次等状态",
     "days": "在一起第几天（从纪念日起始日期算起）",
     "memory": "她长期记忆里关于你的事（提炼的事实 + 偏好数量）",
@@ -615,6 +615,9 @@ class MainWindow(QMainWindow):
         for c in range(4):
             grid.setColumnStretch(c, 1)
         growth_lay.addLayout(grid)
+        self._life_state_var = _label("生活线读取中...", "Muted")
+        self._life_state_var.setWordWrap(True)
+        growth_lay.addWidget(self._life_state_var)
         self._growth_evo_var = _label("读取中...", "Muted")
         self._growth_evo_var.setWordWrap(True)
         growth_lay.addWidget(self._growth_evo_var)
@@ -2126,6 +2129,7 @@ class MainWindow(QMainWindow):
             import personality_state as pstate
             import liveness
             import live_info
+            import life_state
             import diary as growth_diary
             import evolution_db as edb
             import memory as longterm_memory
@@ -2150,7 +2154,7 @@ class MainWindow(QMainWindow):
             # 状态类格子：优先用大模型提炼的今日状态，未就绪/失败回退关键词
             self._ensure_today_digest()
             dig = self._today_digest or {}
-            vals["state"] = dig.get("state") or live_info.current_activity_for(boyfriend)
+            vals["state"] = life_state.current_activity_text()
             vals["rel_hot"] = dig.get("rel") or pstate.relationship_temperature()
             vals["energy"] = dig.get("energy") or pstate.energy_state()
             vals["now_thought"] = dig.get("moment") or pstate.current_thought(boyfriend)
@@ -2206,8 +2210,10 @@ class MainWindow(QMainWindow):
                 for key, value in axes.items()
             )
             evolution_text = "　|　".join(evo) if evo else "暂无性格演化记录"
+            self._life_state_var.setText(life_state.status_line())
             self._growth_evo_var.setText(axis_text + "\n" + evolution_text)
         except Exception as e:
+            self._life_state_var.setText("生活线读取失败")
             self._growth_evo_var.setText(f"成长状态读取失败：{e}")
 
 

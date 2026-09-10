@@ -75,7 +75,7 @@ def test_imports():
         "config", "llm_providers", "personality", "liveness", "boundary",
         "conversation", "memory", "usage", "image_gen", "comfyui_client",
         "appearance_ref", "qq_bot", "llm_base", "openai_compat",
-        "deepseek_client", "llm_factory", "live_info", "singleton", "tts",
+        "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
         "asr", "diary", "personality_state", "evolution", "evolution_db",
         "active_pull", "qzone", "interact_tools", "tray",
     ]
@@ -92,9 +92,11 @@ def test_config():
 
 
 def test_growth():
+    from datetime import datetime, timedelta
     import personality_state as pstate
     import liveness
     import evolution
+    import life_state
     from memory import _select_relevant_memory
     from qzone import _extract_feed_identity
     from qq_bot import (
@@ -149,6 +151,21 @@ def test_growth():
     )
     assert parsed["warmth_delta"] == 2 and parsed["initiative_delta"] == -1
     assert parsed["playfulness_delta"] == 0
+    # 连续生活线：稳定日程 → 明确当前动作 + 近期计划 → 到点自动切换 → 结束后过渡。
+    base_time = datetime(2026, 9, 10, 10, 0, 0)
+    scheduled = life_state.get_snapshot(base_time)
+    assert scheduled["activity"] and scheduled["location"]
+    assert life_state.get_snapshot(base_time)["started_at"] == scheduled["started_at"]
+    changed = life_state.observe_assistant_reply(
+        "我正在画画，等下去洗澡。", base_time,
+    )
+    assert changed == {"state": "画画", "plan": "洗澡"}
+    assert life_state.get_snapshot(base_time + timedelta(minutes=1))["activity"] == "画画"
+    plan = life_state.get_next_plan(base_time)
+    assert plan["activity"] == "洗澡"
+    assert life_state.get_snapshot(base_time + timedelta(minutes=16))["activity"] == "洗澡"
+    assert life_state.get_snapshot(base_time + timedelta(minutes=51))["activity"] == "吹头发"
+    assert "生活线" in life_state.status_line(base_time + timedelta(minutes=16))
 
 
 def test_providers():

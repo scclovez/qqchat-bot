@@ -48,12 +48,15 @@ _activity_cache = {"hour": -1, "text": ""}
 
 
 def current_activity() -> str:
-    """根据当前时刻生成bot此刻的合理动态描述（配合人设：美术系/宿舍/游戏宅/夜猫子）。
+    """返回连续生活状态；数据库不可用时才回退到旧的时段活动。
 
-    每个时段准备多套说法随机挑一套，并按小时缓存（同一小时内保持一致，
-    不同天、不同小时自然变化）——真人不会每次都重复同一个场景，
-    避免"画室"之类的概念被反复提起。
+    连续状态包含开始与结束时间，同一活动不会因再次调用而随机变化。
     """
+    try:
+        import life_state
+        return life_state.current_activity_text()
+    except Exception as e:
+        logger.debug("连续生活状态读取失败，回退时段活动: %s", e)
     global _activity_cache
     hour = datetime.now().hour
     if _activity_cache["hour"] == hour:
@@ -64,80 +67,12 @@ def current_activity() -> str:
 
 
 def daily_scene() -> str:
-    """当前时段的主场景（作息一致性）：主动消息/自述贴合它，而不是只有延迟倍率。"""
-    from datetime import datetime
-    hour = datetime.now().hour
-    if hour < 6:
-        return "深夜在家"
-    if hour < 9:
-        return "早上在家刚醒"
-    if hour < 12:
-        return "上午在家/画室待着"
-    if hour < 14:
-        return "中午在家吃饭/歇着"
-    if hour < 18:
-        return "下午在家/画室忙自己的事"
-    if hour < 21:
-        return "傍晚在家待着"
-    if hour < 23:
-        return "晚上在家/有点困"
-    return "深夜在家，该睡了"
+    """主动消息使用同一条生活线，不再另造一套宽泛时段场景。"""
+    return current_activity()
 
 
 def current_activity_for(user_id: str = "") -> str:
-    """bot 此刻的状态（称呼→状态）：优先取最近对话里她自述的状态（剧情优先），
-    没有才按时段兜底（current_activity）。供机器人注入与 GUI「状态」网格共用。
-    user_id 为空时也取最近对话（跨用户），避免一上来就落到"图书馆/上课"等时段兜底。
-    """
-    try:
-        import memory as longterm_memory
-        conn = longterm_memory._get_conn()
-        with longterm_memory._lock:
-            if user_id:
-                rows = conn.execute(
-                    "SELECT role, content FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT 8",
-                    (str(user_id),),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT role, content FROM chat_history ORDER BY id DESC LIMIT 8",
-                ).fetchall()
-    except Exception:
-        rows = []
-    # 从最近的 assistant 消息里找她自述的状态（后出现的优先；覆盖"累/躺/休息"等）
-    for m in reversed(rows):
-        if not m or m["role"] != "assistant":
-            continue
-        content = m["content"] or ""
-        for pat, desc in (
-            (r"抱着|抱着你|怀里|窝在|窝着|缠着|黏着|赖着你", "在你怀里/黏着你"),
-            (r"累死|好累|累得|没力气|瘫|酸软|软了", "累瘫了，在休息"),
-            (r"躺床|躺下|赖床|被窝|床上|躺着|躺", "在床上/躺着"),
-            (r"醒了|睡醒|醒过来|醒了没", "刚醒"),
-            (r"睡着|抱睡|哄睡|睡了", "在睡觉/休息"),
-            (r"刚洗完|洗好澡|刚做完|完事", "刚忙完，躺着休息"),
-            (r"休息|歇会|缓缓|回血|充电", "在休息"),
-            (r"要睡了|该睡了|去睡了|想睡了|睡觉|午睡|睡个|眯一会|睡一觉|睡会儿", "正在午睡/休息"),
-            (r"在?吃饭|吃个饭|干饭|外卖|泡面|食堂|夜宵", "正在吃饭"),
-            (r"画室", "在画室"),
-            (r"宿舍|躺床|被窝|床上|躺着", "在宿舍/床上"),
-            (r"打游戏|上号|打瓦|打副本", "在打游戏"),
-        ):
-            if re.search(pat, content):
-                return desc
-    # 有活跃对话但没明确自述 → 用居家安全态，避免编造"操场/图书馆/上课"这类不在剧情里的活动
-    if rows:
-        from datetime import datetime
-        hour = datetime.now().hour
-        if hour < 7 or hour >= 23:
-            return "在家准备睡了"
-        if hour < 11:
-            return "刚起，在家待着"
-        if hour < 14:
-            return "在家歇着"
-        if hour < 18:
-            return "在家待着/忙自己的事"
-        return "在家瘫着"
+    """角色只有一条全局生活线，不再按联系人或最近几条回复各猜一套状态。"""
     return current_activity()
 
 

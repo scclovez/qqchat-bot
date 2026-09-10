@@ -21,6 +21,7 @@ from personality import build_system_prompt
 import comfyui_client
 import image_gen
 import live_info
+import life_state
 import memory as longterm_memory
 import diary as growth_diary
 import personality_state as pstate
@@ -908,10 +909,7 @@ class QQGirlfriendBot:
                 messages[0]["content"] += liveness.nickname_injection(
                     user_id, pstate.get_stage(), pstate.sublevel_name(), raw_message,
                 )
-                messages[0]["content"] += (
-                    f"\n（你此刻的状态：{self._current_activity(user_id)}。"
-                    "自然地体现在语气里，不要每轮都主动解释自己在做什么。）"
-                )
+                messages[0]["content"] += life_state.prompt_injection()
                 # 纪念日：在一起第 N 天（他问起时间/在一起多久时准确回答）
                 _days = liveness.days_together()
                 if _days > 0:
@@ -2403,6 +2401,7 @@ class QQGirlfriendBot:
                 await self._reply(msg_type, target_id, user_id, 0, "算了，我还是说吧……")
                 await asyncio.sleep(random.uniform(1.2, 2.0))
             if await self._maybe_send_voice(msg_type, target_id, user_id, text):
+                self._observe_life_reply(msg_type, user_id, text)
                 return
             # 语音合成失败：回退文字时去掉情感标签，避免把【撒娇】读出来/显示出来
             text, _ = self._split_emotion_tag(text)
@@ -2410,13 +2409,20 @@ class QQGirlfriendBot:
         if not parts:
             return
         # 不自动加“嗯/……”之类的无信息前导；若模型确实分条，才留出正常打字停顿。
+        sent_parts = []
         for i, part in enumerate(parts):
             if i > 0:
                 gap = (liveness.split_gap_seconds(parts[i - 1])
                        if runtime.LIVENESS_ENABLED and msg_type == "private"
                        else random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
                 await asyncio.sleep(gap)
-            await self._reply(msg_type, target_id, user_id, message_id if i == 0 else 0, part)
+            sent_id = await self._reply(
+                msg_type, target_id, user_id, message_id if i == 0 else 0, part,
+            )
+            if sent_id:
+                sent_parts.append(part)
+        if sent_parts:
+            self._observe_life_reply(msg_type, user_id, "\n".join(sent_parts))
         # 多模态联动：dual_voice —— 文字发完后，再补一句"语音小尾巴"
         # （重要时刻：晚安/纪念日/道歉等，真人会"文字+语音"一起表达；
         #   但语音不会把文字念一遍，而是补一句更亲密的心里话）
@@ -2430,6 +2436,19 @@ class QQGirlfriendBot:
                     logger.info("双模态：语音小尾巴为空（避免与文字重复），仅发文字")
             except Exception as e:
                 logger.warning("双模态语音发送失败: %s", e)
+
+    def _observe_life_reply(self, msg_type, user_id, text):
+        """只把已经成功发出的明确生活陈述接入生活线。"""
+        if not (runtime.LIVENESS_ENABLED and msg_type == "private"
+                and self._is_intimate_user(user_id)):
+            return
+        try:
+            life_change = life_state.observe_assistant_reply(text)
+            if life_change.get("state") or life_change.get("plan"):
+                logger.info("生活线更新: state=%s plan=%s",
+                            life_change.get("state") or "-", life_change.get("plan") or "-")
+        except Exception as e:
+            logger.warning("生活线更新失败（不影响发送）: %s", e)
 
     async def _dual_voice_supplement(self, user_id, text):
         """为双模态联动生成一句"语音小尾巴"：不重复文字内容，而是补一句更亲密的心里话。
