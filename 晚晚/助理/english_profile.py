@@ -74,7 +74,8 @@ def _profile_or_blank(user_id: str, target: str = "") -> dict:
         "user_id": str(user_id), "target": (target or "")[:80], "overall_level": "待评估",
         "skills": _blank_skills(), "weak_points": [],
         "pending_dimensions": list(DIMENSIONS), "recommendation": {},
-        "confidence": 0.0, "evidence_count": 0, "assessment_state": {}, "last_assessed": "",
+        "confidence": 0.0, "evidence_count": 0, "assessment_state": {},
+        "history_context": {}, "last_assessed": "",
     }
 
 
@@ -90,9 +91,27 @@ def _save(profile: dict):
         recommendation=profile["recommendation"], confidence=profile.get("confidence") or 0,
         evidence_count=profile.get("evidence_count") or 0,
         assessment_state=profile.get("assessment_state") or {},
+        history_context=profile.get("history_context") or {},
         last_assessed=profile.get("last_assessed") or "",
     )
     return adb.get_english_profile(profile["user_id"]) or profile
+
+
+def _history_context(user_id: str) -> dict:
+    """把历史聊天压成学习主题摘要，不保留原文。"""
+    history = adb.fetch_chat_history(role="user", user_id=user_id)[-300:]
+    topics = {
+        "vocabulary": ("单词", "词汇", "背词", "背单词"),
+        "grammar": ("语法", "时态", "句型"),
+        "reading": ("阅读", "短文", "长难句"),
+        "listening": ("听力", "听不懂", "听英语"),
+        "writing": ("写作", "作文", "写英文"),
+        "speaking": ("口语", "开口", "说英语"),
+        "spelling": ("拼写", "拼错"),
+    }
+    mentioned = [dimension for dimension, words in topics.items()
+                 if any(any(word in (row.get("content") or "") for word in words) for row in history)]
+    return {"history_messages": len(history), "mentioned_dimensions": mentioned}
 
 
 def prepare_profile(user_id: str, target: str = "") -> dict:
@@ -102,6 +121,7 @@ def prepare_profile(user_id: str, target: str = "") -> dict:
     自我描述最多影响之后的沟通方式，不能直接变成能力评级。
     """
     profile = _profile_or_blank(user_id, target)
+    profile["history_context"] = _history_context(user_id)
     if adb.get_english_profile(user_id):
         return _save(profile)
 
@@ -296,5 +316,8 @@ def generation_context_from_profile(profile: dict) -> str:
     known = ["%s%s" % (DIMENSION_NAMES[name], (skills.get(name) or {}).get("level"))
              for name in ("vocabulary", "grammar", "reading")
              if (skills.get(name) or {}).get("score") is not None]
-    return "当前优先：%s；已确认：%s。只生成适合这一阶段的基础内容，不要跳难度。" % (
-        DIMENSION_NAMES.get(focus, "基础"), "、".join(known) or "仍在了解")
+    history = (profile.get("history_context") or {}).get("mentioned_dimensions") or []
+    history_note = ("；他过去提过：" + "、".join(DIMENSION_NAMES.get(name, name) for name in history)
+                    if history else "")
+    return "当前优先：%s；已确认：%s%s。只生成适合这一阶段的基础内容，不要跳难度。" % (
+        DIMENSION_NAMES.get(focus, "基础"), "、".join(known) or "仍在了解", history_note)

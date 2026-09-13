@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS english_profiles (
     confidence       REAL DEFAULT 0,
     evidence_count   INTEGER DEFAULT 0,
     assessment_state TEXT DEFAULT '{}',      -- JSON：当前自然摸底题；不存聊天原文
+    history_context  TEXT DEFAULT '{}',      -- JSON：历史学习主题摘要；不存聊天原文
     last_assessed    TEXT,
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -329,6 +330,10 @@ def _migrate(conn: sqlite3.Connection, version: int):
             " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
             "CREATE INDEX IF NOT EXISTS idx_english_assessment_user"
             " ON english_assessment_events(user_id, dimension, id DESC);")
+    if version < 8:
+        _ensure_columns(conn, "english_profiles", {
+            "history_context": "history_context TEXT DEFAULT '{}'",
+        })
     return SCHEMA_VERSION
 
 
@@ -509,7 +514,7 @@ def get_english_profile(user_id: str):
     item = dict(rows[0])
     for key, default in (("skills", {}), ("weak_points", []),
                          ("pending_dimensions", []), ("recommendation", {}),
-                         ("assessment_state", {})):
+                         ("assessment_state", {}), ("history_context", {})):
         item[key] = _loads(item.get(key), default)
     return item
 
@@ -518,18 +523,20 @@ def save_english_profile(user_id: str, target: str = "", overall_level: str = "�
                          skills: dict = None, weak_points: list = None,
                          pending_dimensions: list = None, recommendation: dict = None,
                          confidence: float = 0.0, evidence_count: int = 0,
-                         assessment_state: dict = None, last_assessed: str = "") -> bool:
+                         assessment_state: dict = None, history_context: dict = None,
+                         last_assessed: str = "") -> bool:
     """整份写回画像；唯一键保证同一用户始终只有一份当前结论。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return execute(
         "INSERT INTO english_profiles (user_id, target, overall_level, skills, weak_points, "
-        "pending_dimensions, recommendation, confidence, evidence_count, assessment_state, "
-        "last_assessed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "pending_dimensions, recommendation, confidence, evidence_count, assessment_state, history_context, "
+        "last_assessed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET target=excluded.target, "
         "overall_level=excluded.overall_level, skills=excluded.skills, weak_points=excluded.weak_points, "
         "pending_dimensions=excluded.pending_dimensions, recommendation=excluded.recommendation, "
         "confidence=excluded.confidence, evidence_count=excluded.evidence_count, "
-        "assessment_state=excluded.assessment_state, last_assessed=excluded.last_assessed, "
+        "assessment_state=excluded.assessment_state, history_context=excluded.history_context, "
+        "last_assessed=excluded.last_assessed, "
         "updated_at=excluded.updated_at",
         (str(user_id), (target or "")[:80], (overall_level or "待评估")[:30],
          json.dumps(skills or {}, ensure_ascii=False),
@@ -537,7 +544,8 @@ def save_english_profile(user_id: str, target: str = "", overall_level: str = "�
          json.dumps(pending_dimensions or [], ensure_ascii=False),
          json.dumps(recommendation or {}, ensure_ascii=False),
          max(0.0, min(1.0, float(confidence))), max(0, int(evidence_count)),
-         json.dumps(assessment_state or {}, ensure_ascii=False), last_assessed or None, now, now),
+         json.dumps(assessment_state or {}, ensure_ascii=False),
+         json.dumps(history_context or {}, ensure_ascii=False), last_assessed or None, now, now),
     )
 
 
