@@ -226,6 +226,7 @@ def test_growth():
     own_morning = life_state.own_routine_candidate(datetime(2026, 9, 11, 8, 0, 0))
     own_night = life_state.own_routine_candidate(datetime(2026, 9, 11, 22, 50, 0))
     assert own_morning.get("key") == "morning" and own_night.get("key") == "night"
+    assert life_state.own_routine_minutes()[2] == 0.0
     assert not life_state.own_routine_sent(own_morning)
     assert life_state.mark_own_routine_sent(own_morning)
     assert life_state.own_routine_sent(own_morning)
@@ -239,6 +240,11 @@ def test_growth():
     assert not advice_plan.allowed_tools and not advice_plan.allow_voice
     playful_plan = dialogue_policy.plan_turn("嘿嘿，喜欢你")
     assert playful_plan.intent == "亲密回应" and playful_plan.allowed_tools
+    assert playful_plan.preferred_parts == 2 and "空行" in playful_plan.injection()
+    short_question_plan = dialogue_policy.plan_turn("在干嘛")
+    assert short_question_plan.preferred_parts == 1
+    comfort_plan = dialogue_policy.plan_turn("我今天真的好累")
+    assert comfort_plan.preferred_parts == 2
     image_plan = dialogue_policy.plan_turn("发张自拍给我看看")
     assert image_plan.allow_image and not image_plan.allowed_tools
     mention_plan = dialogue_policy.plan_turn("我今天拍了一张照片")

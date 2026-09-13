@@ -64,6 +64,7 @@ class TurnPlan:
     target_max: int
     hard_max: int
     max_parts: int
+    preferred_parts: int
     allow_voice: bool
     allow_image: bool
     allow_sticker: bool
@@ -90,6 +91,14 @@ class TurnPlan:
             f"回复以{self.target_min}~{self.target_max}字为宜，最多{self.max_parts}条；"
             "先给最重要的那句，不写总结式套话。"
         )
+        if self.preferred_parts > 1:
+            parts.append(
+                f"本轮更像即时聊天地分成{self.preferred_parts}条短消息。"
+                "每条独立一行（中间留空行）；每条都要有不同的信息或情绪，"
+                "不要把一句完整的话硬拆开。"
+            )
+        else:
+            parts.append("本轮一句自然说完更合适，不要为了分条硬加后话。")
         if not self.allow_image:
             parts.append("本轮不要输出【插图】标记，也不要主动承诺发照片。")
         if not self.allowed_tools:
@@ -171,6 +180,20 @@ def _classify(text: str):
     return "自然接话", "平常"
 
 
+def _preferred_parts(intent: str, text: str, multi: bool, happy: float = 0.0) -> int:
+    """决定这轮天然像几条 QQ 消息，而不是把模型输出机械切碎。"""
+    if intent in ("紧急关怀", "直接回答", "一起解决问题", "轻量应答", "矛盾修复"):
+        return 1
+    if intent in ("倾诉安慰", "回应道歉", "回应分享", "亲密回应"):
+        return 2
+    if intent == "接梗玩闹":
+        return 3 if ("哈哈" in text or "!" in text or "！" in text or happy >= 30) else 2
+    if multi or len(text) >= 30:
+        return 2
+    # 平常聊天保留多数一条，避免一套固定的“两条模板”。
+    return 2 if sum(ord(ch) for ch in text) % 5 == 0 else 1
+
+
 def plan_turn(user_text: str, *, user_sent_voice: bool = False,
               user_sent_image: bool = False, is_intimate: bool = True,
               mood_state: Mapping[str, float] | None = None) -> TurnPlan:
@@ -244,12 +267,15 @@ def plan_turn(user_text: str, *, user_sent_voice: bool = False,
     tired = float(mood.get("tired", 0) or 0)
     happy = float(mood.get("happy", 0) or 0)
     negative = max(angry, hurt)
+    preferred_parts = _preferred_parts(intent, text, multi, happy)
+    max_parts = max(max_parts, preferred_parts)
     if negative >= 18 or tired >= 28:
         reduction = 12 if negative >= 35 or tired >= 45 else 7
         max_len = max(min_len, max_len - reduction)
         hard_max = max(max_len, hard_max - reduction)
         if negative >= 35 or tired >= 45:
             max_parts = 1
+            preferred_parts = 1
         allow_sticker = False
         allow_afterthought = False
         allow_dual_voice = False
@@ -269,6 +295,7 @@ def plan_turn(user_text: str, *, user_sent_voice: bool = False,
         target_max=max_len,
         hard_max=hard_max,
         max_parts=max_parts,
+        preferred_parts=min(preferred_parts, max_parts),
         allow_voice=allow_voice,
         allow_image=allow_image,
         allow_sticker=allow_sticker,

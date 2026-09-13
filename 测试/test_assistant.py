@@ -611,6 +611,20 @@ def test_active_periods_not_all_day():
     assert merged and merged[0]["end"] == 25, late_ranges
 
 
+def test_own_routine_gradually_adapts_to_user():
+    """小晚保留自己的基线，但对稳定的长期作息会缓慢靠近。"""
+    import life_state
+    user = "test_own_routine_adapts"
+    _seed_regular_days(user, 14, wake_hour=9, last_msg_hour=1)
+    bp.clear_cache(user)
+    bp.recompute(user, force=True)
+    base_wake, base_sleep, base_weight = life_state.own_routine_minutes()
+    wake, sleep, weight = life_state.own_routine_minutes(user)
+    assert base_weight == 0.0 and weight > 0
+    assert wake > base_wake, "用户稳定晚起时，她应逐渐晚起"
+    assert sleep > base_sleep, "用户稳定晚睡时，她应逐渐晚睡"
+
+
 def test_emotion_history_and_block_log():
     """情绪按小时采样（同小时覆盖）+ 压制原因账（含来源与归类）。"""
     import emotion_history as eh
@@ -677,6 +691,7 @@ def run_into(check):
     check("作业纠错与教材解析", test_homework_and_material_parsing)
     check("历史聊天记录回填", test_history_backfill)
     check("活跃时段不覆盖全天", test_active_periods_not_all_day)
+    check("小晚作息渐进靠近用户", test_own_routine_gradually_adapts_to_user)
     check("情绪曲线与压制原因账", test_emotion_history_and_block_log)
 
 

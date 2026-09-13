@@ -159,7 +159,8 @@ QZONE_TICK_PERIOD = 6
 
 # 追加在 system prompt 末尾的短回复提醒（模型对 prompt 末尾注意力最强，对抗长对话稀释）
 SHORT_REPLY_REMINDER = (
-    "【通用表达】像即时聊天，不写小作文；先回最重要的一句，确有补充才分条。"
+    "【通用表达】像即时聊天，不写小作文；先回最重要的一句。"
+    "本轮策略要求分条时，用空行隔开每一条短消息；不需要分条时，不要硬加后话。"
     "若有本轮对话策略，具体长度与条数以它为准。不要无信息前导、连环追问、动作括号、"
     "套路化催睡或滥用省略号；不用波浪号（~、～），语气和句式自然变化。"
 )
@@ -1796,7 +1797,7 @@ class QQGirlfriendBot:
         target = self._boyfriend_uin()
         if not target or target in self._dead_users:
             return
-        candidate = life_state.own_routine_candidate()
+        candidate = life_state.own_routine_candidate(user_id=target)
         if not candidate or life_state.own_routine_sent(candidate):
             return
         event = candidate.get("key")

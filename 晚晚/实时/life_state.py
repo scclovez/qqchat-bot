@@ -320,7 +320,45 @@ def schedule_plan(activity: str, start_at: datetime, duration_seconds: int = 0,
         return int(cur.lastrowid)
 
 
-def own_routine_candidate(now: datetime = None) -> dict:
+def _circular_blend(base: int, target: int, weight: float) -> int:
+    """按钟点环形距离靠近目标，避免 23:00 → 00:30 被误算成倒退 22 小时。"""
+    delta = ((int(target) - int(base) + 720) % 1440) - 720
+    return int(round((int(base) + delta * max(0.0, min(0.55, weight)))) % 1440)
+
+
+def own_routine_minutes(user_id: str = "") -> tuple[int, int, float]:
+    """她的起床、睡前时刻：有自己的基线，再缓慢靠近长期观察到的用户作息。"""
+    wake_minute, sleep_notice_minute = 390, 1335  # 06:30 起；22:15 后准备睡
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return wake_minute, sleep_notice_minute, 0.0
+    try:
+        import assistant_db as adb
+        profiles = adb.get_profiles(user_id)
+        recent = profiles.get("recent", {})
+        long_term = profiles.get("long", {})
+        dims = recent if int((recent.get("sleep_pattern", {}) or {}).get("evidence_count") or 0) >= 7 else long_term
+        sleep = dims.get("sleep_pattern", {}) or {}
+        wake = dims.get("wake_pattern", {}) or {}
+        sleep_value, wake_value = sleep.get("value") or {}, wake.get("value") or {}
+        sleep_hour, wake_hour = sleep_value.get("hour"), wake_value.get("hour")
+        confidence = min(float(sleep.get("confidence") or 0), float(wake.get("confidence") or 0))
+        evidence = min(int(sleep.get("evidence_count") or 0), int(wake.get("evidence_count") or 0))
+        if sleep_hour is None or wake_hour is None or evidence < 7 or confidence < 0.35:
+            return wake_minute, sleep_notice_minute, 0.0
+        # 证据足够才开始靠近；上限 55%，使她始终保留自己的生活节奏。
+        weight = min(0.55, 0.10 + confidence * 0.35 + min(evidence, 60) / 300.0)
+        user_wake = int(round(float(wake_hour) * 60)) % 1440
+        user_sleep_notice = (int(round(float(sleep_hour) * 60)) - 30) % 1440
+        return (_circular_blend(wake_minute, user_wake, weight),
+                _circular_blend(sleep_notice_minute, user_sleep_notice, weight),
+                round(weight, 3))
+    except Exception as exc:
+        logger.debug("读取用户作息以调整角色作息失败: %s", exc)
+        return wake_minute, sleep_notice_minute, 0.0
+
+
+def own_routine_candidate(now: datetime = None, user_id: str = "") -> dict:
     """返回她自己作息触发的早安或晚安候选。
 
     这套时间只由角色生活线决定，不读取用户活跃度、睡眠推断或学习进度。每天在小窗口
@@ -328,16 +366,17 @@ def own_routine_candidate(now: datetime = None) -> dict:
     """
     now = now or datetime.now()
     minute = now.hour * 60 + now.minute
+    wake_base, sleep_base, adaptation = own_routine_minutes(user_id)
     seed = _day_seed(now, "own_routine")
-    wake_minute = 390 + seed.randint(8, 26)      # 06:38–06:56
-    sleep_notice_minute = 1335 + seed.randint(6, 25)  # 22:21–22:40
+    wake_minute = wake_base + seed.randint(8, 26)
+    sleep_notice_minute = sleep_base + seed.randint(6, 25)
     if wake_minute <= minute < wake_minute + 90:
         return {"key": "morning", "day": now.strftime("%Y-%m-%d"),
-                "scheduled_minute": wake_minute}
+                "scheduled_minute": wake_minute, "adaptation": adaptation}
     # 晚安发生在她准备睡觉时，23:00 后生活线会自然切换为“睡觉”。
     if sleep_notice_minute <= minute < 1380:
         return {"key": "night", "day": now.strftime("%Y-%m-%d"),
-                "scheduled_minute": sleep_notice_minute}
+                "scheduled_minute": sleep_notice_minute, "adaptation": adaptation}
     return {}
 
 
