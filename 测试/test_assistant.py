@@ -441,6 +441,66 @@ def test_normal_chat_not_hijacked_in_study_mode():
     assert handled is False
 
 
+def test_checkin_verification_engine():
+    """打卡由代码判定：低置信度不自动完成、日期不符不算、部分完成记进度。"""
+    import image_verifier as iv
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    ok = iv.verify_checkin({"date": today, "count": 50, "target": 50}, 0.92, {})
+    assert ok["verified"] is True and ok["progress"] == 1.0
+    part = iv.verify_checkin({"date": today, "count": 32, "target": 50}, 0.9, {})
+    assert part["verified"] is False and abs(part["progress"] - 0.64) < 0.01
+    assert "部分" in part["reason"]
+    low = iv.verify_checkin({"date": today, "count": 50, "target": 50}, 0.5, {})
+    assert low["verified"] is False and "置信度" in low["reason"], "低置信度绝不能自动完成"
+    old = iv.verify_checkin({"date": (now - timedelta(days=3)).strftime("%Y-%m-%d"),
+                             "count": 50, "target": 50}, 0.95, {})
+    assert old["verified"] is False and "日期" in old["reason"]
+    unknown = iv.verify_checkin({"date": today, "count": None, "target": None}, 0.9, {})
+    assert unknown["verified"] is False
+    assert "夸他" in iv.checkin_instruction(ok, "背单词")
+    assert "还差" in iv.checkin_instruction(part, "背单词")
+
+
+def test_study_image_context_gate():
+    """学习状态发图走学习逻辑，普通聊天发图仍走原有逻辑。"""
+    import image_verifier as iv
+    assert iv.is_study_context(False, "打卡", None) is False, "没有图片就不是学习图片"
+    assert iv.is_study_context(True, "随便拍的照片", None) is False, "普通发图不得被截走"
+    assert iv.is_study_context(True, "这是我的打卡截图", None) is True
+    assert iv.is_study_context(True, "", {"status": "active"}) is True
+    assert iv.is_study_context(True, "", {"status": "completed"}) is False
+
+
+def test_homework_and_material_parsing():
+    """图片结构化：作业题存正确答案但引导回复不泄露；教材作为学习材料。"""
+    import image_verifier as iv
+    raw = {
+        "type": "homework", "confidence": 0.88,
+        "questions": [
+            {"index": "3", "question": "选择正确的选项：She ___ to school every day.",
+             "user_answer": "go", "correct_answer": "goes", "topic": "一般现在时"},
+            {"index": "4", "question": "翻译：我喜欢咖啡。", "user_answer": "",
+             "correct_answer": "I like coffee.", "topic": "翻译"},
+        ],
+    }
+    parsed = iv.normalize(raw)
+    assert parsed["type"] == "homework" and len(parsed["questions"]) == 2
+    items = iv.questions_to_items(parsed["questions"])
+    assert items[0]["answer"] == "goes", "正确答案要内部留存（供复习）"
+    instruction = iv.homework_instruction(items)
+    assert "goes" not in instruction, "引导式纠错不得把答案直接说出去"
+    assert "不要直接报正确答案" in instruction
+    assert "选择正确的选项" in instruction
+    assert iv.normalize({"type": "homework", "confidence": 0.9, "questions": []}) == {}
+    assert iv.normalize({"type": "unknown_type", "confidence": 0.9}) == {}
+    text = iv.normalize({"type": "textbook", "confidence": 0.8,
+                         "material": {"subject": "英语", "topics": ["时态", "从句"],
+                                      "summary": "语法复习"}})
+    assert iv.material_items(text["material"])[0]["extra"]["type"] == "material"
+    assert "今天就学这个" in iv.material_instruction(text["material"])
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -463,6 +523,9 @@ def run_into(check):
     check("引导式纠错流程", test_guided_grading_flow)
     check("复习优先与间隔递增", test_review_priority_and_interval_growth)
     check("普通聊天不被学习拦截", test_normal_chat_not_hijacked_in_study_mode)
+    check("图片打卡校验引擎", test_checkin_verification_engine)
+    check("学习图片上下文判定", test_study_image_context_gate)
+    check("作业纠错与教材解析", test_homework_and_material_parsing)
 
 
 def main():

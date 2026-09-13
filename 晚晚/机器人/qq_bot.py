@@ -39,12 +39,14 @@ try:
     import schedule_manager
     import goal_manager
     import study_session
+    import image_verifier
 except Exception as _assistant_exc:  # noqa: BLE001
     adb_assistant = None
     behavior_profile = None
     schedule_manager = None
     goal_manager = None
     study_session = None
+    image_verifier = None
     logging.getLogger(__name__).warning("助理系统加载失败，功能自动降级: %s", _assistant_exc)
 
 # 主动消息优先级（与 晚晚/助理/schedule_manager.py 的取值保持一致）
@@ -1166,6 +1168,14 @@ class QQGirlfriendBot:
             if handled:
                 await self._finish_typing(msg_type, user_id)
                 return
+        # 学习图片：打卡截图 / 作业试卷 / 教材笔记 → 走学习图片逻辑（其余图片照旧）
+        if (image_verifier is not None and adb_assistant is not None and not is_group
+                and self._is_intimate_user(user_id)):
+            handled = await self._handle_study_image(
+                msg_type, target_id, user_id, message_id, data, raw_message, turn_revision)
+            if handled:
+                await self._finish_typing(msg_type, user_id)
+                return
         # 学习作答：会话进行中且有待答题目时，这条消息按"回答"处理（引导式纠错）
         if (study_session is not None and adb_assistant is not None and not is_group
                 and self._is_intimate_user(user_id)):
@@ -1764,6 +1774,68 @@ class QQGirlfriendBot:
             longterm_memory.add_chat_history(user_id, "assistant", sent)
         await self._present_word_card(msg_type, target_id, user_id, message_id, cards[0],
                                       turn_revision)
+        return True
+
+    async def _handle_study_image(self, msg_type, target_id, user_id, message_id, data,
+                                  raw_message, turn_revision):
+        """学习图片：打卡校验 / 作业纠错 / 教材材料（与学习无关的图一律交回原逻辑）。"""
+        image_seg = self._first_image_seg(data)
+        session = adb_assistant.get_open_session(user_id)
+        if not image_verifier.is_study_context(bool(image_seg), raw_message, session):
+            return False
+        b64, mime = await self._load_image(image_seg)
+        if not b64:
+            return False
+        parsed = await image_verifier.analyze(self._llm_vision.chat, b64, mime,
+                                              hint=(raw_message or "请解析这张图片。"))
+        kind = (parsed or {}).get("type") or ""
+        if not kind or kind == "other":
+            return False  # 普通图片 → 交给原有的看图逻辑
+        goal = goal_manager.active_goal(user_id) if goal_manager else None
+        goal_id = (goal or {}).get("id")
+
+        if kind == "study_checkin":
+            tasks = adb_assistant.list_tasks(user_id, statuses=("pending", "doing", "partial"))
+            task = tasks[0] if tasks else {}
+            verified = image_verifier.verify_checkin(parsed.get("checkin"),
+                                                     parsed.get("confidence", 0.0), task)
+            if task.get("id"):
+                if verified.get("verified"):
+                    adb_assistant.update_task(task["id"], status="done", progress=1.0)
+                elif verified.get("progress", 0) > 0:
+                    adb_assistant.update_task(task["id"], status="partial",
+                                              progress=verified["progress"])
+            instruction = image_verifier.checkin_instruction(
+                verified, task.get("title") or (goal or {}).get("title") or "")
+        elif kind in ("homework", "exam"):
+            items = image_verifier.questions_to_items(parsed.get("questions"), goal_id)
+            for item in items:
+                adb_assistant.add_knowledge(user_id, item["content"], answer=item["answer"],
+                                            subject=item["subject"], goal_id=item["goal_id"],
+                                            extra=item["extra"])
+            instruction = image_verifier.homework_instruction(items)
+            if not instruction:
+                return False
+        else:  # textbook / notes
+            items = image_verifier.material_items(parsed.get("material"), goal_id)
+            for item in items:
+                adb_assistant.add_knowledge(user_id, item["content"], answer="",
+                                            subject=item["subject"], goal_id=item["goal_id"],
+                                            extra=item["extra"])
+            instruction = image_verifier.material_instruction(parsed.get("material"))
+            if not instruction:
+                return False
+
+        reply = await self._study_persona_reply(user_id, instruction)
+        self._memory.add_message(user_id, "user", raw_message or "[图片]")
+        longterm_memory.add_chat_history(user_id, "user", raw_message or "[图片]")
+        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                       force_voice=False, expected_revision=turn_revision)
+        if sent:
+            self._memory.add_message(user_id, "assistant", sent)
+            longterm_memory.add_chat_history(user_id, "assistant", sent)
+        logger.info("学习图片已处理 [%s] 类型=%s 置信度=%.2f", user_id, kind,
+                    float(parsed.get("confidence") or 0))
         return True
 
     async def _handle_study_answer(self, msg_type, target_id, user_id, message_id, text,
