@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -187,6 +187,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- 主动消息每日账（面板展示"今天主动了几条、被压住几次"）
+CREATE TABLE IF NOT EXISTS proactive_stats (
+    day      TEXT NOT NULL,
+    user_id  TEXT NOT NULL,
+    sent     INTEGER DEFAULT 0,
+    blocked  INTEGER DEFAULT 0,
+    PRIMARY KEY (day, user_id)
+);
 """
 
 
@@ -227,6 +236,12 @@ def _migrate(conn: sqlite3.Connection, version: int):
             "pending_knowledge_id": "pending_knowledge_id INTEGER",
             "ask_attempts": "ask_attempts INTEGER DEFAULT 0",
         })
+    if version < 5:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS proactive_stats ("
+            " day TEXT NOT NULL, user_id TEXT NOT NULL,"
+            " sent INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0,"
+            " PRIMARY KEY (day, user_id));")
     return SCHEMA_VERSION
 
 
@@ -393,6 +408,76 @@ def history_users() -> list:
     """聊天记录里出现过的用户（回填时逐个处理）。"""
     rows = query("SELECT DISTINCT user_id FROM chat_history ORDER BY user_id")
     return [str(row["user_id"]) for row in rows if row["user_id"]]
+
+
+# =============================================================================
+# 面板「陪伴状态」用的实时统计
+# =============================================================================
+
+def bump_proactive_stat(user_id: str, field: str = "sent", day: str = "") -> bool:
+    """主动消息每日计数（sent=已发出 / blocked=被闸门压住）。"""
+    if field not in ("sent", "blocked"):
+        return False
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    return execute(
+        "INSERT INTO proactive_stats (day, user_id, %s) VALUES (?, ?, 1) "
+        "ON CONFLICT(day, user_id) DO UPDATE SET %s = %s + 1" % (field, field, field),
+        (day, str(user_id)),
+    )
+
+
+def get_proactive_stats(user_id: str, day: str = "") -> dict:
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    rows = query(
+        "SELECT sent, blocked FROM proactive_stats WHERE user_id = ? AND day = ?",
+        (str(user_id), day))
+    if not rows:
+        return {"sent": 0, "blocked": 0}
+    return {"sent": int(rows[0]["sent"] or 0), "blocked": int(rows[0]["blocked"] or 0)}
+
+
+def message_counts_by_day(user_id: str, day: str = "") -> dict:
+    """今天双方各发了多少条、最近一条是几点（时间按本地日切分）。"""
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    rows = query(
+        "SELECT role, COUNT(*) AS cnt, MAX(created_at) AS last_at FROM chat_history "
+        "WHERE user_id = ? AND date(created_at, 'localtime') = ? GROUP BY role",
+        (str(user_id), day))
+    out = {"user": 0, "assistant": 0, "last_at": ""}
+    for row in rows:
+        role = str(row["role"])
+        if role in out:
+            out[role] = int(row["cnt"] or 0)
+        if row["last_at"] and str(row["last_at"]) > out["last_at"]:
+            out["last_at"] = str(row["last_at"])
+    return out
+
+
+def processed_counts(table: str, day: str = "") -> dict:
+    """按 kind/tool 统计今天做过多少次（只允许固定白名单表，避免拼接注入）。"""
+    allowed = {"qzone_processed": "kind", "interact_usage": "tool"}
+    column = allowed.get(table)
+    if not column:
+        return {}
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    rows = query(
+        "SELECT %s AS name, COUNT(*) AS cnt FROM %s "
+        "WHERE date(created_at, 'localtime') = ? GROUP BY %s" % (column, table, column),
+        (day,))
+    return {str(row["name"]): int(row["cnt"] or 0) for row in rows}
+
+
+def activity_matrix(user_id: str, days: int = 7) -> list:
+    """近 N 天 × 24 小时的活跃权重（面板热力图用；行=活跃日，列=钟点）。"""
+    days = max(1, min(31, int(days)))
+    first_day = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    rows = query(
+        "SELECT day, hour, SUM(weight) AS weight FROM behavior_evidence "
+        "WHERE user_id = ? AND kind = 'activity' AND day >= ? "
+        "GROUP BY day, hour ORDER BY day ASC, hour ASC",
+        (str(user_id), first_day))
+    return [{"day": row["day"], "hour": int(row["hour"]),
+             "weight": float(row["weight"] or 0)} for row in rows]
 
 
 def get_evidence(user_id: str, since_day: str = "", kinds=None) -> list:

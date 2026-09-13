@@ -325,6 +325,26 @@ def test_gui():
                 card.maximumHeight() <= 155 for card in win._dashboard_status_cards
             )
             win._refresh_growth_stats()
+            # 陪伴状态新增指标：给一个测试用户 + 一条日程，确认"她眼里的你/今天"能取到真实数据
+            from config import runtime as _rt
+            old_uid = _rt.PROACTIVE_ONLY_USER_ID
+            try:
+                _rt.PROACTIVE_ONLY_USER_ID = "gui_status_user"
+                import assistant_db as _adb
+                from datetime import datetime as _dt, timedelta as _td
+                _start = (_dt.now() + _td(minutes=40)).strftime("%Y-%m-%d %H:%M:%S")
+                _adb.add_evidence("gui_status_user", "activity")
+                _adb.add_schedule("gui_status_user", "测试日程", start_time=_start,
+                                  source="user", remind_before=15)
+                win._refresh_growth_stats()
+                result["status_user_state"] = win._growth_labels["user_state"].text()
+                result["status_schedule"] = win._growth_labels["schedule_next"].text()
+                result["status_msgs"] = win._growth_labels["msgs_today"].text()
+                result["status_proactive"] = win._growth_labels["proactive_today"].text()
+                result["emotion_bars"] = len(win._emotion_bars._rows)
+            finally:
+                _rt.PROACTIVE_ONLY_USER_ID = old_uid
+                win._refresh_growth_stats()
             # 助理系统：新一级页「生活与学习」及其四个子页签必须存在且可刷新
             result["assistant_tabs"] = win._life_study_tabs.count()
             result["assistant_metrics"] = len(win._assistant_metric_labels)
@@ -393,9 +413,14 @@ def test_gui():
     QTimer.singleShot(1500, verify)
     app.exec()
     assert result.get("tabs") == 8, "新增「生活与学习」后应有 8 个顶级页"
-    assert result.get("growth") == 16, "16 项陪伴指标必须完整保留"
-    assert result.get("growth_groups") == 7, "陪伴状态应归并为 7 张分组卡片"
+    assert result.get("growth") == 33, "陪伴状态应保留原有 16 项并加入今天/内部状态共 33 项指标"
+    assert result.get("growth_groups") == 16, "陪伴状态应为 16 张分组卡片（此刻/今天/长期/活跃）"
     assert result.get("has_axes"), "性格轮廓应位于分组卡片内"
+    assert result.get("status_user_state") not in (None, "", "—"), "「她眼里的你」应能推断出状态"
+    assert "测试日程" in (result.get("status_schedule") or ""), "「下一项」应显示刚建的日程与倒计时"
+    assert " / " in (result.get("status_msgs") or ""), "「今天的互动」应显示 你/她 两边的条数"
+    assert result.get("status_proactive"), "「主动消息」应显示今天的条数"
+    assert result.get("emotion_bars") == 4, "持续情绪应有 4 条（开心/生气/委屈/疲惫）"
     assert result.get("compact_dashboard"), "首页三张运行状态卡应保持紧凑"
     assert result.get("assistant_tabs") == 4, "「生活与学习」应有今日/学习/日程/她对你的了解四个子页签"
     assert result.get("assistant_metrics") == 4, "「她对你的了解」应展示起床/睡觉/活跃/学习四项推断"

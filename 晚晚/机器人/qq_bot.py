@@ -4403,6 +4403,7 @@ class QQGirlfriendBot:
             verdict["allow"] = False
             logger.info("主动消息被压制 [%s] 优先级=%s 状态=%s（%s）",
                         user_id, priority, verdict["state"], verdict["reason"])
+            self._bump_proactive_stat(user_id, "blocked")
             return verdict
         now_ts = now.timestamp() if now is not None else time.time()
         last = self._last_proactive_any.get(str(user_id), 0)
@@ -4410,13 +4411,25 @@ class QQGirlfriendBot:
             verdict["allow"] = False
             verdict["reason"] = "刚发过一条主动消息，先不打扰"
             logger.info("主动消息被冷却压制 [%s] 优先级=%s", user_id, priority)
+            self._bump_proactive_stat(user_id, "blocked")
         return verdict
+
+    @staticmethod
+    def _bump_proactive_stat(user_id, field):
+        """累计主动消息每日账（面板展示用；失败不影响流程）。"""
+        if adb_assistant is None:
+            return
+        try:
+            adb_assistant.bump_proactive_stat(user_id, field)
+        except Exception as exc:
+            logger.debug("主动消息计数失败: %s", exc)
 
     def _mark_proactive_sent(self, user_id, now=None):
         """记录一条主动消息已发出（用于跨系统防轰炸冷却）。"""
         now_ts = now.timestamp() if now is not None else time.time()
         self._last_proactive_any[str(user_id)] = now_ts
         self._last_proactive_msg[str(user_id)] = now_ts
+        self._bump_proactive_stat(user_id, "sent")
 
     async def _maybe_proactive_followup(self, user_id):
         """未回复升级：对方长时间没回，按病娇傲娇人设追一句（真人感）。

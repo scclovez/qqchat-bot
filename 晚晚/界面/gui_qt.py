@@ -90,6 +90,27 @@ GROWTH_HINTS = {
     "memory": "她长期记忆里关于你的事（提炼的事实 + 偏好数量）",
     "chats": "累计聊天的消息条数",
     "mood_delta": "今日亲密度变化：今天通过聊天涨了多少亲密度",
+    # ---- 今天 / 她的内部状态（新增）----
+    "user_state": "她对你的状态判断：清醒 / 可能在忙 / 准备睡了 / 大概睡了。由聊天时间戳与内容推断，"
+                  "不是固定计时器；你一发消息就会立刻判为清醒",
+    "user_state_reason": "她做出这个判断的依据（作息推断、最近是否说过话、说过晚安或刚起床等）",
+    "msgs_today": "今天双方的互动量：你发了多少条、她回了多少条",
+    "last_msg": "最近一条消息距今多久",
+    "grudge": "今天的情绪账：被惹次数 / 是否正在闹脾气 / 今天是否情绪低落日",
+    "proactive_today": "她今天主动发了几条消息（含提醒、追问、撩人、碎碎念等，全部经统一闸门）",
+    "proactive_blocked": "今天有多少次主动消息被她自己压住了（你在睡/在忙，或刚发过一条、避免轰炸）",
+    "proactive_last": "她最近一次主动找你的时间",
+    "qzone_today": "她今天在 QQ 空间的动静：发说说 / 回复评论 / 给好友动态点赞与评论",
+    "interact_today": "她今天对你做的小动作：戳一戳 / 回表情 / 名片赞 / 改在线状态 / 改个性签名",
+    "media_today": "今天生成的图片与语音条数（token 总量见「设置 → Token 用量」）",
+    "schedule_today": "今天她帮你记下的日程条数（含重复日程在今天的发生）",
+    "schedule_next": "下一项安排是什么、还有多久",
+    "study_today": "学习：连续学习天数与今天待复习的内容数",
+    "memory_book": "长期记忆账本：关于你的事实 / 偏好 / 情景（进行中·已完成），以及下一次回访时间",
+    "sleep_wake": "她观察到的作息：最近通常几点起床、几点睡觉，以及这条结论的确定程度",
+    "coverage": "这些观察建立在多少天的数据上（启动时会自动读一遍已有聊天记录）",
+    "emotion_bars": "持续情绪强度：会随时间自然衰减，不是只看这一句话的关键词（数值 0-100）",
+    "heatmap": "近 7 天 × 24 小时的聊天活跃分布（按活跃日，凌晨 0-4 点算前一天）",
 }
 
 # =============================================================================
@@ -360,6 +381,92 @@ class _CellTooltip(QObject):
         return False
 
 
+class _EmotionBars(QWidget):
+    """持续情绪横条（比数字直观：一眼看出她此刻哪种情绪最强）。"""
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self._rows = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        for key, label in items:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(_label(label, "GrowthMetricName"))
+            track = QFrame()
+            track.setFixedHeight(7)
+            track_lay = QHBoxLayout(track)
+            track_lay.setContentsMargins(0, 0, 0, 0)
+            track_lay.setSpacing(0)
+            bar = QFrame()
+            bar.setFixedHeight(7)
+            bar.setStyleSheet("background:#7fb2e5; border-radius:3px;")
+            track_lay.addWidget(bar)
+            track_lay.addStretch(1)
+            row.addWidget(track, 1)
+            value = _label("0", "GrowthMetricValue")
+            value.setFixedWidth(32)
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(value)
+            lay.addLayout(row)
+            self._rows[key] = (bar, value, track)
+
+    def set_values(self, values):
+        for key, (bar, value, track) in self._rows.items():
+            amount = max(0, min(100, int(round(float((values or {}).get(key) or 0)))))
+            value.setText(str(amount))
+            base = track.width() or 150
+            bar.setFixedWidth(max(2, int(base * amount / 100.0)))
+
+
+class _ActivityHeatmap(QWidget):
+    """近 N 天 × 24 小时聊天活跃热力图（行=日期，列=钟点）。"""
+
+    COLORS = ("#eef2f7", "#cfe0f5", "#9cc3ec", "#5b9be0", "#2f6fbf")
+
+    def __init__(self, days=7, parent=None):
+        super().__init__(parent)
+        self._days = int(days)
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(2)
+        self._grid.setVerticalSpacing(2)
+        self._built = False
+
+    def set_matrix(self, rows):
+        from datetime import datetime, timedelta
+        data = {}
+        for row in rows or []:
+            data[(str(row.get("day")), int(row.get("hour")))] = float(row.get("weight") or 0)
+        peak = max(data.values()) if data else 0.0
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._grid.addWidget(_label("", "GrowthMetricName"), 0, 0)
+        for hour in range(24):
+            self._grid.addWidget(_label(str(hour), "GrowthMetricName"), 0, hour + 1)
+        today = datetime.now().date()
+        for row_index, offset in enumerate(range(self._days - 1, -1, -1)):
+            day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+            self._grid.addWidget(_label(day[5:], "GrowthMetricName"), row_index + 1, 0)
+            for hour in range(24):
+                weight = data.get((day, hour), 0.0)
+                if peak > 0 and weight > 0:
+                    level = min(4, 1 + int(round(3 * weight / peak)))
+                else:
+                    level = 0
+                cell = QFrame()
+                cell.setFixedSize(15, 13)
+                cell.setStyleSheet("background:%s; border-radius:3px;" % self.COLORS[level])
+                cell.setToolTip("%s %02d:00 ｜ %d 条" % (day, hour, int(weight)))
+                self._grid.addWidget(cell, row_index + 1, hour + 1)
+        self._grid.setColumnStretch(24, 1)
+        self._built = True
+
+
 # =============================================================================
 # 主窗口（无边框 + 自绘标题栏）
 # =============================================================================
@@ -618,29 +725,10 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
 
-        # 将原先平铺的 16 个指标按阅读语义收拢：先看此刻，再看关系与长期成长。
-        # 每个指标仍保留独立值和悬停说明，信息量不减少。
-        group_specs = [
-            ("此刻的她", [
-                ("state", "正在做"), ("energy", "能量"),
-                ("mood", "实时情绪"), ("mood_state", "情绪状态"),
-            ], 0, 0, 1, 1),
-            ("关系进度", [
-                ("stage", "性格阶段"), ("rel_hot", "关系温度"),
-                ("affection", "亲密度"), ("mood_delta", "今日变化"),
-            ], 0, 1, 1, 1),
-            ("相处倾向", [
-                ("dependency", "依赖度"), ("jealousy", "醋意倾向"),
-                ("lewdness", "亲密倾向"),
-            ], 0, 2, 1, 1),
-            ("今天留下的片段", [
-                ("now_thought", "今天的小事"),
-            ], 1, 0, 1, 2),
-            ("陪伴档案", [
-                ("nickname", "最近称呼"), ("days", "在一起"),
-                ("memory", "记得你"), ("chats", "聊天记录"),
-            ], 1, 2, 1, 1),
-        ]
+        # 三段式重排：此刻 → 今天 → 关系与长期。
+        # 原有 16 项指标全部保留（键不变，仅重新分组），另加"今天/她的内部状态"实时数据。
+        def add_section(title, row):
+            grid.addWidget(_label(title, "SectionTitle"), row, 0, 1, 3)
 
         def add_metric_group(title, items, row, column, row_span=1, column_span=1):
             panel = QFrame()
@@ -669,38 +757,99 @@ class MainWindow(QMainWindow):
             panel_lay.addStretch(1)
             grid.addWidget(panel, row, column, row_span, column_span)
 
-        for spec in group_specs:
-            add_metric_group(*spec)
+        def add_text_group(title, row, column, row_span=1, column_span=1):
+            panel = QFrame()
+            panel.setObjectName("GrowthGroup")
+            panel_lay = QVBoxLayout(panel)
+            panel_lay.setContentsMargins(12, 9, 12, 9)
+            panel_lay.setSpacing(6)
+            panel_lay.addWidget(_label(title, "GrowthGroupTitle"))
+            grid.addWidget(panel, row, column, row_span, column_span)
+            return panel_lay
 
-        life_panel = QFrame()
-        life_panel.setObjectName("GrowthGroup")
-        life_lay = QVBoxLayout(life_panel)
-        life_lay.setContentsMargins(12, 9, 12, 9)
-        life_lay.setSpacing(6)
-        life_lay.addWidget(_label("生活轨迹", "GrowthGroupTitle"))
+        def add_custom_group(title, widget, hint_key, row, column, row_span=1, column_span=1):
+            panel = QFrame()
+            panel.setObjectName("GrowthGroup")
+            panel_lay = QVBoxLayout(panel)
+            panel_lay.setContentsMargins(12, 9, 12, 9)
+            panel_lay.setSpacing(6)
+            title_label = _label(title, "GrowthGroupTitle")
+            panel_lay.addWidget(title_label)
+            panel_lay.addWidget(widget)
+            panel_lay.addStretch(1)
+            tip = _CellTooltip(GROWTH_HINTS.get(hint_key, ""), panel)
+            panel.installEventFilter(tip)
+            grid.addWidget(panel, row, column, row_span, column_span)
+
+        # ---------------- 此刻的她 ----------------
+        add_section("此刻的她", 0)
+        add_metric_group("此刻的她", [
+            ("state", "正在做"), ("energy", "能量"),
+            ("mood", "实时情绪"), ("mood_state", "情绪状态"),
+        ], 1, 0)
+        life_lay = add_text_group("生活轨迹", 1, 1)
         self._life_state_var = _label("生活线读取中...", "GrowthBody")
         self._life_state_var.setWordWrap(True)
         life_lay.addWidget(self._life_state_var)
         life_lay.addStretch(1)
-        grid.addWidget(life_panel, 2, 0)
+        add_metric_group("她眼里的你", [
+            ("user_state", "她的判断"), ("user_state_reason", "依据"),
+        ], 1, 2)
+        self._emotion_bars = _EmotionBars([("happy", "开心"), ("angry", "生气"),
+                                           ("hurt", "委屈"), ("tired", "疲惫")])
+        add_custom_group("持续情绪", self._emotion_bars, "emotion_bars", 2, 0, 1, 3)
 
-        growth_panel = QFrame()
-        growth_panel.setObjectName("GrowthGroup")
-        evo_lay = QVBoxLayout(growth_panel)
-        evo_lay.setContentsMargins(12, 9, 12, 9)
-        evo_lay.setSpacing(6)
-        evo_lay.addWidget(_label("性格与成长", "GrowthGroupTitle"))
+        # ---------------- 今天 ----------------
+        add_section("今天", 3)
+        add_metric_group("今天的互动", [
+            ("msgs_today", "你 / 她"), ("last_msg", "最近一条"), ("grudge", "情绪账"),
+        ], 4, 0)
+        add_metric_group("她今天做了这些", [
+            ("proactive_today", "主动消息"), ("proactive_blocked", "被压住"),
+            ("proactive_last", "上次主动"), ("qzone_today", "空间动静"),
+            ("interact_today", "小动作"), ("media_today", "图 / 语音"),
+        ], 4, 1)
+        add_metric_group("今天的安排", [
+            ("schedule_today", "日程"), ("schedule_next", "下一项"),
+        ], 4, 2)
+        add_metric_group("今天留下的片段", [
+            ("now_thought", "今天的小事"), ("mood_delta", "今日变化"),
+        ], 5, 0, 1, 3)
+
+        # ---------------- 关系与长期 ----------------
+        add_section("关系与长期", 6)
+        add_metric_group("关系进度", [
+            ("stage", "性格阶段"), ("rel_hot", "关系温度"), ("affection", "亲密度"),
+        ], 7, 0)
+        add_metric_group("相处倾向", [
+            ("dependency", "依赖度"), ("jealousy", "醋意倾向"), ("lewdness", "亲密倾向"),
+        ], 7, 1)
+        add_metric_group("陪伴档案", [
+            ("nickname", "最近称呼"), ("days", "在一起"),
+            ("memory", "记得你"), ("chats", "聊天记录"),
+        ], 7, 2)
+        add_metric_group("记忆账本", [("memory_book", "事实 / 偏好 / 情景")], 8, 0)
+        add_metric_group("作息速览", [
+            ("sleep_wake", "起床 / 睡觉"), ("coverage", "数据覆盖"),
+        ], 8, 1)
+        add_metric_group("学习与复习", [("study_today", "连续 / 待复习")], 8, 2)
+
+        personality_lay = add_text_group("性格与成长", 9, 0, 1, 3)
         self._personality_axes_var = _label("性格轮廓读取中...", "GrowthBody")
         self._personality_axes_var.setWordWrap(True)
-        evo_lay.addWidget(self._personality_axes_var)
+        personality_lay.addWidget(self._personality_axes_var)
         divider = QFrame()
         divider.setObjectName("GrowthDivider")
-        evo_lay.addWidget(divider)
+        personality_lay.addWidget(divider)
         self._growth_evo_var = _label("最近演化读取中...", "GrowthBody")
         self._growth_evo_var.setWordWrap(True)
-        evo_lay.addWidget(self._growth_evo_var)
-        evo_lay.addStretch(1)
-        grid.addWidget(growth_panel, 2, 1, 1, 2)
+        personality_lay.addWidget(self._growth_evo_var)
+        personality_lay.addStretch(1)
+
+        # ---------------- 活跃节奏 ----------------
+        add_section("你的活跃节奏（近 7 天）", 10)
+        self._activity_heatmap = _ActivityHeatmap(7)
+        add_custom_group("聊天活跃", self._activity_heatmap, "heatmap", 11, 0, 1, 3)
 
         for c in range(3):
             grid.setColumnStretch(c, 1)
@@ -2781,6 +2930,7 @@ class MainWindow(QMainWindow):
                 vals["chats"] = f"{total} 条"
             except Exception:
                 vals["chats"] = "—"
+            self._fill_today_vals(vals, boyfriend)
             for key, lbl in self._growth_labels.items():
                 v = vals.get(key, "")
                 lbl.setText(v if v else "—")
@@ -2812,9 +2962,209 @@ class MainWindow(QMainWindow):
             self._growth_evo_var.setText(f"成长状态读取失败：{e}")
 
 
+    def _fill_today_vals(self, vals, boyfriend):
+        """补齐「她眼里的你 / 今天」这些实时指标：全部本地读表，不调模型、不阻塞界面。"""
+        new_keys = ("user_state", "user_state_reason", "msgs_today", "last_msg", "grudge",
+                    "proactive_today", "proactive_blocked", "proactive_last", "qzone_today",
+                    "interact_today", "media_today", "schedule_today", "schedule_next",
+                    "study_today", "memory_book", "sleep_wake", "coverage")
+        if not boyfriend:
+            for key in new_keys:
+                vals[key] = "—"
+            vals["user_state_reason"] = "先设置「只对指定 QQ 号主动发消息」"
+            return
+        from datetime import datetime, timezone
+        import assistant_db as adb
+        import behavior_profile as bp
+        import schedule_manager as sm
+        import goal_manager as gm
+
+        def to_local_hm(raw):
+            """chat_history 存的是 UTC → 转本地 datetime。"""
+            try:
+                naive = datetime.strptime(str(raw)[:19], "%Y-%m-%d %H:%M:%S")
+                return datetime.fromtimestamp(naive.replace(tzinfo=timezone.utc).timestamp())
+            except Exception:
+                return None
+
+        # 她眼里的你
+        try:
+            state = bp.infer_user_state(boyfriend)
+            vals["user_state"] = str(state.get("label") or "—")
+            reasons = [str(x) for x in (state.get("reasons") or []) if x]
+            vals["user_state_reason"] = reasons[0] if reasons else "—"
+        except Exception:
+            vals["user_state"] = vals["user_state_reason"] = "—"
+
+        # 今天的互动
+        try:
+            counts = adb.message_counts_by_day(boyfriend)
+            vals["msgs_today"] = "%d / %d" % (counts["user"], counts["assistant"])
+            moment = to_local_hm(counts["last_at"])
+            vals["last_msg"] = moment.strftime("%H:%M") if moment else "—"
+        except Exception:
+            vals["msgs_today"] = vals["last_msg"] = "—"
+
+        # 情绪账
+        try:
+            bits = []
+            grudge = liveness.grudge_count_today(boyfriend)
+            if grudge:
+                bits.append("被惹 %d 次" % grudge)
+            if liveness.is_angry(boyfriend):
+                bits.append("在闹脾气")
+            if liveness.today_mood_low():
+                bits.append("情绪低落日")
+            vals["grudge"] = " · ".join(bits) if bits else "没有情绪账"
+        except Exception:
+            vals["grudge"] = "—"
+
+        # 主动消息账（今天发出 / 被压住）
+        try:
+            stats = adb.get_proactive_stats(boyfriend)
+            vals["proactive_today"] = "%d 条" % stats["sent"]
+            vals["proactive_blocked"] = "%d 次" % stats["blocked"]
+        except Exception:
+            vals["proactive_today"] = vals["proactive_blocked"] = "—"
+        try:
+            runtime_state = liveness.load_interaction_runtime_state() or {}
+            last_pro = (runtime_state.get("last_proactive_msg") or {}).get(str(boyfriend))
+            if last_pro:
+                moment = datetime.fromtimestamp(float(last_pro))
+                same_day = moment.strftime("%Y-%m-%d") == datetime.now().strftime("%Y-%m-%d")
+                vals["proactive_last"] = moment.strftime("%H:%M") if same_day \
+                    else moment.strftime("%m-%d %H:%M")
+            else:
+                vals["proactive_last"] = "还没主动过"
+        except Exception:
+            vals["proactive_last"] = "—"
+
+        # 空间动静
+        try:
+            qzone = adb.processed_counts("qzone_processed")
+            bits = []
+            if qzone.get("daily_post"):
+                bits.append("说说 %d" % qzone["daily_post"])
+            if qzone.get("comment_replied"):
+                bits.append("回评论 %d" % qzone["comment_replied"])
+            if qzone.get("feed_liked"):
+                bits.append("赞 %d" % qzone["feed_liked"])
+            if qzone.get("feed_commented"):
+                bits.append("评 %d" % qzone["feed_commented"])
+            vals["qzone_today"] = " · ".join(bits) if bits else "今天没去空间"
+        except Exception:
+            vals["qzone_today"] = "—"
+
+        # 小动作（戳一戳 / 表情 / 名片赞 / 状态 / 签名）
+        try:
+            tools = adb.processed_counts("interact_usage")
+            names = {"poke_user": "戳一戳", "react_message": "回表情", "send_like": "赞名片",
+                     "set_online_status": "改状态", "set_longnick": "改签名"}
+            bits = ["%s %d" % (names[key], value) for key, value in tools.items()
+                    if key in names and value]
+            vals["interact_today"] = " · ".join(bits) if bits else "今天没有小动作"
+        except Exception:
+            vals["interact_today"] = "—"
+
+        # 今天生成的图片与语音（按文件时间统计；token 总量见设置页）
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            def count_today(folder, prefix=""):
+                if not os.path.isdir(folder):
+                    return 0
+                total = 0
+                for name in os.listdir(folder):
+                    path = os.path.join(folder, name)
+                    if not os.path.isfile(path) or (prefix and not name.startswith(prefix)):
+                        continue
+                    if datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d") == today:
+                        total += 1
+                return total
+
+            images = count_today(data_path("晚晚", "图片", "生成图片"))
+            voices = count_today(data_path("晚晚", "语音", "语音缓存"), "tts_")
+            vals["media_today"] = "图 %d / 语音 %d" % (images, voices)
+        except Exception:
+            vals["media_today"] = "—"
+
+        # 今天的安排与下一项
+        try:
+            overview = sm.overview(boyfriend)
+            items = overview.get("today") or []
+            vals["schedule_today"] = "%d 项" % len(items)
+            upcoming = None
+            for item in items:
+                try:
+                    start = datetime.strptime(item["start"], "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+                if start >= datetime.now():
+                    upcoming = (start, item)
+                    break
+            if upcoming:
+                minutes = int((upcoming[0] - datetime.now()).total_seconds() // 60)
+                vals["schedule_next"] = "%s %s（%s）" % (
+                    upcoming[0].strftime("%H:%M"), upcoming[1]["title"],
+                    "还有 %d 分钟" % minutes if minutes > 0 else "现在就是")
+            else:
+                vals["schedule_next"] = "今天的都过了" if items else "今天没有安排"
+        except Exception:
+            vals["schedule_today"] = vals["schedule_next"] = "—"
+
+        # 学习与复习
+        try:
+            study = gm.overview(boyfriend)
+            vals["study_today"] = "连续 %d 天 · 待复习 %d 个" % (
+                int(study.get("streak") or 0), len(study.get("due") or []))
+        except Exception:
+            vals["study_today"] = "—"
+
+        # 记忆账本（事实 / 偏好 / 情景 + 下次回访）
+        try:
+            mem = longterm_memory.get_user_memory(boyfriend)
+            facts = len(mem.get("facts") or [])
+            prefs = len(mem.get("preferences") or {})
+            episodes = mem.get("episodes") or []
+            ongoing = sum(1 for item in episodes
+                          if str(item.get("status")) in ("pending", "ongoing"))
+            text = "事实 %d · 偏好 %d · 情景 %d（%d 进行中）" % (facts, prefs, len(episodes), ongoing)
+            follow = ""
+            for item in episodes:
+                raw = str(item.get("follow_up_after") or "")
+                if raw and str(item.get("status")) in ("pending", "ongoing"):
+                    follow = raw if not follow or raw < follow else follow
+            if follow:
+                text += " · 回访 " + follow[5:16]
+            vals["memory_book"] = text
+        except Exception:
+            vals["memory_book"] = "—"
+
+        # 作息速览 + 数据覆盖 + 情绪条 + 活跃热力图
+        try:
+            summary = bp.summarize(boyfriend)
+            vals["sleep_wake"] = "%s 起 / %s 睡（%s）" % (
+                summary["wake"]["text"], summary["sleep"]["text"], summary["sleep"]["level"])
+            cover = summary.get("coverage") or {}
+            vals["coverage"] = ("%d 天（%s ~ %s）" % (int(cover.get("days") or 0),
+                                                    cover.get("first_day") or "—",
+                                                    cover.get("last_day") or "—")
+                                if cover.get("days") else "还没有足够数据")
+        except Exception:
+            vals["sleep_wake"] = vals["coverage"] = "—"
+        try:
+            import emotion_state
+            values = emotion_state.snapshot(boyfriend)
+            self._emotion_bars.set_values(values)
+        except Exception as exc:
+            logger.debug("读取持续情绪失败: %s", exc)
+        try:
+            self._activity_heatmap.set_matrix(adb.activity_matrix(boyfriend, 7))
+        except Exception as exc:
+            logger.debug("读取活跃热力图失败: %s", exc)
+
     # ===================== 今日状态（大模型提炼，缓存） =====================
     _DIGEST_TTL = 600  # 秒：大模型结果缓存时长（约 10 分钟）
-
     def _today_digest_stale(self):
         """大模型结果是否过期（无结果/超时）。"""
         return (not self._today_digest) or (time.time() - self._today_digest_ts > self._DIGEST_TTL)
