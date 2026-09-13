@@ -739,10 +739,25 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
 
     def _build_assistant_today_page(self, sub):
-        self._build_assistant_placeholder(
-            sub, "今日",
-            "今天的安排、当前任务、完成状态与学习时长会显示在这里，随日程与学习系统一同开放。",
-        )
+        page = QWidget()
+        sub.addTab(page, "今日")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        outer.addWidget(_label("今天", "PageTitle"))
+        outer.addWidget(_label("她帮你记下的安排与提醒都会出现在这里。", "Muted"))
+
+        card, cl = _card(page, "今天的安排")
+        self._assistant_today_box = QVBoxLayout()
+        cl.addLayout(self._assistant_today_box)
+        outer.addWidget(card)
+
+        stat_card, stat_lay = _card(page, "完成情况")
+        self._assistant_today_stats = _label("正在读取…", "GrowthBody")
+        self._assistant_today_stats.setWordWrap(True)
+        stat_lay.addWidget(self._assistant_today_stats)
+        outer.addWidget(stat_card)
+        outer.addStretch(1)
 
     def _build_assistant_study_page(self, sub):
         self._build_assistant_placeholder(
@@ -751,10 +766,98 @@ class MainWindow(QMainWindow):
         )
 
     def _build_assistant_schedule_page(self, sub):
-        self._build_assistant_placeholder(
-            sub, "日程",
-            "今日 / 明日 / 本周 / 未来重要事项会显示在这里，并区分「你明确的安排」与「她帮你安排的」。",
-        )
+        page = QWidget()
+        sub.addTab(page, "日程")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        outer.addWidget(_label("日程", "PageTitle"))
+        outer.addWidget(_label(
+            "「你明确的安排」她不会改动；「她帮你安排的」可以推迟或取消。", "Muted"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        scroll.setWidget(body)
+        inner = QVBoxLayout(body)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(10)
+        self._assistant_schedule_boxes = {}
+        for key, title in (("today", "今天"), ("tomorrow", "明天"),
+                           ("week", "本周"), ("important", "未来重要事项")):
+            card, cl = _card(body, title)
+            box = QVBoxLayout()
+            cl.addLayout(box)
+            self._assistant_schedule_boxes[key] = box
+            inner.addWidget(card)
+        inner.addStretch(1)
+        outer.addWidget(scroll, 1)
+
+    @staticmethod
+    def _assistant_clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            elif item.layout() is not None:
+                MainWindow._assistant_clear_layout(item.layout())
+
+    def _assistant_fill_items(self, layout, items, empty_text, allow_actions=True):
+        """把日程条目填进指定分组（用户安排不可移动，AI 安排可推迟/取消）。"""
+        MainWindow._assistant_clear_layout(layout)
+        if not items:
+            layout.addWidget(_label(empty_text, "Muted"))
+            return
+        for item in items:
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(8)
+            source_tag = "她安排的" if str(item.get("source")) == "ai" else "你的安排"
+            status_map = {"pending": "待办", "doing": "进行中", "done": "已完成",
+                          "partial": "部分完成", "postponed": "已推迟", "cancelled": "已取消"}
+            text = "%s  %s（%s · %s）" % (item.get("time") or "--:--", item.get("title") or "",
+                                          source_tag, status_map.get(item.get("status"), "待办"))
+            row_lay.addWidget(_label(text, "GrowthBody"))
+            row_lay.addStretch(1)
+            if allow_actions and str(item.get("source")) == "ai":
+                row_lay.addWidget(_btn("推迟", "Soft",
+                                       lambda _c=False, i=item: self._assistant_move_item(i, 60)))
+                row_lay.addWidget(_btn("取消", "Soft",
+                                       lambda _c=False, i=item: self._assistant_set_status(i, "cancelled")))
+            elif allow_actions:
+                row_lay.addWidget(_btn("完成", "Soft",
+                                       lambda _c=False, i=item: self._assistant_set_status(i, "done")))
+                row_lay.addWidget(_btn("取消", "Soft",
+                                       lambda _c=False, i=item: self._assistant_set_status(i, "cancelled")))
+            layout.addWidget(row)
+
+    def _assistant_move_item(self, item, minutes):
+        try:
+            import schedule_manager as sm
+            from datetime import datetime, timedelta
+            row = sm.adb.get_schedule(item["id"])
+            if not row or not row.get("start_time"):
+                return
+            start = datetime.strptime(row["start_time"], "%Y-%m-%d %H:%M:%S") + timedelta(minutes=minutes)
+            fields = {"start_time": start.strftime("%Y-%m-%d %H:%M:%S"), "reminded_at": None}
+            if row.get("end_time"):
+                end = datetime.strptime(row["end_time"], "%Y-%m-%d %H:%M:%S") + timedelta(minutes=minutes)
+                fields["end_time"] = end.strftime("%Y-%m-%d %H:%M:%S")
+            sm.adb.update_schedule(item["id"], **fields)
+            self._assistant_refresh_ts = 0.0
+            self._refresh_assistant_panel()
+        except Exception as exc:
+            logger.warning("推迟日程失败: %s", exc)
+
+    def _assistant_set_status(self, item, status):
+        try:
+            import schedule_manager as sm
+            sm.adb.update_schedule(item["id"], status=status, reminded_at=None)
+            self._assistant_refresh_ts = 0.0
+            self._refresh_assistant_panel()
+        except Exception as exc:
+            logger.warning("更新日程状态失败: %s", exc)
 
     def _build_assistant_profile_page(self, sub):
         page = QWidget()
@@ -838,9 +941,33 @@ class MainWindow(QMainWindow):
             notes = data.get("observations") or []
             self._assistant_observations.setText(
                 "\n".join("· " + note for note in notes) if notes else "暂时还没有明显发现。")
+            self._refresh_assistant_schedule(user_id)
         except Exception as exc:
             logger.warning("读取行为规律失败: %s", exc)
             self._assistant_status.setText("读取失败，稍后会自动重试。")
+
+    def _refresh_assistant_schedule(self, user_id):
+        """刷新「今日」与「日程」两个子页签（同一份数据，两处展示）。"""
+        try:
+            import schedule_manager as sm
+            data = sm.overview(user_id)
+        except Exception as exc:
+            logger.warning("读取日程失败: %s", exc)
+            return
+        today_box = getattr(self, "_assistant_today_box", None)
+        if today_box is not None:
+            self._assistant_fill_items(today_box, data.get("today") or [], "今天还没有安排。")
+            done = sum(1 for item in (data.get("today") or []) if item.get("status") == "done")
+            pending = sum(1 for item in (data.get("today") or []) if item.get("status") != "done")
+            self._assistant_today_stats.setText(
+                "已完成 %d 项 · 待办 %d 项（学习时长与任务进度随学习系统开放）" % (done, pending))
+        boxes = getattr(self, "_assistant_schedule_boxes", None)
+        if boxes:
+            self._assistant_fill_items(boxes["today"], data.get("today") or [], "今天没有安排。")
+            self._assistant_fill_items(boxes["tomorrow"], data.get("tomorrow") or [], "明天还没有安排。")
+            self._assistant_fill_items(boxes["week"], data.get("week") or [], "本周没有安排。")
+            self._assistant_fill_items(boxes["important"], data.get("important") or [],
+                                       "暂时没有考试或截止日期。", allow_actions=False)
 
     def _submit_assistant_correction(self):
         """把用户的一句纠正作为证据写入（不做手工画像配置页）。"""
@@ -2086,14 +2213,8 @@ class MainWindow(QMainWindow):
         r.addWidget(self._proactive_followup_hours_var)
         r.addStretch(1)
         cl.addLayout(r)
-        self._night_silence_var = QDoubleSpinBox()
-        self._night_silence_var.setRange(0, 24)
-        self._night_silence_var.setValue(float(runtime.NIGHT_SILENCE_HOURS or 8))
-        r = QHBoxLayout()
-        r.addWidget(_label("晚安静默（小时）："))
-        r.addWidget(self._night_silence_var)
-        r.addStretch(1)
-        cl.addLayout(r)
+        cl.addWidget(_label(
+            "是否该安静下来，由她从聊天时间与内容自己判断（不需要设置固定的晚安静默时长）。", "Muted"))
         outer.addWidget(card)
 
         # 实时信息
@@ -2249,7 +2370,6 @@ class MainWindow(QMainWindow):
         data["PROACTIVE_PROBABILITY"] = self._proactive_prob_var.value()
         data["PROACTIVE_GAP_MIN"] = self._proactive_gap_var.value()
         data["PROACTIVE_FOLLOWUP_HOURS"] = self._proactive_followup_hours_var.value()
-        data["NIGHT_SILENCE_HOURS"] = self._night_silence_var.value()
         data["WEATHER_CITY"] = self._weather_city_var.text().strip() or "南昌"
         data["THINKING_MODE"] = 1 if self._thinking_mode_var.isChecked() else 0
         data["IMAGE_GEN_ENABLED"] = 1 if self._imagegen_enabled_var.isChecked() else 0
@@ -2359,7 +2479,6 @@ class MainWindow(QMainWindow):
         self._proactive_prob_var.setValue(float(runtime.PROACTIVE_PROBABILITY or 0))
         self._proactive_gap_var.setValue(int(runtime.PROACTIVE_GAP_MIN or 10))
         self._proactive_followup_hours_var.setValue(float(runtime.PROACTIVE_FOLLOWUP_HOURS or 2))
-        self._night_silence_var.setValue(float(runtime.NIGHT_SILENCE_HOURS or 8))
         self._weather_city_var.setText(runtime.WEATHER_CITY)
         self._thinking_mode_var.setChecked(bool(runtime.THINKING_MODE))
         self._imagegen_enabled_var.setChecked(bool(runtime.IMAGE_GEN_ENABLED))

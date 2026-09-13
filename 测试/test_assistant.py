@@ -203,6 +203,95 @@ def test_hint_detection_and_prompt():
     assert "你对他的作息观察" in text and "通常" in text
 
 
+def test_schedule_parse_rules():
+    """自然语言日程解析：明天/每天/周五、口语时刻、问句不误判。"""
+    import schedule_manager as sm
+    now = datetime.now()
+    tomorrow = now + timedelta(days=1)
+    parsed = sm.parse_text("明天下午三点有课", now)
+    assert parsed, "明天下午三点有课 应能解析"
+    assert parsed["day"] == tomorrow.strftime("%Y-%m-%d")
+    assert parsed["start_time"].endswith("15:00:00"), parsed
+    assert "课" in parsed["title"]
+
+    daily = sm.parse_text("以后每天晚上八点学英语", now)
+    assert daily["repeat_rule"] == "daily" and daily["start_time"].endswith("20:00:00")
+    assert "英语" in daily["title"]
+
+    exam = sm.parse_text("周五考试", now)
+    assert exam and exam["priority"] >= sm.PRIORITY_EXAM, exam
+    assert exam["day"] == (now + timedelta(days=(4 - now.weekday()) % 7 or 7)).strftime("%Y-%m-%d")
+
+    assert not sm.looks_like_schedule("明天几点上课？"), "询问不是日程"
+    assert not sm.looks_like_schedule("我今天好累"), "普通聊天不是日程"
+
+
+def test_fixed_schedule_not_overridden():
+    """用户固定日程不会被 AI 安排覆盖；AI 任务可移动且冲突时标出来。"""
+    import schedule_manager as sm
+    user = "test_schedule_fixed"
+    day = datetime.now() + timedelta(days=1)
+    start = day.replace(hour=15, minute=0, second=0, microsecond=0)
+    sid = adb.add_schedule(user, "上课", start_time=start.strftime("%Y-%m-%d %H:%M:%S"),
+                           source="user", priority=sm.PRIORITY_SCHEDULE)
+    assert sid
+    # AI 试图在同一时间塞一个学习任务
+    ai_id = adb.add_task(user, "背单词", planned_minutes=20,
+                         due_time=start.strftime("%Y-%m-%d %H:%M:%S"),
+                         source="ai", movable=1)
+    assert ai_id
+    plan = sm.plan_day(user, day)
+    kinds = [item["kind"] for item in plan]
+    assert kinds[0] == "user", "用户固定事项必须排在最前"
+    assert plan[0]["movable"] is False and plan[0]["title"] == "上课"
+    row = adb.get_schedule(sid)
+    assert row["status"] == "pending" and row["start_time"].startswith(day.strftime("%Y-%m-%d")), \
+        "固定日程不能被 AI 任务改写"
+    ai_rows = [item for item in plan if item["kind"] == "ai"]
+    assert ai_rows and ai_rows[0]["movable"] is True
+    assert ai_rows[0].get("conflict") is True, "与固定事项撞车时 AI 任务应被标记冲突"
+
+
+def test_schedule_reminder_dedup():
+    """到点提醒只发一次（防止同一日程反复轰炸）。"""
+    import schedule_manager as sm
+    user = "test_schedule_remind"
+    now = datetime.now()
+    start = now + timedelta(minutes=20)
+    sid = adb.add_schedule(user, "开会", start_time=start.strftime("%Y-%m-%d %H:%M:%S"),
+                           source="user", remind_before=30)
+    first = sm.reminder_candidates(user, now)
+    assert any(item["id"] == sid for item in first), first
+    assert sm.claim_reminder(sid, now)
+    second = sm.reminder_candidates(user, now)
+    assert not any(item["id"] == sid for item in second), "已提醒过的日程不得重复提醒"
+
+
+def test_proactive_gate_cooldown():
+    """统一闸门：刚发过主动消息 → 低优先级被压住，考试提醒仍可穿透。"""
+    from qq_bot import (QQGirlfriendBot, PRIORITY_MURMUR, PRIORITY_EXAM, PRIORITY_PROACTIVE)
+    bot = object.__new__(QQGirlfriendBot)
+    bot._last_proactive_any = {}
+    bot._last_proactive_msg = {}
+    bot._mark_proactive_sent("gate_user")
+    assert bot._proactive_gate("gate_user", PRIORITY_MURMUR)["allow"] is False
+    assert bot._proactive_gate("gate_user", PRIORITY_PROACTIVE)["allow"] is False
+    assert bot._proactive_gate("gate_user", PRIORITY_EXAM)["allow"] is True
+
+
+def test_old_night_silence_removed():
+    """旧固定晚安静默必须彻底移除（改由时间戳+内容推断）。"""
+    base = os.path.join(ROOT, "晚晚")
+    qq = open(os.path.join(base, "机器人", "qq_bot.py"), encoding="utf-8").read()
+    assert "_last_night_said" not in qq
+    assert "_is_in_night_silence" not in qq
+    cfg = open(os.path.join(base, "配置", "config.py"), encoding="utf-8").read()
+    assert "NIGHT_SILENCE_HOURS" not in cfg
+    gui = open(os.path.join(base, "界面", "gui_qt.py"), encoding="utf-8").read()
+    assert "NIGHT_SILENCE_HOURS" not in gui
+    assert "_proactive_gate" in qq, "主动消息必须经过统一闸门"
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -213,6 +302,11 @@ def run_into(check):
     check("智能静默优先级", test_silence_priority_and_busy)
     check("用户纠正作为证据", test_user_correction_is_evidence)
     check("内容线索与注入文本", test_hint_detection_and_prompt)
+    check("日程自然语言解析", test_schedule_parse_rules)
+    check("固定日程不被 AI 覆盖", test_fixed_schedule_not_overridden)
+    check("到点提醒不重复轰炸", test_schedule_reminder_dedup)
+    check("主动消息统一闸门", test_proactive_gate_cooldown)
+    check("旧固定静默已移除", test_old_night_silence_removed)
 
 
 def main():

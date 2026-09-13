@@ -62,7 +62,6 @@ _FIELD_TYPES = {
     "PROACTIVE_ONLY_USER_ID": str,
     "PROACTIVE_FOLLOWUP_HOURS": float,
     "PROACTIVE_FOLLOWUP_MAX": int,
-    "NIGHT_SILENCE_HOURS": float,
     "QZONE_SELF_UIN": str, "QZONE_FEED_COMMENT_PROB": float,
     "QZONE_POSTS_PER_DAY": int, "QZONE_POST_IMAGE_PROB": float,
     "QZONE_POST_INTERVAL_MIN": float, "QZONE_POST_INTERVAL_MAX": float,
@@ -154,8 +153,8 @@ class RuntimeConfig:
     PROACTIVE_FOLLOWUP_ENABLED: int = 1
     PROACTIVE_FOLLOWUP_HOURS: float = 2.0  # 多久没回复（小时）触发追问
     PROACTIVE_FOLLOWUP_MAX: int = 2        # 每个沉默期最多追问几次
-    # 晚安静默：用户道晚安后，N 小时内不主动发消息/撩人/追问（模拟真人已睡）；0=关闭
-    NIGHT_SILENCE_HOURS: float = 8.0
+    # 说明：原先的「道晚安后固定静默 N 小时」已移除。是否该安静下来改由
+    # 晚晚/助理/behavior_profile.py 根据消息时间戳与内容推断（他说一句话即视为清醒）。
     # QQ 空间：主动发说说 / 评论自动回复 / 好友动态自动点赞评论（需空间已开通）
     QZONE_ENABLED: int = 1
     QZONE_SELF_UIN: str = ""  # 机器人自己的 QQ 号（留空则从消息 self_id 自动获取）
@@ -227,7 +226,7 @@ class RuntimeConfig:
         "PROACTIVE_PROBABILITY", "PROACTIVE_GAP_MIN", "PROACTIVE_ONLY_USER_ID",
         "FRIEND_APPROVE_UIDS",
         "PROACTIVE_FOLLOWUP_HOURS",
-        "PROACTIVE_FOLLOWUP_MAX", "NIGHT_SILENCE_HOURS",
+        "PROACTIVE_FOLLOWUP_MAX",
         "QZONE_SELF_UIN", "QZONE_FEED_COMMENT_PROB",
         "QZONE_POSTS_PER_DAY", "QZONE_POST_IMAGE_PROB",
         "QZONE_POST_INTERVAL_MIN", "QZONE_POST_INTERVAL_MAX", "QZONE_IMAGE_CHECK",

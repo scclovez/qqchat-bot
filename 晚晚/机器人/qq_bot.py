@@ -35,9 +35,53 @@ import boundary
 # 助理系统（行为规律 / 日程 / 学习）：新模块异常绝不能阻断 bot 启动与聊天
 try:
     import behavior_profile
+    import schedule_manager
 except Exception as _assistant_exc:  # noqa: BLE001
     behavior_profile = None
-    logging.getLogger(__name__).warning("助理系统（行为规律）加载失败，功能自动降级: %s", _assistant_exc)
+    schedule_manager = None
+    logging.getLogger(__name__).warning("助理系统加载失败，功能自动降级: %s", _assistant_exc)
+
+# 主动消息优先级（与 晚晚/助理/schedule_manager.py 的取值保持一致）
+PRIORITY_CRITICAL_TODAY = 100   # 当天的考试 / 截止日期
+PRIORITY_EXAM = 95              # 临近的考试 / 截止日期（睡眠时唯一可穿透的档位）
+PRIORITY_SCHEDULE = 85          # 用户明确的固定日程
+PRIORITY_STUDY_TASK = 80        # 学习任务
+PRIORITY_TASK_FOLLOWUP = 60     # 未回复追问
+PRIORITY_PROACTIVE = 30         # 普通主动消息 / 撩人 / 冷场 / 空间联动
+PRIORITY_MURMUR = 10            # 碎碎念 / 表情
+# 任意一条主动消息发出后的全局冷却：窗口内更低优先级的主动消息一律压住（防轰炸）
+PROACTIVE_ANY_GAP_SECONDS = 600
+
+_WEEKDAY_CN = "一二三四五六日"
+
+
+def _human_time_text(start_raw: str, repeat_rule: str = "", with_date: bool = True) -> str:
+    """把 'YYYY-MM-DD HH:MM:SS' 说成人话（今天/明天/周三 下午三点），供人设 prompt 使用。"""
+    raw = (start_raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt = time.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return raw
+    now = time.localtime()
+    hour, minute = dt.tm_hour, dt.tm_min
+    period = ("凌晨" if hour < 5 else "早上" if hour < 9 else "上午" if hour < 12
+              else "中午" if hour < 14 else "下午" if hour < 18 else "晚上")
+    clock = "%d点%s" % (hour % 12 or 12, "" if minute == 0 else "%02d分" % minute)
+    clock = "%s%s" % (period, clock)
+    if repeat_rule == "daily":
+        return "每天" + clock
+    if not with_date:
+        return clock
+    today = time.strftime("%Y-%m-%d", now)
+    tomorrow = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))
+    day_text = time.strftime("%Y-%m-%d", dt)
+    if day_text == today:
+        return "今天" + clock
+    if day_text == tomorrow:
+        return "明天" + clock
+    return "%s（周%s）%s" % (day_text, _WEEKDAY_CN[dt.tm_wday], clock)
 
 logger = logging.getLogger(__name__)
 
@@ -237,9 +281,8 @@ PROACTIVE_FOLLOWUP_TRIGGER = (
     "几个字到一两句话，短消息风格，直接输出，不要括号动作描写，不要问“在吗”。）"
 )
 
-# 晚安静默触发词：用户消息命中 → 视为道晚安，之后 NIGHT_SILENCE_HOURS 小时内
-# 不主动发消息/撩人/追问（模拟真人已睡）。用精确词避免误伤：
-# "睡不着/睡不着觉"不含这些词；"睡了吗/睡了没"由 _is_night_said 排除问句。
+# 道晚安触发词：命中即作为一条"内容证据"记入行为规律（不再启动固定静默计时器）。
+# 用精确词避免误伤："睡不着/睡不着觉"不含这些词；"睡了吗/睡了没"由 _is_night_said 排除问句。
 NIGHT_SAID_TRIGGERS = (
     "晚安", "睡啦", "睡咯", "睡了哈", "睡了哦", "睡喽",
     "去睡了", "要睡了", "睡觉了", "睡觉去", "先睡了", "睡吧",
@@ -440,7 +483,10 @@ class QQGirlfriendBot:
         self._last_proactive_text = {}  # user_id -> 上次主动消息文本（防止连续发送同一条）
         self._proactive_followups = {}  # user_id -> 当前沉默期已追问次数（回复后清零）
         self._last_voice_sent = {}  # user_id -> 最近一次发语音的时间（超30分钟未回复 → 醋意+1）
-        self._last_night_said = {}  # user_id -> 最近一次道晚安的时间（NIGHT_SILENCE_HOURS 内不主动打扰）
+        # 主动消息统一调度：最近一条"主动"消息时间（任何类型，含图片/表情/语音），
+        # 用于跨系统防轰炸；不再使用固定的"道晚安静默"变量，作息改由时间戳+内容推断。
+        self._last_proactive_any = {}
+        self._schedule_task = None
         self._diary_task = None
         self._pstate_task = None
         self._evolution_task = None
@@ -521,7 +567,7 @@ class QQGirlfriendBot:
             state = liveness.load_interaction_runtime_state()
             for attr in (
                 "_last_user_msg", "_last_outgoing", "_last_proactive_msg",
-                "_last_voice_sent", "_last_night_said",
+                "_last_voice_sent",
             ):
                 setattr(self, attr, self._restored_number_map(state.get(attr[1:], {})))
             texts = state.get("last_proactive_text", {})
@@ -560,7 +606,7 @@ class QQGirlfriendBot:
                 ]
             restored_count = sum(bool(getattr(self, attr)) for attr in (
                 "_last_user_msg", "_last_outgoing", "_last_proactive_msg",
-                "_last_night_said", "_silence_fired",
+                "_silence_fired",
             ))
             if restored_count or self._resumed_pending_messages:
                 logger.info("已恢复互动状态：状态组=%d 待收束消息=%d",
@@ -592,7 +638,6 @@ class QQGirlfriendBot:
             "last_proactive_text": self._last_proactive_text,
             "proactive_followups": self._proactive_followups,
             "last_voice_sent": self._last_voice_sent,
-            "last_night_said": self._last_night_said,
             "silence_fired": {
                 str(key): sorted(value) for key, value in self._silence_fired.items()
             },
@@ -720,6 +765,9 @@ class QQGirlfriendBot:
         self._ritual_task = asyncio.create_task(self._daily_ritual_loop())
         self._murmur_task = asyncio.create_task(self._murmur_loop())
         self._idle_murmur_task = asyncio.create_task(self._idle_murmur_loop())
+        # 助理系统定时任务：日程到点提醒（每 5 分钟扫描一次，优先级高于普通主动消息）
+        self._schedule_task = asyncio.create_task(self._schedule_reminder_loop()) \
+            if schedule_manager is not None else None
         retry_delay = 1
         while self._running:
             try:
@@ -770,12 +818,14 @@ class QQGirlfriendBot:
             self._proactive_task = None
         for task in (self._diary_task, self._pstate_task, self._evolution_task,
                      self._pull_task, self._qzone_task, self._catchup_task,
-                     self._ritual_task, self._murmur_task, self._idle_murmur_task):
+                     self._ritual_task, self._murmur_task, self._idle_murmur_task,
+                     self._schedule_task):
             if task:
                 task.cancel()
         self._diary_task = self._pstate_task = self._evolution_task = None
         self._pull_task = self._qzone_task = self._catchup_task = None
         self._ritual_task = self._murmur_task = self._idle_murmur_task = None
+        self._schedule_task = None
         # 停止/重启前：把内存中所有用户的对话上下文全量落盘，
         # 保证下次启动能接上（消息已实时落盘，这里是双保险，覆盖异常路径）
         try:
@@ -1006,12 +1056,10 @@ class QQGirlfriendBot:
             await self._handle_music_share(msg_type, target_id, user_id, message_id, music_share)
             await self._finish_typing(msg_type, user_id)
             return
-        # 晚安静默：用户道晚安 → 记录时间，之后 NIGHT_SILENCE_HOURS 小时内
-        # 不主动发消息/撩人/追问（模拟真人已睡）；被动的回复不受影响
+        # 说"晚安/睡了"不再启动固定静默计时器：这条内容已作为证据记入行为规律，
+        # 是否该安静下来由 behavior_profile 按时间戳与内容推断（他说一句话即视为清醒）。
         if self._is_intimate_user(user_id) and self._is_night_said(raw_message):
-            self._last_night_said[user_id] = time.time()
-            hours = float(runtime.NIGHT_SILENCE_HOURS or 0)
-            logger.info("用户道晚安，进入 %s 小时静默期 [%s]", hours, user_id)
+            logger.info("用户道晚安（记为作息证据，不做固定静默）[%s]", user_id)
         self._persist_interaction_state()
         # 成长系统：用户提及"别人/别的女生" → 醋意倾向 +2
         if (self._is_intimate_user(user_id)
@@ -1082,6 +1130,28 @@ class QQGirlfriendBot:
                 longterm_memory.add_chat_history(user_id, "assistant", sent_text)
             await self._finish_typing(msg_type, user_id)
             return
+        # 日程：用户说出带时间的事 → 解析入库，确认回复仍由人设生成
+        if (schedule_manager is not None and not is_group and self._is_intimate_user(user_id)
+                and schedule_manager.looks_like_schedule(raw_message)):
+            created = None
+            try:
+                created = await schedule_manager.create_from_text(
+                    user_id, raw_message, self._llm_task.chat)
+            except Exception as exc:
+                logger.warning("日程解析失败，按普通对话处理 [%s]: %s", user_id, exc)
+            if created:
+                self._memory.add_message(user_id, "user", raw_message)
+                longterm_memory.add_chat_history(user_id, "user", raw_message)
+                reply = await self._generate_schedule_reply(raw_message, created)
+                sent_text = await self._reply_split(
+                    msg_type, target_id, user_id, message_id, reply, force_voice=False,
+                    expected_revision=turn_revision,
+                )
+                if sent_text:
+                    self._memory.add_message(user_id, "assistant", sent_text)
+                    longterm_memory.add_chat_history(user_id, "assistant", sent_text)
+                await self._finish_typing(msg_type, user_id)
+                return
         # 图片生成：用户想看bot长相 → 按外貌设定生成自拍；说"画一张xxx"→ 按描述生成
         if runtime.IMAGE_GEN_ENABLED:
             # 慢任务媒体锁：同用户的图片请求串行处理，防止两条消息并发触发
@@ -1489,6 +1559,96 @@ class QQGirlfriendBot:
         except Exception as e:
             logger.warning("记忆确认回复生成失败: %s", e)
         return f"记住啦~（已记下：{mem_info}）"
+
+    async def _generate_schedule_reply(self, text, created):
+        """让大模型用她自己的语气确认日程（不输出系统化模板文案）。"""
+        schedule = created.get("schedule") or {}
+        parsed = created.get("parsed") or {}
+        when = _human_time_text(parsed.get("start_time") or "", parsed.get("repeat_rule") or "")
+        fact = "、".join(part for part in (
+            f"事项：{schedule.get('title') or ''}",
+            f"时间：{when}" if when else "",
+            "每天重复" if (parsed.get("repeat_rule") or "") == "daily" else "",
+        ) if part)
+        try:
+            messages = [
+                {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER},
+                {"role": "user", "content": f"用户刚对你说：「{text}」。你已经帮他记下了这件事（{fact}）。"
+                                            "请用一句简短、符合你人设的话回应，表示你记下了、到点会提醒他；"
+                                            "不要像日程助手那样罗列字段，不要复述整句话。"},
+            ]
+            reply = await self._deepseek.chat(messages, temperature=0.85, max_tokens=120)
+            reply = (reply or "").strip()
+            if reply:
+                return reply
+        except Exception as e:
+            logger.warning("日程确认回复生成失败: %s", e)
+        return f"记下啦，{when}的{schedule.get('title') or '这件事'}我会提醒你的~" if when else \
+            f"记下啦，{schedule.get('title') or '这件事'}我会提醒你的~"
+
+    async def _send_schedule_reminder(self, user_id, item):
+        """到点提醒：用现有人设链路生成一句话（日程模块只提供事实与优先级）。"""
+        when = _human_time_text(item.get("start"), item.get("repeat_rule") or "", with_date=False)
+        prompt = (
+            f"（内部信息，不是他发的消息）他之前让你提醒的日程快到点了：{item.get('title')}，"
+            f"时间 {when or item.get('start')}。现在用你自己的语气提醒他一句，"
+            "一句话就好；可以带一点你的性格和情绪，不要罗列时间字段，不要像闹钟。"
+            "如果他此刻可能刚醒或还在忙，语气自然些，不要责备。"
+        )
+        messages = self._memory.get_messages(user_id)
+        messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
+            user_id, build_system_prompt(), query=str(item.get("title") or ""))
+        messages[0]["content"] += "\n\n" + SHORT_REPLY_REMINDER
+        messages[0]["content"] += self._relationship_prompt(user_id)
+        if runtime.LIVENESS_ENABLED:
+            messages[0]["content"] += liveness.build_mood_injection(user_id, longterm_memory)
+        messages[0]["content"] += (
+            f"\n（【当前真实时间】{live_info.now_text()}。回答任何时间相关问题时一律以这个时间为准。）"
+        )
+        messages.append({"role": "user", "content": prompt})
+        reply = await self._deepseek.chat(messages)
+        reply = (reply or "").strip()
+        if not reply:
+            return ""
+        is_exam = int(item.get("priority") or 0) >= PRIORITY_EXAM
+        text = await self._reply_split(
+            "private", user_id, user_id, 0, reply, force_voice=False,
+            proactive_priority=int(item.get("priority") or PRIORITY_SCHEDULE),
+        )
+        if text:
+            self._memory.add_message(user_id, "assistant", text)
+            longterm_memory.add_chat_history(user_id, "assistant", text)
+            logger.info("日程提醒已发送 [%s] %s（%s）", user_id, item.get("title"),
+                        "考试/截止" if is_exam else "普通日程")
+        return text
+
+    async def _schedule_reminder_loop(self):
+        """每隔几分钟检查一次"该提醒的日程"（提醒去重由日程模块负责）。"""
+        while True:
+            await asyncio.sleep(300)
+            if schedule_manager is None:
+                continue
+            try:
+                await self._schedule_reminder_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("日程提醒检查异常:\n%s", traceback.format_exc())
+
+    async def _schedule_reminder_tick(self):
+        target = self._boyfriend_uin()
+        if not target or target in self._dead_users:
+            return
+        candidates = schedule_manager.reminder_candidates(target)
+        for item in candidates:
+            gate = self._proactive_gate(target, int(item.get("priority") or PRIORITY_SCHEDULE))
+            if not gate["allow"]:
+                continue
+            # 先认领再发送：发送失败也不会在同一时间窗里反复轰炸
+            if not schedule_manager.claim_reminder(item["id"]):
+                continue
+            await self._send_schedule_reminder(target, item)
+            break  # 一轮只提醒一条，避免连发
 
     @staticmethod
     def _message_to_text(data):
@@ -2623,7 +2783,7 @@ class QQGirlfriendBot:
 
     async def _reply_split(self, msg_type, target_id, user_id, message_id, text,
                            force_voice=None, dual_voice=False, context_text="",
-                           turn_plan=None, expected_revision=None):
+                           turn_plan=None, expected_revision=None, proactive_priority=None):
         """将回复按空行拆分为多条消息逐条发送。
 
         - 发送前按输入/回复长度和语境计算阅读、思考、打字时间
@@ -2632,9 +2792,17 @@ class QQGirlfriendBot:
         - 开启语音回复时，把回复拆成多条语音条逐条发送（更像真人）
         - dual_voice=True：文字发完后，整条内容再合成一条语音发出（重要时刻双模态）
         - expected_revision：私聊回复所属轮次；有更新消息时立即停止旧回复
+        - proactive_priority：本条属"主动消息"时传入优先级；会在发送前过统一闸门
+          （睡眠/忙碌推断 + 跨系统防轰炸），被压制则直接不发
         """
         if self._turn_is_stale(user_id, expected_revision):
             return ""
+        if proactive_priority is not None:
+            gate = self._proactive_gate(user_id, proactive_priority)
+            if not gate["allow"]:
+                logger.info("本条主动消息被闸门拦截，未发送 [%s]: %s", user_id, gate["reason"])
+                return ""
+            self._mark_proactive_sent(user_id)
         # 兜底过滤：模型偶尔输出的括号/星号动作描写（人设禁止），发送前一律去掉，
         # 避免"（把脸埋进被子）"这种动作被当成语音条/文字发出去
         text = self._strip_action_marks(text)
@@ -3101,7 +3269,7 @@ class QQGirlfriendBot:
                     await self._reply_split(
                         "private", target, target, 0,
                         f"宝，今天是我们的周年纪念日！{years}周年快乐~ 这一年也谢谢你呀（爱心）",
-                        force_voice=False)
+                        force_voice=False, proactive_priority=PRIORITY_EXAM)
                     logger.info("活人感：周年纪念日庆祝")
                     await asyncio.sleep(2)
                 day = liveness.today_special_day()
@@ -3109,7 +3277,7 @@ class QQGirlfriendBot:
                     await self._reply_split(
                         "private", target, target, 0,
                         f"今天{day}诶，记得照顾好自己哦~",
-                        force_voice=False)
+                        force_voice=False, proactive_priority=PRIORITY_EXAM)
                     logger.info("活人感：节日/节气提醒 %s", day)
                 # 情绪视觉外化：每天 8:00 按当天心情改个性签名（心情写在脸上）
                 # 心情低落日 → "今天不太想说话"；否则 → "今天天气好好"
@@ -3151,8 +3319,8 @@ class QQGirlfriendBot:
             count = 0
         if count >= 3 or random.random() > 0.4:
             return
-        # 防打扰：道晚安静默期 / 对方最近 1 小时聊过 / 凌晨 1-7 点
-        if self._is_in_night_silence(target):
+        # 防打扰：睡眠/忙碌推断（时间戳+内容）/ 对方最近 1 小时聊过 / 凌晨 1-7 点
+        if not self._proactive_gate(target, PRIORITY_MURMUR)["allow"]:
             return
         if time.time() - self._last_user_msg.get(target, 0) < 3600:
             return
@@ -3174,7 +3342,8 @@ class QQGirlfriendBot:
             )
             text = (text or "").strip()
             if len(text) >= 3:
-                await self._reply_split("private", target, target, 0, text, force_voice=False)
+                await self._reply_split("private", target, target, 0, text, force_voice=False,
+                                        proactive_priority=PRIORITY_MURMUR)
                 liveness._set(key, str(count + 1))
                 liveness._set("murmur:last:" + target, str(time.time()))  # 空闲碎碎念防撞车
                 logger.info("活人感：碎碎念 %r", text[:40])
@@ -3203,7 +3372,7 @@ class QQGirlfriendBot:
         target = self._boyfriend_uin()
         if not target or target in self._dead_users:
             return
-        if self._is_in_night_silence(target):
+        if not self._proactive_gate(target, PRIORITY_PROACTIVE)["allow"]:
             return
         if liveness.is_angry(target):
             return
@@ -3268,7 +3437,8 @@ class QQGirlfriendBot:
                 fired.add(level)
                 self._silence_fired[target] = fired
                 self._persist_interaction_state()
-                await self._reply_split("private", target, target, 0, text, force_voice=False)
+                await self._reply_split("private", target, target, 0, text, force_voice=False,
+                                        proactive_priority=PRIORITY_MURMUR)
                 liveness.mark_idle_murmur(target)
                 logger.info("活人感：冷场20分钟 废话 %r", text[:40])
                 return
@@ -3296,7 +3466,8 @@ class QQGirlfriendBot:
                 self._silence_fired[target] = fired
                 self._persist_interaction_state()
                 await self._reply_split("private", target, target, 0,
-                                        random.choice(liveness.JEALOUS_LINES), force_voice=False)
+                                        random.choice(liveness.JEALOUS_LINES), force_voice=False,
+                                        proactive_priority=PRIORITY_PROACTIVE)
                 logger.info("活人感：冷场60分钟 醋意 [%s]", target)
                 return
             if level == "soften":
@@ -3311,7 +3482,8 @@ class QQGirlfriendBot:
                 self._persist_interaction_state()
                 liveness._set("miss_you:heavy:" + today, "1")
                 await self._reply_split("private", target, target, 0,
-                                        random.choice(liveness.SOFTEN_LINES), force_voice=False)
+                                        random.choice(liveness.SOFTEN_LINES), force_voice=False,
+                                        proactive_priority=PRIORITY_PROACTIVE)
                 logger.info("活人感：冷场120分钟 服软 [%s]", target)
                 return
         except Exception as e:
@@ -3355,7 +3527,7 @@ class QQGirlfriendBot:
                 return
             if self._last_user_msg.get(user_id, 0) > start:
                 return  # 他中间又说话了，话题已经继续，不再补
-            if self._is_in_night_silence(user_id):
+            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE)["allow"]:
                 return
             h = time.localtime().tm_hour
             if h >= 23 or h < 6:
@@ -3376,7 +3548,8 @@ class QQGirlfriendBot:
             )
             text = (text or "").strip()
             if len(text) >= 2:
-                await self._reply_split("private", user_id, user_id, 0, text, force_voice=False)
+                await self._reply_split("private", user_id, user_id, 0, text, force_voice=False,
+                                        proactive_priority=PRIORITY_PROACTIVE)
                 logger.info("活人感：回马枪 %r", text[:40])
         except asyncio.CancelledError:
             raise
@@ -3567,7 +3740,8 @@ class QQGirlfriendBot:
                 if not note or len(note) > 60:
                     note = "嘿嘿我刚发了条说说，你看到没~"
                 await self._reply_split("private", self._boyfriend_uin(), self._boyfriend_uin(),
-                                        0, note, force_voice=False)
+                                        0, note, force_voice=False,
+                                        proactive_priority=PRIORITY_PROACTIVE)
                 logger.info("多模态联动：发说说后私聊 [%s]", note[:30])
             except Exception as e:
                 logger.warning("发说说私聊反馈失败: %s", e)
@@ -3589,8 +3763,8 @@ class QQGirlfriendBot:
                 continue  # 无法私聊（非好友），跳过撩人
             if runtime.PROACTIVE_ONLY_USER_ID and str(user_id) != str(runtime.PROACTIVE_ONLY_USER_ID):
                 continue  # 只给指定 QQ 号发主动消息
-            if self._is_in_night_silence(user_id):
-                continue  # 用户道晚安后静默期内，不撩人（对方已睡）
+            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE)["allow"]:
+                continue  # 此刻他大概在睡/在忙，或刚发过一条，不撩人
             # 发语音后超过 30 分钟未回复 → 醋意倾向 +1（每个语音只计一次）
             vs = self._last_voice_sent.get(user_id)
             if vs and time.time() - vs > 1800:
@@ -3653,13 +3827,14 @@ class QQGirlfriendBot:
                 continue  # 无法私聊（非好友），不再主动发消息
             if runtime.PROACTIVE_ONLY_USER_ID and str(user_id) != str(runtime.PROACTIVE_ONLY_USER_ID):
                 continue  # 只给指定 QQ 号发主动消息
-            if self._is_in_night_silence(user_id):
-                continue  # 用户道晚安后静默期内，不主动发消息（对方已睡）
             # 用户最近刚聊过 → 跳过，避免打扰
             if now - self._last_user_msg.get(user_id, 0) < gap:
                 continue
             # 最近刚主动发过 → 跳过（防打扰冷却；之前只写不读导致从未生效）
             if now - self._last_proactive_msg.get(user_id, 0) < gap:
+                continue
+            # 统一闸门：睡眠/忙碌推断 + 跨系统防轰炸（旧固定静默已移除）
+            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE)["allow"]:
                 continue
             mood_probability = prob * (
                 liveness.emotion_initiative_factor(user_id)
@@ -3686,8 +3861,8 @@ class QQGirlfriendBot:
                     continue  # 无法私聊（非好友），不追问
                 if runtime.PROACTIVE_ONLY_USER_ID and str(user_id) != str(runtime.PROACTIVE_ONLY_USER_ID):
                     continue  # 只给指定 QQ 号发主动消息
-                if self._is_in_night_silence(user_id):
-                    continue  # 用户道晚安后静默期内，不追问（对方已睡）
+                if not self._proactive_gate(user_id, PRIORITY_TASK_FOLLOWUP)["allow"]:
+                    continue  # 他大概在睡/在忙，或刚发过一条，不追问
                 try:
                     await self._maybe_proactive_followup(user_id)
                 except asyncio.CancelledError:
@@ -3791,7 +3966,8 @@ class QQGirlfriendBot:
 
         longterm_memory.add_chat_history(user_id, "assistant", mem_text)
         # 主动消息只发私聊，避免打扰群聊里的人
-        await self._reply_split("private", user_id, user_id, 0, reply_text, force_voice=use_voice)
+        await self._reply_split("private", user_id, user_id, 0, reply_text, force_voice=use_voice,
+                                proactive_priority=PRIORITY_PROACTIVE)
         if followup_event:
             longterm_memory.mark_episode_followed_up(user_id, followup_event.get("id", ""))
         if not followup_event and playful_media:
@@ -3819,13 +3995,45 @@ class QQGirlfriendBot:
             return True
         return False
 
-    def _is_in_night_silence(self, user_id):
-        """用户道晚安后是否仍处于静默期（NIGHT_SILENCE_HOURS 小时内）。"""
-        hours = float(getattr(runtime, "NIGHT_SILENCE_HOURS", 0) or 0)
-        if hours <= 0:
-            return False
-        t = self._last_night_said.get(user_id, 0)
-        return t > 0 and (time.time() - t) < hours * 3600
+    # ============ 主动消息统一调度（Phase 2：取代旧的固定晚安静默） ============
+
+    def _proactive_gate(self, user_id, priority, now=None):
+        """所有"主动"消息的唯一闸门：睡眠/忙碌推断 + 跨系统防轰炸。
+
+        - 结论全部来自 behavior_profile（消息时间戳 + 内容推断），不再使用固定静默变量；
+        - 用户刚说过话 → 状态为清醒，正常放行；
+        - 优先级 ≥ 考试档（95）可穿透睡眠判定（重要日程/考试提醒仍能叫醒他）；
+        - 被动回复（用户说话后的回答）不走本闸门。
+        """
+        verdict = {"allow": True, "reason": "", "state": "", "priority": int(priority)}
+        if behavior_profile is None:
+            return verdict
+        try:
+            decision = behavior_profile.should_suppress_proactive(
+                user_id, priority=int(priority), now=now)
+        except Exception as exc:
+            logger.debug("主动消息闸门判定失败，按放行处理 [%s]: %s", user_id, exc)
+            return verdict
+        verdict["state"] = decision.get("state", "")
+        verdict["reason"] = decision.get("reason", "")
+        if not decision.get("allow", True):
+            verdict["allow"] = False
+            logger.info("主动消息被压制 [%s] 优先级=%s 状态=%s（%s）",
+                        user_id, priority, verdict["state"], verdict["reason"])
+            return verdict
+        now_ts = now.timestamp() if now is not None else time.time()
+        last = self._last_proactive_any.get(str(user_id), 0)
+        if last and now_ts - last < PROACTIVE_ANY_GAP_SECONDS and int(priority) < PRIORITY_EXAM:
+            verdict["allow"] = False
+            verdict["reason"] = "刚发过一条主动消息，先不打扰"
+            logger.info("主动消息被冷却压制 [%s] 优先级=%s", user_id, priority)
+        return verdict
+
+    def _mark_proactive_sent(self, user_id, now=None):
+        """记录一条主动消息已发出（用于跨系统防轰炸冷却）。"""
+        now_ts = now.timestamp() if now is not None else time.time()
+        self._last_proactive_any[str(user_id)] = now_ts
+        self._last_proactive_msg[str(user_id)] = now_ts
 
     async def _maybe_proactive_followup(self, user_id):
         """未回复升级：对方长时间没回，按病娇傲娇人设追一句（真人感）。
@@ -3869,7 +4077,8 @@ class QQGirlfriendBot:
                 longterm_memory.add_chat_history(user_id, "assistant", reply)
                 self._proactive_followups[user_id] = self._proactive_followups.get(user_id, 0) + 1
                 self._persist_interaction_state()
-            await self._reply_split("private", user_id, user_id, 0, reply)
+            await self._reply_split("private", user_id, user_id, 0, reply,
+                                    proactive_priority=PRIORITY_TASK_FOLLOWUP)
             # 成长系统：追问 → 依赖度+1 + 情绪标签"追问"
             pstate.add_dependency(1)
             growth_diary.add_mood_tag("追问")

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     status        TEXT DEFAULT 'pending',     -- pending / doing / done / partial / postponed / cancelled
     progress      REAL DEFAULT 0,
     remind_before INTEGER DEFAULT 15,         -- 提前多少分钟提醒
+    reminded_at   TEXT,                       -- 最近一次已提醒的时间（防重复提醒）
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -208,12 +209,14 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict):
 
 
 def _migrate(conn: sqlite3.Connection, version: int):
-    """按版本顺序补齐结构；当前为第 1 版，仅补历史缺失列。"""
+    """按版本顺序补齐结构（只加列/加表，绝不重建或删除既有数据）。"""
     if version < 1:
         _ensure_columns(conn, "behavior_evidence", {
             "meta": "meta TEXT",
             "slot": "slot INTEGER",
         })
+    if version < 2:
+        _ensure_columns(conn, "schedules", {"reminded_at": "reminded_at TEXT"})
     return SCHEMA_VERSION
 
 
@@ -442,6 +445,177 @@ def get_user_corrections(user_id: str, limit: int = 10) -> list:
         out.append({"day": row["day"], "hour": int(row["hour"]),
                     "text": str(meta.get("text") or "")})
     return out
+
+
+# =============================================================================
+# 日程（schedules）
+# =============================================================================
+
+SCHEDULE_FIELDS = (
+    "title", "description", "start_time", "end_time", "repeat_rule",
+    "priority", "source", "status", "progress", "remind_before", "reminded_at",
+)
+
+
+def add_schedule(user_id: str, title: str, start_time: str = "", end_time: str = "",
+                 description: str = "", repeat_rule: str = "", priority: int = 50,
+                 source: str = "user", remind_before: int = 15, status: str = "pending"):
+    """新建日程，返回新行 id；失败返回 None。"""
+    user_id, title = str(user_id or "").strip(), (title or "").strip()
+    if not user_id or not title:
+        return None
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _lock:
+            cur = conn.execute(
+                "INSERT INTO schedules (user_id, title, description, start_time, end_time, "
+                "  repeat_rule, priority, source, status, progress, remind_before, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (user_id, title, description or "", start_time or None, end_time or None,
+                 repeat_rule or "", int(priority), str(source or "user"), str(status or "pending"),
+                 int(remind_before), now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("新建日程失败: %s", exc)
+        return None
+
+
+def update_schedule(schedule_id: int, **fields) -> bool:
+    """更新日程字段（只接受白名单字段）。"""
+    updates = {k: v for k, v in fields.items() if k in SCHEDULE_FIELDS}
+    if not updates:
+        return False
+    updates["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    columns = ", ".join("%s = ?" % key for key in updates)
+    return execute(
+        "UPDATE schedules SET %s WHERE id = ?" % columns,
+        tuple(updates.values()) + (int(schedule_id),),
+    )
+
+
+def get_schedule(schedule_id: int):
+    rows = query("SELECT * FROM schedules WHERE id = ?", (int(schedule_id),))
+    return dict(rows[0]) if rows else None
+
+
+def list_schedules(user_id: str, since: str = "", until: str = "", statuses=None,
+                   include_repeating: bool = True) -> list:
+    """按时间范围列日程（since/until 为 'YYYY-MM-DD'，比较到当天 23:59:59）。"""
+    sql = "SELECT * FROM schedules WHERE user_id = ?"
+    params = [str(user_id)]
+    if statuses:
+        sql += " AND status IN (%s)" % ",".join("?" for _ in statuses)
+        params.extend(list(statuses))
+    clauses = []
+    if since:
+        clauses.append("COALESCE(end_time, start_time) >= ?")
+        params.append(since + " 00:00:00")
+    if until:
+        clauses.append("COALESCE(start_time, end_time) <= ?")
+        params.append(until + " 23:59:59")
+    if not include_repeating:
+        clauses.append("COALESCE(repeat_rule, '') = ''")
+    if clauses:
+        sql += " AND " + " AND ".join(clauses)
+    sql += " ORDER BY COALESCE(start_time, end_time) ASC, priority DESC, id ASC"
+    return [dict(row) for row in query(sql, tuple(params))]
+
+
+def delete_schedule(schedule_id: int) -> bool:
+    return execute("DELETE FROM schedules WHERE id = ?", (int(schedule_id),))
+
+
+def mark_schedule_reminded(schedule_id: int, when: str = "") -> bool:
+    return update_schedule(schedule_id, reminded_at=when or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+# =============================================================================
+# 目标 / 任务（Phase 3 使用，先建最小读写，保证表与调用约定一致）
+# =============================================================================
+
+def add_goal(user_id: str, title: str, category: str = "", target: str = "",
+             deadline: str = ""):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _lock:
+            cur = conn.execute(
+                "INSERT INTO goals (user_id, title, category, target, deadline, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(user_id), (title or "").strip(), category or "", target or "",
+                 deadline or None, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("新建目标失败: %s", exc)
+        return None
+
+
+def list_goals(user_id: str, statuses=None) -> list:
+    sql = "SELECT * FROM goals WHERE user_id = ?"
+    params = [str(user_id)]
+    if statuses:
+        sql += " AND status IN (%s)" % ",".join("?" for _ in statuses)
+        params.extend(list(statuses))
+    sql += " ORDER BY id DESC"
+    return [dict(row) for row in query(sql, tuple(params))]
+
+
+def add_task(user_id: str, title: str, goal_id=None, schedule_id=None, description: str = "",
+             planned_minutes: int = 0, due_time: str = "", priority: int = 50,
+             source: str = "ai", movable: int = 1, status: str = "pending"):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _lock:
+            cur = conn.execute(
+                "INSERT INTO tasks (user_id, goal_id, schedule_id, title, description, "
+                "  planned_minutes, due_time, priority, source, status, movable, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(user_id), goal_id, schedule_id, (title or "").strip(), description or "",
+                 int(planned_minutes), due_time or None, int(priority), str(source),
+                 str(status), 1 if movable else 0, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("新建任务失败: %s", exc)
+        return None
+
+
+def list_tasks(user_id: str, statuses=None, goal_id=None, day: str = "") -> list:
+    sql = "SELECT * FROM tasks WHERE user_id = ?"
+    params = [str(user_id)]
+    if statuses:
+        sql += " AND status IN (%s)" % ",".join("?" for _ in statuses)
+        params.extend(list(statuses))
+    if goal_id is not None:
+        sql += " AND goal_id = ?"
+        params.append(int(goal_id))
+    if day:
+        sql += " AND (due_time IS NULL OR substr(due_time, 1, 10) <= ?)"
+        params.append(day)
+    sql += " ORDER BY priority DESC, id ASC"
+    return [dict(row) for row in query(sql, tuple(params))]
+
+
+def update_task(task_id: int, **fields) -> bool:
+    allowed = ("title", "description", "planned_minutes", "done_minutes", "due_time",
+               "priority", "source", "status", "progress", "movable", "goal_id", "schedule_id")
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    updates["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    columns = ", ".join("%s = ?" % key for key in updates)
+    return execute("UPDATE tasks SET %s WHERE id = ?" % columns,
+                   tuple(updates.values()) + (int(task_id),))
 
 
 init_db()
