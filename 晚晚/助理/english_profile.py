@@ -245,6 +245,18 @@ def primary_focus(profile: dict) -> str:
     return min(candidates)[1] if candidates else "assessment"
 
 
+def focus_for_request(profile: dict, text: str = "") -> str:
+    """用户明确说想练哪项时尊重他的选择，否则按画像给当前优先项。"""
+    value = (text or "").replace(" ", "")
+    requested = (("listening", ("听力", "听")), ("reading", ("阅读", "读文章")),
+                 ("grammar", ("语法", "时态", "造句")), ("writing", ("写作", "作文")),
+                 ("speaking", ("口语", "开口")), ("vocabulary", ("单词", "背词", "背单词")))
+    for dimension, words in requested:
+        if any(word in value for word in words):
+            return dimension
+    return primary_focus(profile)
+
+
 def recommendation(profile: dict) -> dict:
     focus = primary_focus(profile)
     labels = {

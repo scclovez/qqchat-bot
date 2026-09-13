@@ -1880,7 +1880,8 @@ class QQGirlfriendBot:
                 return False
             study_session.resume_session(session["id"])
             goal = goal_manager.active_goal(user_id)
-            card = study_session.next_card(user_id, (goal or {}).get("id"))
+            card = study_session.next_card(user_id, (goal or {}).get("id"),
+                                           study_session.session_focus(session))
             if not card:
                 return False
             await self._present_word_card(msg_type, target_id, user_id, message_id, card,
@@ -1906,8 +1907,17 @@ class QQGirlfriendBot:
                     self._memory.add_message(user_id, "assistant", sent)
                     longterm_memory.add_chat_history(user_id, "assistant", sent)
                 return True
+        profile = (adb_assistant.get_english_profile(user_id) if english_profile is not None else {}) or {}
+        focus = english_profile.focus_for_request(profile, text) if english_profile is not None else "vocabulary"
+        # 当前已具备可互动内容的是词汇/语法/阅读/听力；其余方向先回到语法基础，
+        # 不把尚未实现的写作或口语伪装成已可教学。
+        if focus not in ("vocabulary", "grammar", "reading", "listening"):
+            focus = "grammar"
         try:
-            cards = await study_session.ensure_word_pool(user_id, goal, self._llm_task.chat)
+            if focus == "vocabulary":
+                cards = await study_session.ensure_word_pool(user_id, goal, self._llm_task.chat)
+            else:
+                cards = await study_session.ensure_focus_pool(user_id, goal, focus, self._llm_task.chat)
         except Exception as exc:
             logger.warning("词卡准备失败 [%s]: %s", user_id, exc)
             cards = []
@@ -1916,10 +1926,15 @@ class QQGirlfriendBot:
         session = study_session.start_session(user_id, goal)
         if not session:
             return False
+        study_session.set_session_focus(session["id"], focus)
+        session = adb_assistant.get_session(session["id"]) or session
         minutes = int(session.get("planned_minutes") or 10)
+        focus_name = {"vocabulary": "词汇", "grammar": "语法", "reading": "阅读", "listening": "听力",
+                      "writing": "写作", "speaking": "口语"}.get(focus, "英语")
         reply = await self._study_persona_reply(
             user_id,
-            f"他要开始学「{goal.get('title')}」了，你准备了 {len(cards)} 个词，"
+            f"他要开始学「{goal.get('title')}」了，你这次准备带他练 {focus_name}，"
+            f"一共 {len(cards)} 个小内容，"
             f"这次大概陪他学 {minutes} 分钟。自然开个头，别像老师点名或宣布课程。",
             event="start",
         )
@@ -2164,8 +2179,15 @@ class QQGirlfriendBot:
                                  turn_revision, lead=""):
         """展示一个词：文字讲解（人设）+ 语音读例句 + 语音单独读词。"""
         fact = study_session.describe_card(card)
-        instruction = (f"{lead}。你现在带着他学这一个词：{fact}。"
-                       "用你自己的语气说一两句（把例句也带出来），不要像老师念课本，也不要罗列格式。")
+        extra = card.get("extra") or {}
+        focus = extra.get("learning_focus") or ""
+        if focus:
+            focus_name = {"grammar": "语法", "reading": "阅读", "listening": "听力"}.get(focus, "英语")
+            instruction = (f"{lead}。你现在带他练一个{focus_name}小内容：{fact}。"
+                           "先自然地陪他看题，不要提前给答案，不要像老师念讲义；问完就等他。")
+        else:
+            instruction = (f"{lead}。你现在带着他学这一个词：{fact}。"
+                           "用你自己的语气说一两句（把例句也带出来），不要像老师念课本，也不要罗列格式。")
         reply = await self._study_persona_reply(user_id, instruction, event="present")
         sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
                                        force_voice=False, expected_revision=turn_revision)
@@ -2175,7 +2197,7 @@ class QQGirlfriendBot:
         # 语音：先把例句读一遍，再把单词重读两遍（实测该顺序合成最清晰）
         await self._speak_study_text(user_id, study_session.read_aloud_text(card))
         word = card.get("content") or ""
-        if word:
+        if word and not focus:
             await self._speak_study_text(
                 user_id, word, instruct=study_session.word_only_instruction())
         try:

@@ -694,6 +694,24 @@ def test_english_profile_onboarding_and_adaptive_plan():
     events = adb.list_english_assessment_events(user)
     assert len(events) == 3 and {row["dimension"] for row in events} == set(ep.CORE_DIMENSIONS)
 
+    # 计划切到语法后，实际会话也要拿语法小练习，不得又偷偷回到词卡。
+    import study_session as ss
+    goal = gm.active_goal(user)
+    cards = asyncio.run(ss.ensure_focus_pool(user, goal, "grammar"))
+    assert len(cards) >= ss.WORDS_PER_SESSION
+    assert cards[0]["subject"] == "english_grammar"
+    assert ss.build_question(cards[0]) == "I ___ to school yesterday."
+    assert "went" not in ss.describe_card(cards[0]), "展示题目时不能提前泄露答案"
+    session = ss.start_session(user, goal, planned_minutes=10)
+    assert ss.set_session_focus(session["id"], "grammar")
+    session = adb.get_session(session["id"])
+    assert ss.session_focus(session) == "grammar"
+    ss.ask_question(session["id"], cards[0])
+    verdict = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "went"))
+    assert verdict["verdict"] == "correct"
+    profile = adb.get_english_profile(user)
+    assert profile["skills"]["grammar"]["confidence"] > 0
+
 
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""

@@ -21,6 +21,31 @@ WORDS_PER_SESSION = 5
 MASTERY_STEP = 0.25
 REVIEW_STEPS = (1, 2, 4, 7, 15, 30)
 
+# 非词汇方向也必须有可实际练习的内容，不能只在计划表里换个名字。
+_FOCUS_ITEMS = {
+    "grammar": [
+        ("一般过去时 1", "I ___ to school yesterday.", "went", "yesterday 要用过去式。"),
+        ("一般过去时 2", "She ___ a movie last night.", "watched", "last night 提示过去发生。"),
+        ("第三人称单数", "He ___ coffee every morning.", "drinks", "he 后面的动词要变化。"),
+        ("be 动词", "They ___ happy today.", "are", "they 对应 are。"),
+        ("现在进行时", "I am ___ a book now.", "reading", "now 常搭配进行时。"),
+    ],
+    "reading": [
+        ("短句阅读 1", "Tom missed the bus, so he walked to school. Tom 怎么去学校？", "走路", "so 后面说的是结果。"),
+        ("短句阅读 2", "Lily is tired because she studied late. Lily 为什么累？", "学习到很晚", "because 后面是原因。"),
+        ("短句阅读 3", "The shop closes at eight, but we arrived at nine. 我们到时商店怎么样？", "关门了", "arrived 比 closes 晚。"),
+        ("短句阅读 4", "Jack took an umbrella because it was raining. Jack 为什么带伞？", "下雨", "because 后面是原因。"),
+        ("短句阅读 5", "Amy wants tea, not coffee. Amy 想喝什么？", "茶", "not 后面排除 coffee。"),
+    ],
+    "listening": [
+        ("短句听力 1", "刚才那句里，她下课后要去哪？", "图书馆", "注意 after class 后面的地点。", "She is going to the library after class."),
+        ("短句听力 2", "刚才那句里，他周末做什么？", "看望奶奶", "注意 weekend 的动作。", "He will visit his grandmother this weekend."),
+        ("短句听力 3", "刚才那句里，会议几点开始？", "三点", "听时间。", "The meeting starts at three o'clock."),
+        ("短句听力 4", "刚才那句里，她为什么晚到？", "错过了火车", "注意 because 后面的原因。", "She was late because she missed the train."),
+        ("短句听力 5", "刚才那句里，他们晚饭吃什么？", "面条", "听 dinner 后面的食物。", "They are having noodles for dinner."),
+    ],
+}
+
 
 def _extract_json_list(raw: str):
     text = raw or ""
@@ -98,6 +123,8 @@ def read_aloud_text(card: dict) -> str:
     """朗读文本：先读例句，再把单词重读两遍（实测该写法合成的英文最清晰）。"""
     word = card.get("content") or card.get("word") or ""
     extra = card.get("extra") or {}
+    if extra.get("learning_focus"):
+        return extra.get("listen_text") or ""
     example = extra.get("example_en") or card.get("example_en") or ""
     parts = []
     if example:
@@ -125,6 +152,18 @@ def start_session(user_id: str, goal=None, planned_minutes: int = 0, task_id=Non
     if session_id is None:
         return {}
     return adb.get_session(session_id)
+
+
+def set_session_focus(session_id: int, focus: str) -> bool:
+    """将本次会话锁定在一个方向，避免语法练到一半又跳回单词。"""
+    return adb.update_session(session_id, summary="focus:%s" % (focus or "vocabulary"))
+
+
+def session_focus(session: dict) -> str:
+    summary = (session or {}).get("summary") or ""
+    if summary.startswith("focus:"):
+        return summary.split(":", 1)[1] or "vocabulary"
+    return "vocabulary"
 
 
 def pause_session(session_id: int, done: int = 0, total: int = 0) -> bool:
@@ -199,9 +238,12 @@ def record_answer(user_id: str, knowledge_id: int, correct: bool) -> dict:
                          status=status, next_review=next_review,
                          last_seen=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     adb.add_review_record(user_id, knowledge_id, "correct" if correct else "wrong", step)
-    if (item.get("subject") or "").lower() == "english":
-        # 词卡不是全部英语能力，但它是词汇维度的一条真实长期证据。
-        ep.record_practice_result(user_id, "vocabulary", correct, source="word_card")
+    subject = (item.get("subject") or "").lower()
+    if subject == "english" or subject.startswith("english_"):
+        # 词卡、语法、阅读、听力分别回灌对应维度；不再把所有表现都误算成词汇。
+        dimension = subject.split("_", 1)[1] if "_" in subject else "vocabulary"
+        ep.record_practice_result(user_id, dimension, correct,
+                                  source="word_card" if dimension == "vocabulary" else "practice")
     return {"mastery": round(mastery, 3), "status": status, "next_review": next_review,
             "correct_count": correct_count, "wrong_count": wrong_count}
 
@@ -217,6 +259,8 @@ def session_progress(session_id: int) -> dict:
 def describe_card(card: dict) -> str:
     """词卡的事实文本（供人设链路引用，不作为最终回复直接发出）。"""
     extra = card.get("extra") or {}
+    if extra.get("learning_focus"):
+        return extra.get("prompt") or card.get("content") or ""
     parts = [card.get("content") or ""]
     if extra.get("phonetic"):
         parts.append(extra["phonetic"])
@@ -227,13 +271,38 @@ def describe_card(card: dict) -> str:
     return " ".join(parts)
 
 
-def next_card(user_id: str, goal_id=None) -> dict:
+def next_card(user_id: str, goal_id=None, focus: str = "vocabulary") -> dict:
     """取下一个该学的词（优先没学过的，其次最不熟的）。"""
-    pool = adb.list_knowledge(user_id, goal_id=goal_id, limit=200)
+    subject = "english" if focus == "vocabulary" else "english_%s" % focus
+    pool = [row for row in adb.list_knowledge(user_id, goal_id=goal_id, limit=200)
+            if (row.get("subject") or "").lower() == subject]
     unseen = [row for row in pool if row.get("status") == "unknown"]
     if unseen:
         return unseen[0]
     return pool[0] if pool else {}
+
+
+async def ensure_focus_pool(user_id: str, goal, focus: str, llm_call=None,
+                            want: int = WORDS_PER_SESSION) -> list:
+    """准备语法/阅读/听力小练习；答案同样进入知识点与复习机制。"""
+    focus = focus if focus in _FOCUS_ITEMS else "grammar"
+    goal_id = (goal or {}).get("id")
+    subject = "english_%s" % focus
+    pool = [row for row in adb.list_knowledge(user_id, goal_id=goal_id, limit=200)
+            if (row.get("subject") or "").lower() == subject]
+    unseen = [row for row in pool if row.get("status") == "unknown"]
+    if len(unseen) >= want:
+        return unseen[:want]
+    for item in _FOCUS_ITEMS[focus]:
+        title, prompt, answer, explanation, *listen_text = item
+        adb.add_knowledge(
+            user_id, title, answer=answer, subject=subject, goal_id=goal_id,
+            extra={"learning_focus": focus, "prompt": prompt, "explanation": explanation,
+                   "listen_text": listen_text[0] if listen_text else ""},
+        )
+    pool = [row for row in adb.list_knowledge(user_id, goal_id=goal_id, limit=200)
+            if (row.get("subject") or "").lower() == subject]
+    return [row for row in pool if row.get("status") == "unknown"][:want]
 
 
 # =============================================================================
@@ -251,6 +320,8 @@ def build_question(card: dict, mastery: float = 0.0) -> str:
     word = card.get("content") or ""
     extra = card.get("extra") or {}
     meaning = card.get("answer") or ""
+    if extra.get("learning_focus"):
+        return extra.get("prompt") or word
     if mastery >= 0.5:
         return "「%s」用英语怎么说？" % meaning if meaning else "这个词用英语怎么说？"
     if extra.get("example_en") and mastery < 0.2:
@@ -360,6 +431,21 @@ def step_instruction(verdict: dict) -> str:
     extra = card.get("extra") or {}
     example = extra.get("example_en") or ""
     kind = verdict.get("verdict")
+    if extra.get("learning_focus"):
+        focus_name = {"grammar": "语法", "reading": "阅读", "listening": "听力"}.get(
+            extra.get("learning_focus"), "英语")
+        prompt = extra.get("prompt") or word
+        explanation = extra.get("explanation") or ""
+        if kind == "correct":
+            return (f"他刚才把这道{focus_name}小练习答对了。夸他一句，然后自然带到下一个，"
+                    "不要重复讲成长篇课程。")
+        if kind == "retry":
+            hint = verdict.get("hint") or explanation
+            return (f"他这道{focus_name}小练习还没想起来（题目是：{prompt}）。"
+                    f"给一个不直接报答案的小提示：{hint}，然后等他再试。")
+        if kind == "explain":
+            return (f"他连着两次卡在这道{focus_name}小练习（题目是：{prompt}，答案是「{meaning}」）。"
+                    f"现在用生活化的方式讲清楚：{explanation}，一次只讲这一个点。")
     if kind == "correct":
         return (f"他刚才答对了（「{word}」）。用你自己的语气夸他一句，很短，"
                 "然后说接着下一个；不要重复讲这个词的知识点。")
@@ -387,15 +473,22 @@ def review_queue(user_id: str, limit: int = 3) -> list:
 def session_seen(user_id: str, session: dict) -> list:
     """本次会话里已经考过的知识点（按 last_seen 判断，重启也不丢）。"""
     started = (session or {}).get("started_at") or ""
+    focus = session_focus(session)
+    subject = "english" if focus == "vocabulary" else "english_%s" % focus
     return [row for row in adb.list_knowledge(user_id, limit=200)
+            if (row.get("subject") or "").lower() == subject
             if row.get("last_seen") and str(row["last_seen"]) >= started]
 
 
 def pick_next_for_session(user_id: str, session: dict, goal_id=None) -> dict:
     """下一次要考的内容：先复习到期的，再学没学过的，最后挑最不熟的。"""
-    pool = adb.list_knowledge(user_id, goal_id=goal_id, limit=200)
+    focus = session_focus(session)
+    subject = "english" if focus == "vocabulary" else "english_%s" % focus
+    pool = [row for row in adb.list_knowledge(user_id, goal_id=goal_id, limit=200)
+            if (row.get("subject") or "").lower() == subject]
     seen_ids = {row["id"] for row in session_seen(user_id, session)}
-    due = [row for row in adb.due_reviews(user_id, limit=10) if row["id"] not in seen_ids]
+    due = [row for row in adb.due_reviews(user_id, limit=20)
+           if row["id"] not in seen_ids and (row.get("subject") or "").lower() == subject]
     if due:
         return due[0]
     unseen = [row for row in pool if row.get("status") == "unknown" and row["id"] not in seen_ids]
