@@ -80,6 +80,11 @@ def _get_conn() -> sqlite3.Connection:
                 " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
             )
             _conn.execute(
+                "CREATE TABLE IF NOT EXISTS life_routine_delivery ("
+                " routine_day TEXT NOT NULL, routine_key TEXT NOT NULL, sent_at REAL NOT NULL,"
+                " PRIMARY KEY (routine_day, routine_key))"
+            )
+            _conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_life_plan_due "
                 "ON life_plan(status, start_at)"
             )
@@ -163,7 +168,7 @@ def _schedule_snapshot(now: datetime) -> dict:
                     ("宿舍", "看番", "睡前看一会儿番")]
     else:
         slot, start, end = "night", 1380, 1440
-        variants = [("宿舍", "休息", "深夜窝在床上准备睡觉")]
+        variants = [("宿舍", "睡觉", "已经睡着了")]
     location, activity, detail = _day_seed(now, slot).choice(variants)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return {
@@ -313,6 +318,61 @@ def schedule_plan(activity: str, start_at: datetime, duration_seconds: int = 0,
         )
         conn.commit()
         return int(cur.lastrowid)
+
+
+def own_routine_candidate(now: datetime = None) -> dict:
+    """返回她自己作息触发的早安或晚安候选。
+
+    这套时间只由角色生活线决定，不读取用户活跃度、睡眠推断或学习进度。每天在小窗口
+    内有轻微但稳定的变化，重启也不会让同一天的时间来回跳。
+    """
+    now = now or datetime.now()
+    minute = now.hour * 60 + now.minute
+    seed = _day_seed(now, "own_routine")
+    wake_minute = 390 + seed.randint(8, 26)      # 06:38–06:56
+    sleep_notice_minute = 1335 + seed.randint(6, 25)  # 22:21–22:40
+    if wake_minute <= minute < wake_minute + 90:
+        return {"key": "morning", "day": now.strftime("%Y-%m-%d"),
+                "scheduled_minute": wake_minute}
+    # 晚安发生在她准备睡觉时，23:00 后生活线会自然切换为“睡觉”。
+    if sleep_notice_minute <= minute < 1380:
+        return {"key": "night", "day": now.strftime("%Y-%m-%d"),
+                "scheduled_minute": sleep_notice_minute}
+    return {}
+
+
+def own_routine_sent(candidate: dict) -> bool:
+    """同一天的同一件生活小事只发一次。"""
+    if not candidate:
+        return False
+    conn = _get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT 1 FROM life_routine_delivery WHERE routine_day=? AND routine_key=?",
+            (str(candidate.get("day") or ""), str(candidate.get("key") or "")),
+        ).fetchone()
+    return bool(row)
+
+
+def mark_own_routine_sent(candidate: dict, now: datetime = None) -> bool:
+    """在消息实际发送成功后记录，失败时仍可在当日窗口内重试。"""
+    if not candidate:
+        return False
+    conn = _get_conn()
+    with _lock:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO life_routine_delivery (routine_day, routine_key, sent_at) "
+                "VALUES (?, ?, ?)",
+                (str(candidate.get("day") or ""), str(candidate.get("key") or ""),
+                 (now or datetime.now()).timestamp()),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            conn.rollback()
+            logger.warning("记录生活仪式发送状态失败: %s", exc)
+            return False
 
 
 def get_next_plan(now: datetime = None) -> dict:

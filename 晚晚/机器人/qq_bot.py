@@ -523,6 +523,7 @@ class QQGirlfriendBot:
         # 用于跨系统防轰炸；不再使用固定的"道晚安静默"变量，作息改由时间戳+内容推断。
         self._last_proactive_any = {}
         self._schedule_task = None
+        self._routine_task = None
         self._diary_task = None
         self._pstate_task = None
         self._evolution_task = None
@@ -801,6 +802,9 @@ class QQGirlfriendBot:
         self._ritual_task = asyncio.create_task(self._daily_ritual_loop())
         self._murmur_task = asyncio.create_task(self._murmur_loop())
         self._idle_murmur_task = asyncio.create_task(self._idle_murmur_loop())
+        # 她自己的作息：醒来和准备睡觉时各有一次生活化的主动消息，不跟随用户作息。
+        self._routine_task = asyncio.create_task(self._own_routine_loop()) \
+            if runtime.LIVENESS_ENABLED else None
         # 助理系统定时任务：日程到点提醒（每 5 分钟扫描一次，优先级高于普通主动消息）
         self._schedule_task = asyncio.create_task(self._schedule_reminder_loop()) \
             if schedule_manager is not None else None
@@ -858,13 +862,13 @@ class QQGirlfriendBot:
         for task in (self._diary_task, self._pstate_task, self._evolution_task,
                      self._pull_task, self._qzone_task, self._catchup_task,
                      self._ritual_task, self._murmur_task, self._idle_murmur_task,
-                     self._schedule_task, self._backfill_task):
+                     self._routine_task, self._schedule_task, self._backfill_task):
             if task:
                 task.cancel()
         self._diary_task = self._pstate_task = self._evolution_task = None
         self._pull_task = self._qzone_task = self._catchup_task = None
         self._ritual_task = self._murmur_task = self._idle_murmur_task = None
-        self._schedule_task = None
+        self._routine_task = self._schedule_task = None
         self._backfill_task = None
         # 停止/重启前：把内存中所有用户的对话上下文全量落盘，
         # 保证下次启动能接上（消息已实时落盘，这里是双保险，覆盖异常路径）
@@ -1692,8 +1696,9 @@ class QQGirlfriendBot:
         prompt = (
             f"（内部信息，不是他发的消息）他之前让你提醒的日程快到点了：{item.get('title')}，"
             f"时间 {when or item.get('start')}。现在用你自己的语气提醒他一句，"
-            "一句话就好；可以带一点你的性格和情绪，不要罗列时间字段，不要像闹钟。"
-            "如果他此刻可能刚醒或还在忙，语气自然些，不要责备。"
+            "这件事是他交给你记着、让你盯着的。用你自己的语气提醒他一句，"
+            "别像闹钟；若这是学习或复习，就给一个清楚、能立刻开始的小动作，"
+            "带一点监督感但不唠叨。若他正在忙，就先问一句是否需要你帮他顺延。"
         )
         messages = self._memory.get_messages(user_id)
         messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
@@ -1771,6 +1776,62 @@ class QQGirlfriendBot:
                 continue
             await self._send_schedule_reminder(target, item)
             break  # 一轮只提醒一条，避免连发
+
+    async def _own_routine_loop(self):
+        """每分钟检查她自己的起床、睡前生活事件，不参考用户作息。"""
+        while True:
+            try:
+                await self._own_routine_tick()
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("个人作息检查异常:\n%s", traceback.format_exc())
+                await asyncio.sleep(60)
+
+    async def _own_routine_tick(self):
+        """醒来发早安、睡前发晚安；仅由 life_state 的独立作息决定。"""
+        if not self._ws or not runtime.LIVENESS_ENABLED:
+            return
+        target = self._boyfriend_uin()
+        if not target or target in self._dead_users:
+            return
+        candidate = life_state.own_routine_candidate()
+        if not candidate or life_state.own_routine_sent(candidate):
+            return
+        event = candidate.get("key")
+        detail = (
+            "你刚按自己的作息醒来，正在洗漱收拾。现在主动发一句早安。"
+            "这不是根据他的在线时间或作息推断出来的；不要问他醒没醒，也不要顺势布置学习。"
+            if event == "morning" else
+            "你今晚按自己的作息准备睡觉。现在主动和他道晚安。"
+            "这是你要睡前自然说的话，不根据他的作息决定；不要催他立刻睡，也不要布置学习。"
+        )
+        try:
+            async with self._get_lock(target):
+                # 锁等待期间可能已由同一日另一轮写入，发送前再确认一次。
+                if life_state.own_routine_sent(candidate):
+                    return
+                messages = [{"role": "system", "content": build_system_prompt() + "\n\n"
+                             + SHORT_REPLY_REMINDER + self._relationship_prompt(target)
+                             + life_state.prompt_injection()}]
+                messages.append({"role": "user", "content": "（内部信息，不是他发的消息）" + detail})
+                reply = (await self._deepseek.chat(messages, temperature=0.82, max_tokens=80)).strip()
+                if not reply:
+                    reply = "早呀，我刚醒" if event == "morning" else "我先睡啦，晚安"
+                # 不经过用户作息闸门：这是她自己的生活事件；成功后仍写入全局冷却，防止叠发。
+                sent = await self._reply_split("private", target, target, 0, reply, force_voice=False)
+                if not sent:
+                    return
+                life_state.mark_own_routine_sent(candidate)
+                self._mark_proactive_sent(target)
+                self._memory.add_message(target, "assistant", sent)
+                longterm_memory.add_chat_history(target, "assistant", sent)
+                logger.info("个人作息消息已发送 [%s] %s", target, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("个人作息消息发送失败 [%s]: %s", target, exc)
 
     # ============ 学习会话（Phase 3：目标 / 任务 / 会话 / 语音读词） ============
 

@@ -222,6 +222,13 @@ def test_growth():
     assert life_state.get_snapshot(base_time + timedelta(minutes=16))["activity"] == "洗澡"
     assert life_state.get_snapshot(base_time + timedelta(minutes=51))["activity"] == "吹头发"
     assert "生活线" in life_state.status_line(base_time + timedelta(minutes=16))
+    # 她自己的起床/睡前仪式只看生活线，不依赖用户作息或学习状态。
+    own_morning = life_state.own_routine_candidate(datetime(2026, 9, 11, 8, 0, 0))
+    own_night = life_state.own_routine_candidate(datetime(2026, 9, 11, 22, 50, 0))
+    assert own_morning.get("key") == "morning" and own_night.get("key") == "night"
+    assert not life_state.own_routine_sent(own_morning)
+    assert life_state.mark_own_routine_sent(own_morning)
+    assert life_state.own_routine_sent(own_morning)
     # 对话决策层：连续消息整体理解，严肃问题收敛动作，轻松互动才开放相应出口。
     urgent_plan = dialogue_policy.plan_turn("我现在很难受\n有点撑不住了")
     assert urgent_plan.multi_message and urgent_plan.intent in ("紧急关怀", "倾诉安慰")

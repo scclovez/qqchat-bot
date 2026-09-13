@@ -46,7 +46,7 @@ def _seed_regular_days(user_id: str, days: int, wake_hour: int = 8, last_msg_hou
     last_msg_hour < 4 时算作次日的凌晨消息（与真实熬夜跨零点一致）。
     全部样本至少落在 2 天前，确保不会被"15 分钟内说过话=清醒"的硬规则命中。
     """
-    now = datetime.now()
+    now = datetime.now().replace(minute=15, second=0, microsecond=0)
     for offset in range(2, days + 2):
         day = (now - timedelta(days=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -148,7 +148,7 @@ def test_active_user_is_not_sleeping():
     bp.clear_cache(user)
     _seed_regular_days(user, 8, wake_hour=8, last_msg_hour=0)
     bp.recompute(user, force=True)
-    now = datetime.now().replace(hour=3, minute=0, second=0, microsecond=0)
+    now = datetime.now().replace(minute=15, second=0, microsecond=0).replace(hour=3, minute=0, second=0, microsecond=0)
     before = bp.infer_user_state(user, now)
     assert before["state"] == "likely_sleeping", before
     bp.observe_inbound(user, "在吗，睡不着", ts=now.timestamp())
@@ -207,7 +207,7 @@ def test_hint_detection_and_prompt():
 def test_schedule_parse_rules():
     """自然语言日程解析：明天/每天/周五、口语时刻、问句不误判。"""
     import schedule_manager as sm
-    now = datetime.now()
+    now = datetime.now().replace(minute=15, second=0, microsecond=0)
     tomorrow = now + timedelta(days=1)
     parsed = sm.parse_text("明天下午三点有课", now)
     assert parsed, "明天下午三点有课 应能解析"
@@ -257,7 +257,7 @@ def test_schedule_reminder_dedup():
     """到点提醒只发一次（防止同一日程反复轰炸）。"""
     import schedule_manager as sm
     user = "test_schedule_remind"
-    now = datetime.now()
+    now = datetime.now().replace(minute=15, second=0, microsecond=0)
     start = now + timedelta(minutes=20)
     sid = adb.add_schedule(user, "开会", start_time=start.strftime("%Y-%m-%d %H:%M:%S"),
                            source="user", remind_before=30)
@@ -491,7 +491,7 @@ def test_active_study_pauses_for_user_state():
 def test_checkin_verification_engine():
     """打卡由代码判定：低置信度不自动完成、日期不符不算、部分完成记进度。"""
     import image_verifier as iv
-    now = datetime.now()
+    now = datetime.now().replace(minute=15, second=0, microsecond=0)
     today = now.strftime("%Y-%m-%d")
     ok = iv.verify_checkin({"date": today, "count": 50, "target": 50}, 0.92, {})
     assert ok["verified"] is True and ok["progress"] == 1.0
@@ -557,7 +557,7 @@ def test_history_backfill():
     db_path = os.path.join(os.environ["DSH_DATA_ROOT"], "晚晚", "数据", "bot_memory.db")
     import sqlite3
     conn = sqlite3.connect(db_path)
-    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    now = datetime.now().replace(minute=15, second=0, microsecond=0).replace(minute=0, second=0, microsecond=0)
     rows = []
     for offset in range(2, 14):
         for hour, minute in ((8, 0), (12, 30), (23, 0)):
@@ -617,7 +617,7 @@ def test_emotion_history_and_block_log():
     import assistant_db as adb2
     from qq_bot import QQGirlfriendBot, PRIORITY_PROACTIVE, PRIORITY_EXAM
     user = "test_emotion_curve"
-    now = datetime.now()
+    now = datetime.now().replace(minute=15, second=0, microsecond=0)
     assert eh.record(user, {"happy": 20, "angry": 0, "hurt": 0, "tired": 10}, ts=now.timestamp())
     assert eh.record(user, {"happy": 55, "angry": 5, "hurt": 0, "tired": 10},
                      ts=(now + timedelta(minutes=10)).timestamp())
