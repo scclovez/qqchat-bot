@@ -829,6 +829,40 @@ def test_word_pool_drops_meta_vocabulary():
     assert not ss.usable_word("verb") and not ss.usable_word("the")
 
 
+def test_study_facts_survive_send_splitting():
+    """回归：教学事实句经发送链路分条后必须完整（真机上被按 30 字硬切）。
+
+    真机现象（2026-09-13 23:25）：「improve | /ɪmˈpruːv/ | 释义：改善，提」+
+    「高 | 例句：I want to improve my En」——释义被劈开、例句被丢掉。
+    """
+    import study_session as ss
+    from qq_bot import split_reply_text, LEARN_MSG_LEN, LEARN_REPLY_LEN
+    card = {
+        "id": 9002, "content": "improve", "answer": "改善，提高", "subject": "english",
+        "extra": {"phonetic": "/ɪmˈpruːv/", "example_en": "I want to improve my English.",
+                  "example_cn": "我想提高我的英语。"},
+    }
+    fact = ss.fact_line(card)
+    # 旧上限（30/72）会丢内容，新上限（学习专用）不会
+    old = "\n".join(split_reply_text(fact))
+    assert "example" in ss.missing_facts(card, old, ["word", "phonetic", "example"]), \
+        "旧上限确实会切掉例句（这条回归断言防止上限被改回去）"
+    sent = "\n".join(split_reply_text(fact, max_msg_len=LEARN_MSG_LEN, max_total=LEARN_REPLY_LEN))
+    assert ss.missing_facts(card, sent, ["word", "phonetic", "example"]) == [], sent
+    assert "improve" in sent and "I want to improve my English." in sent and "ɪmˈpruːv" in sent
+    assert "改善，提高" in sent, "释义不能被切一半"
+    # 不能把英文单词切成两半
+    for part in split_reply_text(fact, max_msg_len=LEARN_MSG_LEN, max_total=LEARN_REPLY_LEN):
+        assert not part.endswith("En") and "En " not in part, part
+    # 出场模板同样要完整送达，且不含释义
+    present = ss.present_template(card, "好呀，来看这个")
+    parts = split_reply_text(present, max_msg_len=LEARN_MSG_LEN, max_total=LEARN_REPLY_LEN)
+    joined = "\n".join(parts)
+    assert "improve" in joined and "I want to improve my English" in joined
+    assert "改善" not in joined and "提高" not in joined, "出场时不能先给答案"
+    assert ss.missing_facts(card, joined, ["word", "phonetic", "example"]) == []
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -864,6 +898,7 @@ def run_into(check):
     check("学习文案不换词不泄露", test_study_facts_never_leak_or_swap_words)
     check("学习会话不悬空", test_study_session_never_stays_stuck)
     check("词池剔除元词汇", test_word_pool_drops_meta_vocabulary)
+    check("学习事实不被发送截断", test_study_facts_survive_send_splitting)
 
 
 def main():

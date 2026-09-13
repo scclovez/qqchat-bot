@@ -214,19 +214,62 @@ def fact_line(card: dict) -> str:
     return " | ".join(part for part in parts if part)
 
 
+def _squash(text: str) -> str:
+    """去掉空白与标点后再比对（发送链路会整理标点，不该因此误判"事实丢了"）。"""
+    return re.sub(r"[\s，。、；：,.;:!！?？…\"'“”‘’（）()\[\]「」/|·-]", "", text or "")
+
+
+def _has_phonetic(text: str, phonetic: str) -> bool:
+    """音标可能被发送链路的标点整理改过（'·' 之类），只比对纯字母数字部分。"""
+    wanted = re.sub(r"[^0-9a-z]", "", (phonetic or "").lower())
+    return len(wanted) >= 2 and wanted in re.sub(r"[^0-9a-z]", "", (text or "").lower())
+
+
+def missing_facts(card: dict, sent_text: str, expect: list = None) -> list:
+    """发送后校验：这一轮必须送达的事实是不是真的发出去了（防发送链路截断）。
+
+    真机事故：词卡事实句被按 30 字硬切，"释义：改善，提高"被切成"…改善，提"，
+    例句整段被丢掉，用户在手机上看到的就是半截话。
+    """
+    value = sent_text or ""
+    text = _squash(value)
+    word = (card or {}).get("content") or ""
+    extra = (card or {}).get("extra") or {}
+    lost = []
+    for item in expect or []:
+        if item == "word":
+            if word and word.lower() not in value.lower():
+                lost.append("word:" + word)
+        elif item == "answer":
+            if (card or {}).get("answer") and card["answer"] not in value:
+                lost.append("answer")
+        elif item == "example":
+            example = _squash(extra.get("example_en"))
+            if example and example not in text:
+                lost.append("example")
+        elif item == "prompt":
+            prompt = _squash(extra.get("prompt"))
+            if prompt and prompt not in text:
+                lost.append("prompt")
+        elif item == "phonetic":
+            if extra.get("phonetic") and not _has_phonetic(value, extra["phonetic"]):
+                lost.append("phonetic")
+    return lost
+
+
 def present_template(card: dict, lead: str = "") -> str:
     """出场文案的模板兜底：一定包含词形与例句，不含答案。"""
     word = (card or {}).get("content") or ""
     extra = (card or {}).get("extra") or {}
     if extra.get("learning_focus"):
         return "%s，来看这道题：%s。你先说说看" % (lead or "好，接着来", extra.get("prompt") or word)
-    head = "%s，我们看这一个：%s" % (lead or "好", word)
+    head = "%s，我们看这一个：%s。" % (lead or "好", word)
     if extra.get("phonetic"):
-        head += " %s" % extra["phonetic"]
+        head += "%s。" % extra["phonetic"]
     example = (extra.get("example_en") or "").rstrip(".?!")
     if example:
-        head += "。例句 %s" % example
-    return head + "。念两遍给你听"
+        head += "例句 %s。" % example
+    return head + "念两遍给你听"
 
 
 def explain_template(card: dict, lead: str = "") -> str:
@@ -238,11 +281,11 @@ def explain_template(card: dict, lead: str = "") -> str:
         return "%s，这题是「%s」，答案是「%s」。%s" % (
             lead or "没事", extra.get("prompt") or word, meaning,
             (extra.get("explanation") or "").rstrip("。") + "。")
-    text = "%s，「%s」就是「%s」的意思" % (lead or "没事", word, meaning)
+    text = "%s，「%s」就是「%s」的意思。" % (lead or "没事", word, meaning)
     example = (extra.get("example_en") or "").rstrip(".?!")
     if example:
-        text += "，例句是 %s" % example
-    return text + "。记住了没"
+        text += "例句是 %s。" % example
+    return text + "记住了没"
 
 
 def retry_template(card: dict, lead: str = "", hint: str = "") -> str:

@@ -136,6 +136,11 @@ MAX_REPLY_LEN = 72
 # 这是防刷屏的保护上限，不是默认回复条数；正常回复由模型按语义决定是否分条。
 MAX_REPLY_PARTS = 3
 
+# 学习内容（词卡事实句 / 提问原文）的发送上限：这些是"必须原样送达"的教学内容，
+# 不能被"像聊天那样短"的默认上限截断，否则词形、释义、问句会被切碎甚至丢掉。
+LEARN_MSG_LEN = 46
+LEARN_REPLY_LEN = 200
+
 # 私聊连续消息收束上限：每次新消息都重新计时；完整句会更早收束，碎片最多等 6 秒。
 MESSAGE_DEBOUNCE_SECONDS = 6.0
 
@@ -423,23 +428,45 @@ FACE_IDS += [6, 13, 21, 63, 66, 76, 85, 106, 107, 109, 116] * 2
 
 
 def _split_long_segment(text: str, limit: int) -> list[str]:
-    """把超长段落拆成短段：优先在句末标点处断句，单句仍超长时硬切。"""
+    """把超长段落拆成短段：优先句末标点，其次词/短语边界，绝不把词切一半。
+
+    真机事故（2026-09-13 23:25）：词卡"improve | /ɪmˈpruːv/ | 释义：改善，提高 | 例句…"
+    被硬切成「…释义：改善，提」+「高 | 例句：I want to improve my En」——中文字被劈开、
+    英文单词被劈成 "En"，例句尾巴直接被丢掉。
+    """
+    min_break = max(6, limit // 2)
     pieces, buf = [], ""
     for ch in text:
         buf += ch
-        if ch in _SENTENCE_END and len(buf) >= max(10, limit // 2):
+        if ch in _SENTENCE_END and len(buf) >= min_break:
             pieces.append(buf)
             buf = ""
     if buf:
         pieces.append(buf)
     out = []
-    for p in pieces:
-        while len(p) > limit:
-            out.append(p[:limit].rstrip())
-            p = p[limit:].lstrip()
-        if p:
-            out.append(p)
-    return out
+    for piece in pieces:
+        rest = piece.strip()
+        while len(rest) > limit:
+            cut = _best_break(rest, limit)
+            out.append(rest[:cut].strip())
+            rest = rest[cut:].strip()
+        if rest:
+            out.append(rest)
+    return [part for part in out if part]
+
+
+def _best_break(text: str, limit: int) -> int:
+    """在 limit 之内挑一个不破坏语义的断开点；实在没有才硬切。"""
+    window = text[:limit + 1]
+    for marks in ("，,、；;：:", " \t"):
+        for index in range(len(window) - 1, 0, -1):
+            if window[index] in marks and index + 1 >= max(6, limit // 3):
+                return index + 1
+    # 英文优先按词断开：回退到窗口内最后一个空格
+    space = window.rfind(" ")
+    if space >= max(4, limit // 4):
+        return space + 1
+    return limit
 
 
 def _normalize_outgoing_text(text: str) -> str:
@@ -475,17 +502,21 @@ def split_reply_text(text: str, max_msg_len: int = MAX_MSG_LEN,
 
     - 先按任意换行拆分
     - 波浪号不作为分条符；发送前会删除或改成普通停顿
-    - 单段超过 max_msg_len 时按句末标点二次切分
+    - 单段超过单条上限时按句末标点/词边界二次切分（不会把词切一半）
     - 累计超过 max_total 或达到防刷屏上限时丢弃剩余部分
     - 极小上限也至少保留一个截短后的片段，不产生空回复
     """
     text = _normalize_outgoing_text(text)
     line_parts = [p.strip() for p in re.split(r"\n+", text)]
     line_parts = [p for p in line_parts if p]
+    # 总预算够用时，按"总预算/允许条数"放宽单条长度，避免明明还有额度
+    # 却被单条上限掐断（教学事实句就是这样被切碎的）
+    per_msg = max(1, int(max_total) // max(1, int(max_parts))) if max_total else max_msg_len
+    limit = max(int(max_msg_len), per_msg)
     parts = line_parts
     result, total = [], 0
     for p in parts:
-        segs = [p] if len(p) <= max_msg_len else _split_long_segment(p, max_msg_len)
+        segs = [p] if len(p) <= limit else _split_long_segment(p, limit)
         for s in segs:
             if total + len(s) > max_total:
                 if not result and max_total > 0:
@@ -1840,7 +1871,7 @@ class QQGirlfriendBot:
                 continue
             sent = await self._reply_split(
                 "private", user_id, user_id, 0, reply, force_voice=False,
-                expected_revision=None)
+                expected_revision=None, max_msg_len=LEARN_MSG_LEN, max_total=LEARN_REPLY_LEN)
             if sent:
                 logger.info("学习会话静置收尾已通知 [%s]", user_id)
 
@@ -2166,16 +2197,14 @@ class QQGirlfriendBot:
             facts=self._verdict_fact(card, verdict), asked=asked,
             hint=verdict.get("hint") or "")
         if not reply:
-            reply = study_session.present_template(card) if event == "explain" else ""
+            reply = study_session.fallback_template(card, event=event)
         self._memory.add_message(user_id, "user", text)
         longterm_memory.add_chat_history(user_id, "user", text)
-        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
-                                       force_voice=False, expected_revision=turn_revision)
-        if sent:
-            self._memory.add_message(user_id, "assistant", sent)
-            longterm_memory.add_chat_history(user_id, "assistant", sent)
-        logger.info("学习作答 [%s] 词=%s 判分=%s 已回复=%s", user_id,
-                    card.get("content"), verdict.get("verdict"), bool(sent))
+        expect = ["answer"] if event in ("explain", "repeat") else []
+        await self._send_study_text(msg_type, target_id, user_id, message_id, reply,
+                                    turn_revision, card, expect)
+        logger.info("学习作答 [%s] 词=%s 判分=%s", user_id,
+                    card.get("content"), verdict.get("verdict"))
         if verdict.get("verdict") in ("correct", "explain", "repeat"):
             await self._advance_study(msg_type, target_id, user_id, message_id, turn_revision)
         return True
@@ -2190,6 +2219,35 @@ class QQGirlfriendBot:
         if verdict.get("verdict") == "correct":
             return ""
         return study_session.fact_line(card)
+
+    async def _send_study_text(self, msg_type, target_id, user_id, message_id, text,
+                               turn_revision, card, expect=None):
+        """按段发送学习文案，并回头校验"必须送达的事实"有没有被截断。
+
+        按空行分成几条发，而不是让切分器把一段话切碎——教学事实必须是完整句子
+        （真机上出现过"…释义：改善，提" + "高 | 例句：I want to improve my En"）。
+        """
+        blocks = [part.strip() for part in re.split(r"\n{2,}", (text or "").strip()) if part.strip()]
+        if not blocks:
+            return ""
+        sent_parts = []
+        for index, block in enumerate(blocks[:MAX_REPLY_PARTS]):
+            part = await self._reply_split(
+                msg_type, target_id, user_id, message_id if index == 0 else 0, block,
+                force_voice=False, expected_revision=turn_revision,
+                max_msg_len=LEARN_MSG_LEN, max_total=LEARN_REPLY_LEN)
+            if part:
+                sent_parts.append(part)
+        sent = "\n".join(sent_parts)
+        if sent:
+            self._memory.add_message(user_id, "assistant", sent)
+            longterm_memory.add_chat_history(user_id, "assistant", sent)
+        if card is not None:
+            lost = study_session.missing_facts(card, sent, expect)
+            if lost:
+                logger.warning("学习文案发送后被截断 [%s] 词=%s 丢失=%s",
+                               user_id, card.get("content"), "、".join(lost))
+        return sent
 
     async def _advance_study(self, msg_type, target_id, user_id, message_id, turn_revision):
         """推进到下一个内容；本次会话的内容过完就收尾（一次只推进一步）。"""
@@ -2224,7 +2282,7 @@ class QQGirlfriendBot:
         await self._present_word_card(msg_type, target_id, user_id, message_id, card,
                                       turn_revision, lead="下一个")
 
-    async def _ask_word(self, user_id, card, session_id):
+    async def _ask_word(self, user_id, card, session_id, turn_revision=None):
         """提出问题（问题原文由学习模块产出，逐字带出，绝不改写）。"""
         mastery = float(card.get("mastery") or 0)
         question = study_session.ask_question(session_id, card, mastery)
@@ -2245,9 +2303,9 @@ class QQGirlfriendBot:
             # 问题里同时出现词形和释义就等于送答案，退回不带释义的问法
             text = study_session.question_template(
                 "这个词用英语怎么说？" if mastery >= 0.5 else "这个词是什么意思？", lead)
-        await self._reply_split("private", user_id, user_id, 0, text, force_voice=False)
-        self._memory.add_message(user_id, "assistant", text)
-        longterm_memory.add_chat_history(user_id, "assistant", text)
+        expect = ["word"] if word else ["prompt"]
+        await self._send_study_text("private", user_id, user_id, 0, text, turn_revision,
+                                    card, expect)
         logger.info("学习提问 [%s] kb=%s 词=%s", user_id, card.get("id"), word)
         return question
 
@@ -2318,13 +2376,10 @@ class QQGirlfriendBot:
                 else study_session.fact_line(card)
         reply = await self._study_reply_with_facts(
             user_id, instruction, event="present", card=card, facts=facts)
-        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
-                                       force_voice=False, expected_revision=turn_revision)
-        if sent:
-            self._memory.add_message(user_id, "assistant", sent)
-            longterm_memory.add_chat_history(user_id, "assistant", sent)
-        logger.info("学习出场 [%s] kb=%s 词=%s 已发送=%s", user_id, card.get("id"), word,
-                    bool(sent))
+        expect = ["prompt"] if focus else ["word", "phonetic", "example"]
+        await self._send_study_text(msg_type, target_id, user_id, message_id, reply,
+                                    turn_revision, card, expect)
+        logger.info("学习出场 [%s] kb=%s 词=%s", user_id, card.get("id"), word)
         # 语音：先把例句读一遍，再把单词重读两遍（实测该顺序合成最清晰）
         await self._speak_study_text(user_id, study_session.read_aloud_text(card))
         if word and not focus:
@@ -2339,7 +2394,7 @@ class QQGirlfriendBot:
         # 讲完立刻考他一个（引导式：一次只推进一步）
         session = adb_assistant.get_open_session(user_id)
         if session:
-            await self._ask_word(user_id, card, session["id"])
+            await self._ask_word(user_id, card, session["id"], turn_revision)
 
     async def _speak_study_text(self, user_id, text, instruct=""):
         """用现有 TTS 合成并发送语音条（学习朗读专用：音色仍是她）。"""
@@ -3522,7 +3577,8 @@ class QQGirlfriendBot:
 
     async def _reply_split(self, msg_type, target_id, user_id, message_id, text,
                            force_voice=None, dual_voice=False, context_text="",
-                           turn_plan=None, expected_revision=None, proactive_priority=None):
+                           turn_plan=None, expected_revision=None, proactive_priority=None,
+                           max_msg_len=None, max_total=None):
         """将回复按空行拆分为多条消息逐条发送。
 
         - 发送前按输入/回复长度和语境计算阅读、思考、打字时间
@@ -3533,6 +3589,7 @@ class QQGirlfriendBot:
         - expected_revision：私聊回复所属轮次；有更新消息时立即停止旧回复
         - proactive_priority：本条属"主动消息"时传入优先级；会在发送前过统一闸门
           （睡眠/忙碌推断 + 跨系统防轰炸），被压制则直接不发
+        - max_msg_len / max_total：教学类内容传入更宽松的上限，保证事实句不被截断
         """
         if self._turn_is_stale(user_id, expected_revision):
             return ""
@@ -3605,8 +3662,9 @@ class QQGirlfriendBot:
             text, _ = self._split_emotion_tag(text)
         parts = split_reply_text(
             text,
-            max_total=(max(MAX_MSG_LEN, min(MAX_REPLY_LEN, turn_plan.hard_max))
-                       if turn_plan is not None else MAX_REPLY_LEN),
+            max_msg_len=int(max_msg_len or MAX_MSG_LEN),
+            max_total=(max_total or (max(MAX_MSG_LEN, min(MAX_REPLY_LEN, turn_plan.hard_max))
+                                     if turn_plan is not None else MAX_REPLY_LEN)),
             max_parts=(turn_plan.max_parts if turn_plan is not None else MAX_REPLY_PARTS),
         )
         if not parts:

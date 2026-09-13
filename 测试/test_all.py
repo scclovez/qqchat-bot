@@ -128,6 +128,16 @@ def test_growth():
     parts = split_reply_text("第一句稍微有一点长，需要自然切开。\n第二句是补充。\n第三句。\n第四句不应发送。")
     assert 1 <= len(parts) <= 3 and all(len(part) <= 32 for part in parts)
     assert split_reply_text("好呀~我在呢～") == ["好呀，我在呢"]
+    # 截断回归（真机 2026-09-13 23:25）：单词不能被切一半，完整句子不能被丢掉
+    card_like = "improve | /ɪmˈpruːv/ | 释义：改善，提高 | 例句：I want to improve my English."
+    wide = split_reply_text(card_like, max_msg_len=46, max_total=200)
+    assert "improve" in "".join(wide) and "I want to improve my English." in "".join(wide)
+    assert all(part.strip().endswith(".") or part.strip() in card_like for part in wide)
+    assert not any(part.endswith("En") or part.startswith("glish") for part in wide)
+    # 单段没超上限时必须原样保留（旧逻辑会把第一段弄丢）
+    assert split_reply_text(card_like, max_msg_len=200, max_total=200) == [card_like]
+    # 总预算够用时按"总预算/条数"放宽单条上限，不再死守 30 字
+    assert len(split_reply_text(card_like)) >= 2
     image_followup = _compact_image_followup(
         "图片短评：刚才镜头有点歪，不过窗边那束暖光真的特别好看，像傍晚落在桌上的一小块糖。"
     )
@@ -345,7 +355,11 @@ def test_gui():
                 _rt.PROACTIVE_ONLY_USER_ID = "gui_status_user"
                 import assistant_db as _adb
                 from datetime import datetime as _dt, timedelta as _td
-                _start = (_dt.now() + _td(minutes=40)).strftime("%Y-%m-%d %H:%M:%S")
+                # 日程必须落在"今天"：临近零点时 +40 分钟会跨天，面板只统计今天 → 测试会假失败
+                _now = _dt.now()
+                _day_end = _now.replace(hour=23, minute=59, second=0, microsecond=0)
+                _start_dt = min(_now + _td(minutes=40), _day_end)
+                _start = _start_dt.strftime("%Y-%m-%d %H:%M:%S")
                 _adb.add_evidence("gui_status_user", "activity")
                 _adb.add_schedule("gui_status_user", "测试日程", start_time=_start,
                                   source="user", remind_before=15)
