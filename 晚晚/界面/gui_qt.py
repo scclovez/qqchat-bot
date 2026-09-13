@@ -25,7 +25,7 @@ import 路径  # noqa: E402
 from 路径 import PROJECT_ROOT, CODE_ROOT, DATA_ROOT, data_path, code_path, is_frozen  # noqa: E402
 
 from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QPoint, QRect, QUrl  # noqa: E402
-from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QPen  # noqa: E402
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
@@ -111,6 +111,7 @@ GROWTH_HINTS = {
     "coverage": "这些观察建立在多少天的数据上（启动时会自动读一遍已有聊天记录）",
     "emotion_bars": "持续情绪强度：会随时间自然衰减，不是只看这一句话的关键词（数值 0-100）",
     "heatmap": "近 7 天 × 24 小时的聊天活跃分布（按活跃日，凌晨 0-4 点算前一天）",
+    "emotion_curve": "近 24 小时的情绪走势（每小时采样一次）：橙=开心、红=生气、紫=委屈、蓝=疲惫",
 }
 
 # =============================================================================
@@ -467,6 +468,52 @@ class _ActivityHeatmap(QWidget):
         self._built = True
 
 
+class _EmotionCurve(QWidget):
+    """近 24 小时情绪曲线（四条折线：开心/生气/委屈/疲惫）。"""
+
+    COLORS = {"happy": "#e8a33d", "angry": "#d4655c", "hurt": "#8f7fd0", "tired": "#5b9be0"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._points = []
+        self.setMinimumHeight(118)
+
+    def set_series(self, points):
+        self._points = list(points or [])
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802  Qt 命名
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(4, 8, -4, -16)
+        painter.setPen(QPen(QColor("#dfe6ee"), 1, Qt.PenStyle.DotLine))
+        for frac in (0.25, 0.5, 0.75):
+            y = int(rect.bottom() - rect.height() * frac)
+            painter.drawLine(rect.left(), y, rect.right(), y)
+        if not self._points:
+            painter.setPen(QColor("#8b98a8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "还没有采样（聊几句就会出现）")
+            return
+        count = len(self._points)
+        step = rect.width() / max(1, count - 1)
+        for key, color in self.COLORS.items():
+            painter.setPen(QPen(QColor(color), 2))
+            last = None
+            for index, point in enumerate(self._points):
+                value = max(0.0, min(100.0, float(point.get(key) or 0)))
+                pos = (int(rect.left() + step * index),
+                       int(rect.bottom() - rect.height() * value / 100.0))
+                if last is not None:
+                    painter.drawLine(last[0], last[1], pos[0], pos[1])
+                last = pos
+        painter.setPen(QColor("#8b98a8"))
+        for index, point in enumerate(self._points):
+            if index % 6:
+                continue
+            painter.drawText(int(rect.left() + step * index) - 10,
+                             self.rect().bottom() - 3, str(point.get("label") or ""))
+
+
 # =============================================================================
 # 主窗口（无边框 + 自绘标题栏）
 # =============================================================================
@@ -719,7 +766,16 @@ class MainWindow(QMainWindow):
         outer.addWidget(_label("今日陪伴状态", "PageTitle"))
         outer.addWidget(_label("从此刻状态到长期成长，集中查看小晚今天与你相处的变化。", "Muted"))
 
-        growth, growth_lay = _card(tab, "状态总览")
+        # 内容较多 → 整页放进滚动区，卡片各取自然高度，不再挤在一起
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        scroll.setWidget(body)
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 6, 0)
+        body_lay.setSpacing(0)
+
+        growth, growth_lay = _card(body, "状态总览")
         grid = QGridLayout()
         grid.setContentsMargins(4, 4, 4, 4)
         grid.setHorizontalSpacing(8)
@@ -797,7 +853,9 @@ class MainWindow(QMainWindow):
         ], 1, 2)
         self._emotion_bars = _EmotionBars([("happy", "开心"), ("angry", "生气"),
                                            ("hurt", "委屈"), ("tired", "疲惫")])
-        add_custom_group("持续情绪", self._emotion_bars, "emotion_bars", 2, 0, 1, 3)
+        add_custom_group("持续情绪", self._emotion_bars, "emotion_bars", 2, 0)
+        self._emotion_curve = _EmotionCurve()
+        add_custom_group("情绪走势（近 24 小时）", self._emotion_curve, "emotion_curve", 2, 1, 1, 2)
 
         # ---------------- 今天 ----------------
         add_section("今天", 3)
@@ -814,7 +872,12 @@ class MainWindow(QMainWindow):
         ], 4, 2)
         add_metric_group("今天留下的片段", [
             ("now_thought", "今天的小事"), ("mood_delta", "今日变化"),
-        ], 5, 0, 1, 3)
+        ], 5, 0)
+        blocked_lay = add_text_group("今天为什么没找你", 5, 1, 1, 2)
+        self._blocked_reasons_var = _label("读取中…", "GrowthBody")
+        self._blocked_reasons_var.setWordWrap(True)
+        blocked_lay.addWidget(self._blocked_reasons_var)
+        blocked_lay.addStretch(1)
 
         # ---------------- 关系与长期 ----------------
         add_section("关系与长期", 6)
@@ -854,7 +917,9 @@ class MainWindow(QMainWindow):
         for c in range(3):
             grid.setColumnStretch(c, 1)
         growth_lay.addLayout(grid)
-        outer.addWidget(growth, 1)
+        body_lay.addWidget(growth)
+        body_lay.addStretch(1)
+        outer.addWidget(scroll, 1)
 
         self._refresh_growth_stats()
 
@@ -3162,6 +3227,38 @@ class MainWindow(QMainWindow):
             self._activity_heatmap.set_matrix(adb.activity_matrix(boyfriend, 7))
         except Exception as exc:
             logger.debug("读取活跃热力图失败: %s", exc)
+
+        # 情绪 24 小时曲线
+        try:
+            import emotion_history as eh
+            self._emotion_curve.set_series(eh.series(boyfriend, 24))
+        except Exception as exc:
+            logger.debug("读取情绪曲线失败: %s", exc)
+
+        # 今天为什么没找你（压制原因统计 + 最近几条明细）
+        try:
+            blocks = adb.proactive_blocks_today(boyfriend, limit=50)
+            if not blocks:
+                self._blocked_reasons_var.setText("今天没有压住过消息——她想找你就直接找了。")
+            else:
+                counts = {}
+                for row in blocks:
+                    counts[row["block_kind"]] = counts.get(row["block_kind"], 0) + 1
+                names = {"sleeping": "她判断你睡了", "busy": "你大概在忙",
+                         "winding_down": "你准备睡了", "cooldown": "刚发过、避免连着打扰",
+                         "other": "其他原因"}
+                summary = " · ".join("%s %d 次" % (names.get(kind, kind), count)
+                                    for kind, count in sorted(counts.items(), key=lambda x: -x[1]))
+                recent = []
+                for row in blocks[:3]:
+                    moment = datetime.fromtimestamp(float(row["ts"])) if row["ts"] else None
+                    recent.append("%s %s（%s）" % (
+                        moment.strftime("%H:%M") if moment else "--:--",
+                        row["source"] or "主动消息", names.get(row["block_kind"], row["block_kind"])))
+                self._blocked_reasons_var.setText(
+                    "共压住 %d 次：%s\n最近：" % (len(blocks), summary) + "；".join(recent))
+        except Exception as exc:
+            logger.debug("读取压制原因失败: %s", exc)
 
     # ===================== 今日状态（大模型提炼，缓存） =====================
     _DIGEST_TTL = 600  # 秒：大模型结果缓存时长（约 10 分钟）

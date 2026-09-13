@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -196,6 +196,35 @@ CREATE TABLE IF NOT EXISTS proactive_stats (
     blocked  INTEGER DEFAULT 0,
     PRIMARY KEY (day, user_id)
 );
+
+-- 情绪采样：每小时记一次当前强度（画 24 小时曲线用）
+CREATE TABLE IF NOT EXISTS emotion_samples (
+    user_id   TEXT NOT NULL,
+    day       TEXT NOT NULL,
+    hour      INTEGER NOT NULL,
+    happy     REAL DEFAULT 0,
+    angry     REAL DEFAULT 0,
+    hurt      REAL DEFAULT 0,
+    tired     REAL DEFAULT 0,
+    updated_at TEXT,
+    PRIMARY KEY (user_id, day, hour)
+);
+
+-- 主动消息"为什么没发"：每次被闸门压住都记一条原因
+CREATE TABLE IF NOT EXISTS proactive_blocks (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id   TEXT NOT NULL,
+    day       TEXT NOT NULL,
+    hour      INTEGER NOT NULL,
+    ts        REAL,
+    source    TEXT DEFAULT '',     -- 普通主动 / 追问 / 撩人 / 碎碎念 ...
+    priority  INTEGER DEFAULT 0,
+    block_kind TEXT DEFAULT '',    -- sleeping / busy / cooldown / other
+    reason    TEXT DEFAULT '',
+    state     TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_proactive_blocks_day ON proactive_blocks(user_id, day);
 """
 
 
@@ -242,6 +271,20 @@ def _migrate(conn: sqlite3.Connection, version: int):
             " day TEXT NOT NULL, user_id TEXT NOT NULL,"
             " sent INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0,"
             " PRIMARY KEY (day, user_id));")
+    if version < 6:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS emotion_samples ("
+            " user_id TEXT NOT NULL, day TEXT NOT NULL, hour INTEGER NOT NULL,"
+            " happy REAL DEFAULT 0, angry REAL DEFAULT 0, hurt REAL DEFAULT 0,"
+            " tired REAL DEFAULT 0, updated_at TEXT,"
+            " PRIMARY KEY (user_id, day, hour));"
+            "CREATE TABLE IF NOT EXISTS proactive_blocks ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,"
+            " day TEXT NOT NULL, hour INTEGER NOT NULL, ts REAL, source TEXT DEFAULT '',"
+            " priority INTEGER DEFAULT 0, block_kind TEXT DEFAULT '', reason TEXT DEFAULT '',"
+            " state TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+            "CREATE INDEX IF NOT EXISTS idx_proactive_blocks_day"
+            " ON proactive_blocks(user_id, day);")
     return SCHEMA_VERSION
 
 
@@ -478,6 +521,104 @@ def activity_matrix(user_id: str, days: int = 7) -> list:
         (str(user_id), first_day))
     return [{"day": row["day"], "hour": int(row["hour"]),
              "weight": float(row["weight"] or 0)} for row in rows]
+
+
+# ---------------------------------------------------------------- 情绪采样
+
+def record_emotion_sample(user_id: str, values: dict, ts: float = None) -> bool:
+    """按小时记一次情绪强度（同一小时内重复记录覆盖为最新值）。"""
+    user_id = str(user_id or "").strip()
+    if not user_id or not values:
+        return False
+    ts = float(ts if ts is not None else time.time())
+    day, hour, _slot = _local_day_hour(ts)
+    return execute(
+        "INSERT INTO emotion_samples (user_id, day, hour, happy, angry, hurt, tired, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id, day, hour) DO UPDATE SET "
+        "  happy = excluded.happy, angry = excluded.angry, hurt = excluded.hurt,"
+        "  tired = excluded.tired, updated_at = excluded.updated_at",
+        (user_id, day, int(hour), float(values.get("happy") or 0), float(values.get("angry") or 0),
+         float(values.get("hurt") or 0), float(values.get("tired") or 0),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def emotion_series(user_id: str, hours: int = 24, now: datetime = None) -> list:
+    """最近 N 小时的情绪序列（缺的时段补 0，便于直接画曲线）。"""
+    hours = max(2, min(168, int(hours)))
+    now = now or datetime.now()
+    since = now - timedelta(hours=hours - 1)
+    rows = query(
+        "SELECT day, hour, happy, angry, hurt, tired FROM emotion_samples "
+        "WHERE user_id = ? AND day >= ? ORDER BY day ASC, hour ASC",
+        (str(user_id), since.strftime("%Y-%m-%d")))
+    buckets = {}
+    for row in rows:
+        key = (str(row["day"]), int(row["hour"]))
+        buckets[key] = {"happy": float(row["happy"] or 0), "angry": float(row["angry"] or 0),
+                        "hurt": float(row["hurt"] or 0), "tired": float(row["tired"] or 0)}
+    series = []
+    for offset in range(hours):
+        moment = since + timedelta(hours=offset)
+        day = (moment - timedelta(hours=DAY_START_HOUR)).strftime("%Y-%m-%d")
+        values = buckets.get((day, moment.hour)) or {}
+        series.append({
+            "label": moment.strftime("%H"),
+            "hour": moment.hour,
+            "day": day,
+            "happy": values.get("happy", 0.0),
+            "angry": values.get("angry", 0.0),
+            "hurt": values.get("hurt", 0.0),
+            "tired": values.get("tired", 0.0),
+        })
+    return series
+
+
+# ---------------------------------------------------------------- 压制原因账
+
+def add_proactive_block(user_id: str, source: str = "", priority: int = 0,
+                        block_kind: str = "", reason: str = "", state: str = "",
+                        ts: float = None) -> bool:
+    """记一条"这次主动消息为什么没发"。
+
+    这里按**自然日**归档（面板问的是"今天为什么没找我"），与行为证据的"活跃日"口径不同。
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return False
+    ts = float(ts if ts is not None else time.time())
+    moment = datetime.fromtimestamp(ts)
+    return execute(
+        "INSERT INTO proactive_blocks "
+        "  (user_id, day, hour, ts, source, priority, block_kind, reason, state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, moment.strftime("%Y-%m-%d"), moment.hour, ts, str(source or ""),
+         int(priority), str(block_kind or ""), str(reason or "")[:80], str(state or "")),
+    )
+
+
+def proactive_blocks_today(user_id: str, day: str = "", limit: int = 50) -> list:
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    rows = query(
+        "SELECT hour, ts, source, priority, block_kind, reason, state FROM proactive_blocks "
+        "WHERE user_id = ? AND day = ? ORDER BY id DESC LIMIT ?",
+        (str(user_id), day, max(1, int(limit))))
+    return [dict(row) for row in rows]
+
+
+def prune_proactive_blocks(keep_days: int = 60) -> int:
+    cutoff = (datetime.now() - timedelta(days=max(7, int(keep_days)))).strftime("%Y-%m-%d")
+    conn = get_conn()
+    try:
+        with _lock:
+            cur = conn.execute("DELETE FROM proactive_blocks WHERE day < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount or 0
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("清理压制记录失败: %s", exc)
+        return 0
 
 
 def get_evidence(user_id: str, since_day: str = "", kinds=None) -> list:

@@ -564,6 +564,43 @@ def test_active_periods_not_all_day():
     assert merged and merged[0]["end"] == 25, late_ranges
 
 
+def test_emotion_history_and_block_log():
+    """情绪按小时采样（同小时覆盖）+ 压制原因账（含来源与归类）。"""
+    import emotion_history as eh
+    import assistant_db as adb2
+    from qq_bot import QQGirlfriendBot, PRIORITY_PROACTIVE, PRIORITY_EXAM
+    user = "test_emotion_curve"
+    now = datetime.now()
+    assert eh.record(user, {"happy": 20, "angry": 0, "hurt": 0, "tired": 10}, ts=now.timestamp())
+    assert eh.record(user, {"happy": 55, "angry": 5, "hurt": 0, "tired": 10},
+                     ts=(now + timedelta(minutes=10)).timestamp())
+    series = eh.series(user, 6)
+    assert len(series) == 6
+    last = series[-1]
+    assert last["happy"] == 55 and last["angry"] == 5, "同一小时内应覆盖为最新值"
+    points = adb2.emotion_series(user, 6)
+    assert len(points) == 6 and sum(p["happy"] for p in points) == 55
+
+    # 压制原因：造一个"此刻通常在睡"的用户，闸门压住时必须落一条带来源的记录
+    sleepy_user = "test_block_log"
+    bp.clear_cache(sleepy_user)
+    _seed_regular_days(sleepy_user, 8, wake_hour=8, last_msg_hour=0)
+    bp.recompute(sleepy_user, force=True)
+    bot = object.__new__(QQGirlfriendBot)
+    bot._last_proactive_any = {}
+    bot._last_proactive_msg = {}
+    night = datetime.now().replace(hour=4, minute=0, second=0, microsecond=0)
+    verdict = bot._proactive_gate(sleepy_user, PRIORITY_PROACTIVE, now=night, source="普通主动")
+    assert verdict["allow"] is False and verdict["block_kind"] == "sleeping", verdict
+    exam = bot._proactive_gate(sleepy_user, PRIORITY_EXAM, now=night, source="考试提醒")
+    assert exam["allow"] is True, "考试提醒不该被记成压制"
+    blocks = adb2.proactive_blocks_today(sleepy_user, day=night.strftime("%Y-%m-%d"))
+    assert blocks, "压制必须留下原因记录"
+    assert blocks[0]["source"] == "普通主动" and blocks[0]["block_kind"] == "sleeping"
+    stats = adb2.get_proactive_stats(sleepy_user, day=night.strftime("%Y-%m-%d"))
+    assert stats["blocked"] == 1 and stats["sent"] == 0
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -591,6 +628,7 @@ def run_into(check):
     check("作业纠错与教材解析", test_homework_and_material_parsing)
     check("历史聊天记录回填", test_history_backfill)
     check("活跃时段不覆盖全天", test_active_periods_not_all_day)
+    check("情绪曲线与压制原因账", test_emotion_history_and_block_log)
 
 
 def main():

@@ -414,7 +414,7 @@ def test_gui():
     app.exec()
     assert result.get("tabs") == 8, "新增「生活与学习」后应有 8 个顶级页"
     assert result.get("growth") == 33, "陪伴状态应保留原有 16 项并加入今天/内部状态共 33 项指标"
-    assert result.get("growth_groups") == 16, "陪伴状态应为 16 张分组卡片（此刻/今天/长期/活跃）"
+    assert result.get("growth_groups") == 18, "陪伴状态应为 18 张卡片（含情绪走势与压制原因）"
     assert result.get("has_axes"), "性格轮廓应位于分组卡片内"
     assert result.get("status_user_state") not in (None, "", "—"), "「她眼里的你」应能推断出状态"
     assert "测试日程" in (result.get("status_schedule") or ""), "「下一项」应显示刚建的日程与倒计时"

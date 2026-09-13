@@ -40,6 +40,7 @@ try:
     import goal_manager
     import study_session
     import image_verifier
+    import emotion_history
 except Exception as _assistant_exc:  # noqa: BLE001
     adb_assistant = None
     behavior_profile = None
@@ -47,6 +48,7 @@ except Exception as _assistant_exc:  # noqa: BLE001
     goal_manager = None
     study_session = None
     image_verifier = None
+    emotion_history = None
     logging.getLogger(__name__).warning("助理系统加载失败，功能自动降级: %s", _assistant_exc)
 
 # 主动消息优先级（与 晚晚/助理/schedule_manager.py 的取值保持一致）
@@ -61,6 +63,30 @@ PRIORITY_MURMUR = 10            # 碎碎念 / 表情
 PROACTIVE_ANY_GAP_SECONDS = 600
 
 _WEEKDAY_CN = "一二三四五六日"
+
+
+def _block_kind(state, reason=""):
+    """把压制原因归类，供面板统计"为什么没找你"。"""
+    state = str(state or "")
+    reason = str(reason or "")
+    if "刚发过" in reason or "冷却" in reason:
+        return "cooldown"
+    if state == "likely_sleeping":
+        return "sleeping"
+    if state == "possibly_busy":
+        return "busy"
+    if state == "winding_down":
+        return "winding_down"
+    return "other"
+
+
+BLOCK_KIND_NAMES = {
+    "sleeping": "她判断你已经睡了",
+    "busy": "你大概在忙",
+    "winding_down": "你准备睡了",
+    "cooldown": "刚发过一条，避免连着打扰",
+    "other": "其他原因压住",
+}
 
 
 def _human_time_text(start_raw: str, repeat_rule: str = "", with_date: bool = True) -> str:
@@ -1121,6 +1147,12 @@ class QQGirlfriendBot:
                                 source, repeated.get("repeat_count", 0))
             except Exception as exc:
                 logger.warning("持续情绪更新失败，使用普通对话策略 [%s]: %s", user_id, exc)
+        # 情绪轨迹埋点：按小时记一次强度，供面板画 24 小时曲线（失败不影响聊天）
+        if emotion_history is not None and emotion_now and self._is_intimate_user(user_id):
+            try:
+                emotion_history.record(user_id, emotion_now)
+            except Exception as exc:
+                logger.debug("情绪采样失败 [%s]: %s", user_id, exc)
         logger.info("收到 %s 消息 [%s]: %s", msg_type, user_id, raw_message[:200])
         # 明确计划或结果先即时更新情景状态；后台 LLM 之后再补全细节。
         try:
@@ -1728,7 +1760,8 @@ class QQGirlfriendBot:
             return
         candidates = schedule_manager.reminder_candidates(target)
         for item in candidates:
-            gate = self._proactive_gate(target, int(item.get("priority") or PRIORITY_SCHEDULE))
+            gate = self._proactive_gate(target, int(item.get("priority") or PRIORITY_SCHEDULE),
+                                        source="日程提醒")
             if not gate["allow"]:
                 continue
             # 先认领再发送：发送失败也不会在同一时间窗里反复轰炸
@@ -3181,7 +3214,7 @@ class QQGirlfriendBot:
         if self._turn_is_stale(user_id, expected_revision):
             return ""
         if proactive_priority is not None:
-            gate = self._proactive_gate(user_id, proactive_priority)
+            gate = self._proactive_gate(user_id, proactive_priority, source="主动发送")
             if not gate["allow"]:
                 logger.info("本条主动消息被闸门拦截，未发送 [%s]: %s", user_id, gate["reason"])
                 return ""
@@ -3703,7 +3736,7 @@ class QQGirlfriendBot:
         if count >= 3 or random.random() > 0.4:
             return
         # 防打扰：睡眠/忙碌推断（时间戳+内容）/ 对方最近 1 小时聊过 / 凌晨 1-7 点
-        if not self._proactive_gate(target, PRIORITY_MURMUR)["allow"]:
+        if not self._proactive_gate(target, PRIORITY_MURMUR, source="碎碎念")["allow"]:
             return
         if time.time() - self._last_user_msg.get(target, 0) < 3600:
             return
@@ -3755,7 +3788,7 @@ class QQGirlfriendBot:
         target = self._boyfriend_uin()
         if not target or target in self._dead_users:
             return
-        if not self._proactive_gate(target, PRIORITY_PROACTIVE)["allow"]:
+        if not self._proactive_gate(target, PRIORITY_PROACTIVE, source="冷场搭话")["allow"]:
             return
         if liveness.is_angry(target):
             return
@@ -3910,7 +3943,7 @@ class QQGirlfriendBot:
                 return
             if self._last_user_msg.get(user_id, 0) > start:
                 return  # 他中间又说话了，话题已经继续，不再补
-            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE)["allow"]:
+            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE, source="回马枪")["allow"]:
                 return
             h = time.localtime().tm_hour
             if h >= 23 or h < 6:
@@ -4146,7 +4179,7 @@ class QQGirlfriendBot:
                 continue  # 无法私聊（非好友），跳过撩人
             if runtime.PROACTIVE_ONLY_USER_ID and str(user_id) != str(runtime.PROACTIVE_ONLY_USER_ID):
                 continue  # 只给指定 QQ 号发主动消息
-            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE)["allow"]:
+            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE, source="主动撩人")["allow"]:
                 continue  # 此刻他大概在睡/在忙，或刚发过一条，不撩人
             # 发语音后超过 30 分钟未回复 → 醋意倾向 +1（每个语音只计一次）
             vs = self._last_voice_sent.get(user_id)
@@ -4217,7 +4250,7 @@ class QQGirlfriendBot:
             if now - self._last_proactive_msg.get(user_id, 0) < gap:
                 continue
             # 统一闸门：睡眠/忙碌推断 + 跨系统防轰炸（旧固定静默已移除）
-            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE)["allow"]:
+            if not self._proactive_gate(user_id, PRIORITY_PROACTIVE, source="普通主动")["allow"]:
                 continue
             mood_probability = prob * (
                 liveness.emotion_initiative_factor(user_id)
@@ -4244,7 +4277,8 @@ class QQGirlfriendBot:
                     continue  # 无法私聊（非好友），不追问
                 if runtime.PROACTIVE_ONLY_USER_ID and str(user_id) != str(runtime.PROACTIVE_ONLY_USER_ID):
                     continue  # 只给指定 QQ 号发主动消息
-                if not self._proactive_gate(user_id, PRIORITY_TASK_FOLLOWUP)["allow"]:
+                if not self._proactive_gate(user_id, PRIORITY_TASK_FOLLOWUP,
+                                            source="未回复追问")["allow"]:
                     continue  # 他大概在睡/在忙，或刚发过一条，不追问
                 try:
                     await self._maybe_proactive_followup(user_id)
@@ -4380,15 +4414,17 @@ class QQGirlfriendBot:
 
     # ============ 主动消息统一调度（Phase 2：取代旧的固定晚安静默） ============
 
-    def _proactive_gate(self, user_id, priority, now=None):
+    def _proactive_gate(self, user_id, priority, now=None, source=""):
         """所有"主动"消息的唯一闸门：睡眠/忙碌推断 + 跨系统防轰炸。
 
         - 结论全部来自 behavior_profile（消息时间戳 + 内容推断），不再使用固定静默变量；
         - 用户刚说过话 → 状态为清醒，正常放行；
         - 优先级 ≥ 考试档（95）可穿透睡眠判定（重要日程/考试提醒仍能叫醒他）；
-        - 被动回复（用户说话后的回答）不走本闸门。
+        - 被动回复（用户说话后的回答）不走本闸门；
+        - 被压住时记一条"为什么没发"（面板「今天为什么没找你」用）。
         """
-        verdict = {"allow": True, "reason": "", "state": "", "priority": int(priority)}
+        verdict = {"allow": True, "reason": "", "state": "", "priority": int(priority),
+                   "source": str(source or "")}
         if behavior_profile is None:
             return verdict
         try:
@@ -4401,18 +4437,34 @@ class QQGirlfriendBot:
         verdict["reason"] = decision.get("reason", "")
         if not decision.get("allow", True):
             verdict["allow"] = False
+            verdict["block_kind"] = _block_kind(decision.get("state"), verdict["reason"])
             logger.info("主动消息被压制 [%s] 优先级=%s 状态=%s（%s）",
                         user_id, priority, verdict["state"], verdict["reason"])
-            self._bump_proactive_stat(user_id, "blocked")
+            self._record_proactive_block(user_id, verdict)
             return verdict
         now_ts = now.timestamp() if now is not None else time.time()
         last = self._last_proactive_any.get(str(user_id), 0)
         if last and now_ts - last < PROACTIVE_ANY_GAP_SECONDS and int(priority) < PRIORITY_EXAM:
             verdict["allow"] = False
             verdict["reason"] = "刚发过一条主动消息，先不打扰"
+            verdict["block_kind"] = "cooldown"
             logger.info("主动消息被冷却压制 [%s] 优先级=%s", user_id, priority)
-            self._bump_proactive_stat(user_id, "blocked")
+            self._record_proactive_block(user_id, verdict)
         return verdict
+
+    def _record_proactive_block(self, user_id, verdict):
+        """记录压制原因（每日账 + 明细），失败不影响流程。"""
+        self._bump_proactive_stat(user_id, "blocked")
+        if adb_assistant is None:
+            return
+        try:
+            adb_assistant.add_proactive_block(
+                user_id, source=verdict.get("source") or "",
+                priority=int(verdict.get("priority") or 0),
+                block_kind=verdict.get("block_kind") or "other",
+                reason=verdict.get("reason") or "", state=verdict.get("state") or "")
+        except Exception as exc:
+            logger.debug("记录压制原因失败: %s", exc)
 
     @staticmethod
     def _bump_proactive_stat(user_id, field):
