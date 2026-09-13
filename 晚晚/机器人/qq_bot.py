@@ -776,6 +776,9 @@ class QQGirlfriendBot:
         # 助理系统定时任务：日程到点提醒（每 5 分钟扫描一次，优先级高于普通主动消息）
         self._schedule_task = asyncio.create_task(self._schedule_reminder_loop()) \
             if schedule_manager is not None else None
+        # 行为规律历史回填：启动时把已有聊天记录读一遍，让"她对你的了解"立刻有真实结论
+        self._backfill_task = asyncio.create_task(self._behavior_backfill_startup()) \
+            if behavior_profile is not None else None
         retry_delay = 1
         while self._running:
             try:
@@ -827,13 +830,14 @@ class QQGirlfriendBot:
         for task in (self._diary_task, self._pstate_task, self._evolution_task,
                      self._pull_task, self._qzone_task, self._catchup_task,
                      self._ritual_task, self._murmur_task, self._idle_murmur_task,
-                     self._schedule_task):
+                     self._schedule_task, self._backfill_task):
             if task:
                 task.cancel()
         self._diary_task = self._pstate_task = self._evolution_task = None
         self._pull_task = self._qzone_task = self._catchup_task = None
         self._ritual_task = self._murmur_task = self._idle_murmur_task = None
         self._schedule_task = None
+        self._backfill_task = None
         # 停止/重启前：把内存中所有用户的对话上下文全量落盘，
         # 保证下次启动能接上（消息已实时落盘，这里是双保险，覆盖异常路径）
         try:
@@ -1271,6 +1275,14 @@ class QQGirlfriendBot:
                 messages[0]["content"] += ILLUSTRATION_INSTRUCTION
             # 阶段性格演变：每次回复前注入当前阶段/特征值描述
             messages[0]["content"] += self._relationship_prompt(user_id)
+            # 作息观察：把推断出来的作息/活跃时段给她，让她自然用上（不是让她播报）
+            if behavior_profile is not None and self._is_intimate_user(user_id):
+                try:
+                    _bp_inj = behavior_profile.profile_prompt(user_id)
+                    if _bp_inj:
+                        messages[0]["content"] += "\n" + _bp_inj
+                except Exception as exc:
+                    logger.debug("作息观察注入失败 [%s]: %s", user_id, exc)
             # 活人感状态注入：情绪日 / 闹脾气 / 深夜困意 / 生日 / 短消息对称 / 称呼 / 纪念日 / 翻旧账
             if runtime.LIVENESS_ENABLED and self._is_intimate_user(user_id):
                 mood_inj = liveness.build_mood_injection(user_id, longterm_memory)
@@ -1675,6 +1687,27 @@ class QQGirlfriendBot:
             logger.info("日程提醒已发送 [%s] %s（%s）", user_id, item.get("title"),
                         "考试/截止" if is_exam else "普通日程")
         return text
+
+    async def _behavior_backfill_startup(self):
+        """启动时读一遍已有的聊天记录，立刻形成作息/活跃推断（幂等，只处理新增记录）。"""
+        await asyncio.sleep(3)
+        try:
+            target = self._boyfriend_uin()
+            if target:
+                result = await asyncio.to_thread(behavior_profile.backfill_user, target)
+            else:
+                result = await asyncio.to_thread(behavior_profile.backfill_all)
+            processed = int((result or {}).get("processed") or 0)
+            days = int((result or {}).get("days") or 0)
+            if processed:
+                logger.info("行为规律回填完成：%d 条历史记录、覆盖 %d 天（面板「生活与学习」已可用）",
+                            processed, days)
+            else:
+                logger.info("行为规律回填：没有新的历史记录需要处理")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("行为规律回填失败（不影响聊天）:\n%s", traceback.format_exc())
 
     async def _schedule_reminder_loop(self):
         """每隔几分钟检查一次"该提醒的日程"（提醒去重由日程模块负责）。"""

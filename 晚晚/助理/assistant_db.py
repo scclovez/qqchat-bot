@@ -332,6 +332,69 @@ def add_evidence(user_id: str, kind: str, ts: float = None, weight: float = 1.0,
     )
 
 
+def local_day_hour(ts: float):
+    """对外暴露的 (活跃日, 钟点, 槽位) 计算（回填时复用同一套口径）。"""
+    return _local_day_hour(float(ts))
+
+
+def add_evidence_bucket(user_id: str, kind: str, day: str, hour: int, weight: float,
+                        first_ts: float, last_ts: float, meta: dict = None) -> bool:
+    """按"活跃日 + 小时"整格写入（回填历史记录时用：一次写一格，避免逐条 upsert）。"""
+    user_id = str(user_id or "").strip()
+    if not user_id or not kind:
+        return False
+    slot = int(hour) if int(hour) >= DAY_START_HOUR else int(hour) + 24
+    return execute(
+        "INSERT INTO behavior_evidence "
+        "  (user_id, kind, day, hour, slot, weight, first_ts, last_ts, meta) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id, kind, day, hour) DO UPDATE SET "
+        "  weight = weight + excluded.weight,"
+        "  first_ts = COALESCE(MIN(first_ts, excluded.first_ts), excluded.first_ts),"
+        "  last_ts = MAX(last_ts, excluded.last_ts)",
+        (user_id, kind, str(day), int(hour), slot, float(weight),
+         float(first_ts), float(last_ts),
+         json.dumps(meta, ensure_ascii=False) if meta else None),
+    )
+
+
+def get_meta(key: str, default: str = "") -> str:
+    rows = query("SELECT value FROM schema_meta WHERE key = ?", (str(key),))
+    return str(rows[0]["value"]) if rows else default
+
+
+def set_meta(key: str, value: str) -> bool:
+    return execute(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(key), str(value)),
+    )
+
+
+def fetch_chat_history(role: str = "user", since_id: int = 0, since_time: str = "",
+                       user_id: str = "") -> list:
+    """读取已有聊天记录（回填行为规律用；只读，不改动原表）。"""
+    sql = "SELECT id, user_id, role, content, created_at FROM chat_history WHERE id > ?"
+    params = [int(since_id)]
+    if role:
+        sql += " AND role = ?"
+        params.append(str(role))
+    if user_id:
+        sql += " AND user_id = ?"
+        params.append(str(user_id))
+    if since_time:
+        sql += " AND created_at >= ?"
+        params.append(str(since_time))
+    sql += " ORDER BY id ASC"
+    return [dict(row) for row in query(sql, tuple(params))]
+
+
+def history_users() -> list:
+    """聊天记录里出现过的用户（回填时逐个处理）。"""
+    rows = query("SELECT DISTINCT user_id FROM chat_history ORDER BY user_id")
+    return [str(row["user_id"]) for row in rows if row["user_id"]]
+
+
 def get_evidence(user_id: str, since_day: str = "", kinds=None) -> list:
     """取证据行（按天、小时排序）。kinds 为 None 时取全部类型。"""
     params = [str(user_id)]
@@ -378,6 +441,19 @@ def get_hour_histogram(user_id: str, since_day: str, kinds=("activity",)) -> dic
 def get_hint_hours(user_id: str, kind: str, since_day: str) -> dict:
     """某类内容线索的小时分布（如 busy_hint / study_hint / night_said）。"""
     return get_hour_histogram(user_id, since_day, (kind,))
+
+
+def evidence_span(user_id: str) -> dict:
+    """证据覆盖范围（起始日 / 最近日 / 天数），面板用来显示"观察了多久"。"""
+    rows = query(
+        "SELECT MIN(day) AS first_day, MAX(day) AS last_day, COUNT(DISTINCT day) AS days, "
+        "       SUM(weight) AS weight FROM behavior_evidence WHERE user_id = ? AND kind = 'activity'",
+        (str(user_id),))
+    if not rows:
+        return {"first_day": "", "last_day": "", "days": 0, "messages": 0}
+    row = rows[0]
+    return {"first_day": row["first_day"] or "", "last_day": row["last_day"] or "",
+            "days": int(row["days"] or 0), "messages": int(row["weight"] or 0)}
 
 
 def prune_evidence(keep_days: int = 180) -> int:

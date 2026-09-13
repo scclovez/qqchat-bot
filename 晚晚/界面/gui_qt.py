@@ -951,6 +951,10 @@ class MainWindow(QMainWindow):
         self._assistant_status = _label("正在读取…", "Muted")
         self._assistant_status.setWordWrap(True)
         cl.addWidget(self._assistant_status)
+        row = QHBoxLayout()
+        row.addWidget(_btn("重新总结（读一遍聊天记录）", "Soft", self._assistant_resummarize))
+        row.addStretch(1)
+        cl.addLayout(row)
         outer.addWidget(card)
 
         obs_card, obs_lay = _card(page, "最近观察到")
@@ -1000,10 +1004,15 @@ class MainWindow(QMainWindow):
                 self._assistant_status.setText(
                     "已观察 %d 天，结论还在形成中（至少需要几天才作数）。" % int(data.get("evidence_days") or 0))
             else:
+                cover = data.get("coverage") or {}
+                span = ""
+                if cover.get("days"):
+                    span = " · 数据覆盖 %s ~ %s" % (cover.get("first_day") or "—",
+                                                    cover.get("last_day") or "—")
                 self._assistant_status.setText(
-                    "已观察 %d 天 · 共 %d 条消息 · 最近更新 %s"
+                    "已观察 %d 天 · 共 %d 条消息%s · 最近更新 %s"
                     % (int(data.get("evidence_days") or 0), int(data.get("messages") or 0),
-                       data.get("updated") or "—"))
+                       span, data.get("updated") or "—"))
             notes = data.get("observations") or []
             self._assistant_observations.setText(
                 "\n".join("· " + note for note in notes) if notes else "暂时还没有明显发现。")
@@ -1035,6 +1044,31 @@ class MainWindow(QMainWindow):
             self._assistant_fill_items(boxes["week"], data.get("week") or [], "本周没有安排。")
             self._assistant_fill_items(boxes["important"], data.get("important") or [],
                                        "暂时没有考试或截止日期。", allow_actions=False)
+
+    def _assistant_resummarize(self):
+        """手动重新总结：把已有聊天记录再读一遍（幂等，只处理新增），不阻塞界面。"""
+        user_id = str(getattr(runtime, "PROACTIVE_ONLY_USER_ID", "") or "").strip()
+        if not user_id:
+            QMessageBox.information(self, "提示", "请先在「设置 → 互动 → 主动消息」里填上你的 QQ 号。")
+            return
+        self._assistant_status.setText("正在读聊天记录重新总结…")
+
+        def worker():
+            try:
+                import behavior_profile as bp
+                result = bp.backfill_user(user_id)
+                message = "已读 %d 条记录、覆盖 %d 天" % (int(result.get("processed") or 0),
+                                                          int(result.get("days") or 0))
+            except Exception as exc:  # noqa: BLE001
+                message = "总结失败：%s" % exc
+            self._safe_after(0, lambda: self._on_assistant_resummarized(message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_assistant_resummarized(self, message):
+        self._assistant_refresh_ts = 0.0
+        self._refresh_assistant_panel()
+        QMessageBox.information(self, "重新总结", message)
 
     def _submit_assistant_correction(self):
         """把用户的一句纠正作为证据写入（不做手工画像配置页）。"""

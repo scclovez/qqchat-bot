@@ -12,7 +12,7 @@ import asyncio
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if ROOT not in sys.path:
@@ -501,6 +501,49 @@ def test_homework_and_material_parsing():
     assert "今天就学这个" in iv.material_instruction(text["material"])
 
 
+def test_history_backfill():
+    """启动回填：把已有聊天记录读一遍形成推断；重复执行不重复计数。"""
+    import behavior_profile as bp
+    user = "test_backfill_user"
+    bp.clear_cache(user)
+    # 造 12 天历史聊天记录（UTC 存储，08:00 与次日 00:30 各一条）
+    db_path = os.path.join(os.environ["DSH_DATA_ROOT"], "晚晚", "数据", "bot_memory.db")
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    rows = []
+    for offset in range(2, 14):
+        for hour, minute in ((8, 0), (12, 30), (23, 0)):
+            local = (now - timedelta(days=offset)).replace(hour=hour, minute=minute)
+            utc = datetime.fromtimestamp(local.timestamp(), tz=timezone.utc)
+            rows.append((user, "user", "在吗，今天上课好累", utc.strftime("%Y-%m-%d %H:%M:%S")))
+        late = (now - timedelta(days=offset - 1)).replace(hour=0, minute=40)
+        utc = datetime.fromtimestamp(late.timestamp(), tz=timezone.utc)
+        rows.append((user, "user", "晚安，我先睡了", utc.strftime("%Y-%m-%d %H:%M:%S")))
+    conn.executemany(
+        "INSERT INTO chat_history (user_id, role, content, created_at) VALUES (?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+    first = bp.backfill_user(user)
+    assert first["processed"] >= 30, first
+    assert first["days"] >= 11, first
+    data = bp.summarize(user)
+    assert data["insufficient"] is False, "回填后必须立刻形成可用结论"
+    assert data["coverage"]["days"] >= 11
+    assert data["sleep"]["text"] != "—" and data["wake"]["text"] != "—"
+    sleep_text = data["sleep"]["text"]
+    assert sleep_text.startswith("01:") or sleep_text.startswith("00:"), sleep_text
+    # 内容线索也被回填（上课 → busy_hint；晚安 → night_said）
+    kinds = {row["kind"] for row in adb.get_evidence(user, "", ("busy_hint", "night_said"))}
+    assert "busy_hint" in kinds and "night_said" in kinds, kinds
+    # 幂等：再跑一次不再重复计数
+    second = bp.backfill_user(user)
+    assert second["processed"] == 0, second
+    after = bp.summarize(user)
+    assert after["messages"] == data["messages"], "重复回填不得让证据翻倍"
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -526,6 +569,7 @@ def run_into(check):
     check("图片打卡校验引擎", test_checkin_verification_engine)
     check("学习图片上下文判定", test_study_image_context_gate)
     check("作业纠错与教材解析", test_homework_and_material_parsing)
+    check("历史聊天记录回填", test_history_backfill)
 
 
 def main():

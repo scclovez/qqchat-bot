@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import assistant_db as adb
 
@@ -610,6 +610,7 @@ def summarize(user_id: str, force: bool = False) -> dict:
         "evidence_days": days,
         "messages": int((active.get("value") or {}).get("messages") or 0),
         "updated": sleep.get("last_updated") or active.get("last_updated") or "",
+        "coverage": adb.evidence_span(user_id),
         "sleep": _metric(sleep),
         "wake": _metric(wake),
         "active": {
@@ -665,3 +666,120 @@ def clear_cache(user_id: str = ""):
     else:
         _state_cache.clear()
         _last_recompute.clear()
+
+
+# =============================================================================
+# 历史回填：启动时把已有的聊天记录读一遍，立刻形成作息推断
+# =============================================================================
+
+BACKFILL_KEEP_DAYS = 180
+BACKFILL_BATCH_LIMIT = 20000      # 单次回填最多读多少条（防止超大库卡启动）
+
+
+def _parse_history_ts(text: str):
+    """chat_history.created_at 是 UTC（SQLite CURRENT_TIMESTAMP）→ 本地时间戳。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            naive = datetime.strptime(raw[:26], fmt)
+        except ValueError:
+            continue
+        try:
+            return naive.replace(tzinfo=timezone.utc).timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def backfill_user(user_id: str, keep_days: int = BACKFILL_KEEP_DAYS, force: bool = False) -> dict:
+    """把某个用户已有的聊天记录回填成行为证据，并立即重算规律。
+
+    - 幂等：用 schema_meta 里的 checkpoint 记录已处理到的 chat_history.id，
+      重复调用（含每次启动）只处理新增记录，不会重复计数；
+    - 只读原表，不改动聊天记录；回填失败不影响聊天。
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return {"user_id": "", "processed": 0}
+    key = "behavior_backfill_last_id:%s" % user_id
+    last_id = 0 if force else int(adb.get_meta(key, "0") or 0)
+    since_time = (datetime.now() - timedelta(days=max(7, int(keep_days)))).strftime("%Y-%m-%d %H:%M:%S")
+    rows = adb.fetch_chat_history(role="user", since_id=last_id, since_time=since_time,
+                                  user_id=user_id)
+    if not rows:
+        if last_id == 0:
+            recompute(user_id, force=True)
+        return {"user_id": user_id, "processed": 0, "days": 0}
+    if len(rows) > BACKFILL_BATCH_LIMIT:
+        rows = rows[-BACKFILL_BATCH_LIMIT:]
+    now_ts = time.time()
+    buckets = {}    # (day, hour) -> [count, first_ts, last_ts, chars]
+    hints = {}      # (kind, day, hour) -> count
+    max_id = last_id
+    for row in rows:
+        ts = _parse_history_ts(row.get("created_at"))
+        max_id = max(max_id, int(row.get("id") or 0))
+        if ts is None or ts > now_ts + 86400:
+            continue
+        day, hour, _slot = adb.local_day_hour(ts)
+        slot_key = (day, hour)
+        info = buckets.get(slot_key)
+        text = str(row.get("content") or "")
+        if info is None:
+            buckets[slot_key] = [1, ts, ts, len(text)]
+        else:
+            info[0] += 1
+            info[1] = min(info[1], ts)
+            info[2] = max(info[2], ts)
+            info[3] += len(text)
+        for kind in _detect_hints(text):
+            hints[(kind, day, hour)] = hints.get((kind, day, hour), 0) + 1
+    for (day, hour), (count, first_ts, last_ts, chars) in buckets.items():
+        adb.add_evidence_bucket(user_id, "activity", day, hour, count, first_ts, last_ts,
+                                meta={"chars": chars, "backfill": True})
+    for (kind, day, hour), count in hints.items():
+        adb.add_evidence_bucket(user_id, kind, day, hour, count,
+                                _ts_at(day, hour), _ts_at(day, hour), meta={"backfill": True})
+    adb.set_meta(key, str(max_id))
+    recompute(user_id, force=True)
+    days = len({day for (day, _hour) in buckets})
+    logger.info("行为规律回填 [%s]：处理 %d 条记录、%d 天、%d 个时段",
+                user_id, len(rows), days, len(buckets))
+    return {"user_id": user_id, "processed": len(rows), "days": days,
+            "buckets": len(buckets), "hints": len(hints), "last_id": max_id}
+
+
+def _ts_at(day: str, hour: int) -> float:
+    """活跃日 + 钟点 → 时间戳（凌晨属于次日，换算回去）。"""
+    try:
+        base = datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        return time.time()
+    if int(hour) < adb.DAY_START_HOUR:
+        base = base + timedelta(days=1)
+    return base.replace(hour=int(hour) % 24).timestamp()
+
+
+def backfill_all(user_ids=None, keep_days: int = BACKFILL_KEEP_DAYS) -> dict:
+    """回填全部（或指定）用户；启动时调用一次即可。"""
+    targets = [str(u) for u in (user_ids or []) if str(u).strip()]
+    if not targets:
+        try:
+            targets = adb.history_users()
+        except Exception as exc:
+            logger.warning("读取聊天记录用户失败: %s", exc)
+            return {"users": 0, "processed": 0}
+    total = 0
+    done = 0
+    for user_id in targets:
+        try:
+            result = backfill_user(user_id, keep_days=keep_days)
+            total += int(result.get("processed") or 0)
+            done += 1
+        except Exception as exc:
+            logger.warning("回填失败 [%s]: %s", user_id, exc)
+    if total:
+        logger.info("行为规律历史回填完成：%d 个用户、%d 条记录", done, total)
+    return {"users": done, "processed": total}
