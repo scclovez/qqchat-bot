@@ -8,6 +8,7 @@
 测试数据全部写入 DSH_DATA_ROOT 指定的一次性临时目录（由 test_all.py 或本文件自建），
 不会污染真实数据。
 """
+import asyncio
 import os
 import sys
 import time
@@ -292,6 +293,91 @@ def test_old_night_silence_removed():
     assert "_proactive_gate" in qq, "主动消息必须经过统一闸门"
 
 
+def test_goal_and_tasks():
+    """目标识别 + 任务拆解（无模型时走规则兜底）+ 进度统计。"""
+    import goal_manager as gm
+    assert gm.looks_like_goal("我要过四级") and gm.looks_like_goal("我要学 Python")
+    assert not gm.looks_like_goal("我今天好累"), "普通聊天不是目标"
+    assert not gm.looks_like_goal("我要过四级？"), "问句不是目标"
+    assert gm.detect_category("我要过四级") == "english"
+    assert gm.detect_category("我要学 Python") == "programming"
+    user = "test_goal_user"
+    created = asyncio.run(gm.create_goal(user, "我要过四级", llm_call=None))
+    assert created and created["goal_id"]
+    assert created["tasks"], "目标必须拆出任务"
+    assert all(5 <= item["minutes"] <= 45 for item in created["tasks"]), created["tasks"]
+    tasks = adb.list_tasks(user, goal_id=created["goal_id"])
+    assert tasks and all(row["source"] == "ai" and row["movable"] == 1 for row in tasks)
+    adb.update_task(tasks[0]["id"], status="done")
+    progress = gm.goal_progress(user, created["goal_id"])
+    assert progress["done_tasks"] == 1 and progress["total_tasks"] == len(tasks)
+    assert 0 < progress["progress"] <= 1
+    assert gm._parse_deadline("我要在 6 月过四级").endswith("-01")
+    assert gm._parse_deadline("年底前考完").endswith("12-31")
+
+
+def test_study_session_lifecycle():
+    """会话可暂停、可继续，进度不丢；结束时按完成比例给状态。"""
+    import study_session as ss
+    import goal_manager as gm
+    user = "test_session_user"
+    created = asyncio.run(gm.create_goal(user, "我要学英语", llm_call=None))
+    goal = gm.active_goal(user)
+    session = ss.start_session(user, goal, planned_minutes=12)
+    assert session and session["status"] == "active" and session["planned_minutes"] == 12
+    assert ss.start_session(user, goal)["id"] == session["id"], "已有未结束会话不得重复开"
+    assert ss.pause_session(session["id"], done=2, total=5)
+    assert adb.get_session(session["id"])["status"] == "paused"
+    assert adb.get_open_session(user)["id"] == session["id"], "暂停中的会话仍可续"
+    assert ss.resume_session(session["id"])
+    assert adb.get_session(session["id"])["status"] == "active"
+    half = ss.finish_session(session["id"], done=2, total=5)
+    assert half["status"] == "partial" and abs(half["progress"] - 0.4) < 0.01
+    assert adb.get_session(session["id"])["actual_minutes"] >= 1
+    # 中断不丢进度：下次会话能看到上次的 partial 记录
+    assert adb.get_last_finished_session(user)["status"] == "partial"
+    assert created and created["goal_id"]
+
+
+def test_word_cards_and_aloud_text():
+    """词卡校验 + 朗读文本顺序（先例句、再把单词重读两遍）。"""
+    import study_session as ss
+
+    async def fake_llm(messages, **kwargs):
+        return ('[{"word":"coffee","phonetic":"/ˈkɒfi/","meaning":"咖啡",'
+                '"example_en":"I would like a cup of coffee, please.","example_cn":"我想要一杯咖啡。"},'
+                '{"word":"tea","meaning":"茶","example_en":"She drinks tea every morning.","example_cn":"她每天早晨喝茶。"},'
+                '{"word":"broken","meaning":"坏了","example_en":"no english word here","example_cn":"无效"},'
+                '{"word":"123","meaning":"无效","example_en":"123 123","example_cn":"无效"}]')
+
+    cards = asyncio.run(ss.generate_word_cards("四级词汇", 4, fake_llm))
+    assert len(cards) == 2, "缺例句或单词不合法必须丢弃"
+    assert cards[0]["word"] == "coffee"
+    text = ss.read_aloud_text(cards[0])
+    assert text.index("please") < text.index("coffee."), "必须先读例句再强调单词"
+    assert text.count("coffee") >= 3, "单词要重复强调"
+    assert "只读这个单词" in ss.word_only_instruction("温柔女声")
+
+
+def test_record_answer_updates_mastery():
+    """答错进薄弱、答对提升掌握度并安排复习。"""
+    import study_session as ss
+    user = "test_mastery_user"
+    kid = adb.add_knowledge(user, "coffee", answer="咖啡", subject="english",
+                            extra={"example_en": "I would like a coffee."})
+    assert kid
+    wrong = ss.record_answer(user, kid, correct=False)
+    assert wrong["wrong_count"] == 1 and wrong["status"] in ("unstable", "learning")
+    assert wrong["next_review"], "答错必须安排复习"
+    assert "coffee" in [row["content"] for row in ss.gm.weak_points(user)] or \
+        adb.get_knowledge(kid)["mastery"] < 0.6
+    for _ in range(4):
+        ss.record_answer(user, kid, correct=True)
+    final = adb.get_knowledge(kid)
+    assert final["mastery"] > wrong["mastery"]
+    assert final["next_review"] and final["last_seen"]
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -307,6 +393,10 @@ def run_into(check):
     check("到点提醒不重复轰炸", test_schedule_reminder_dedup)
     check("主动消息统一闸门", test_proactive_gate_cooldown)
     check("旧固定静默已移除", test_old_night_silence_removed)
+    check("学习目标与任务拆解", test_goal_and_tasks)
+    check("学习会话可暂停续做", test_study_session_lifecycle)
+    check("词卡校验与朗读顺序", test_word_cards_and_aloud_text)
+    check("掌握度与复习安排", test_record_answer_updates_mastery)
 
 
 def main():

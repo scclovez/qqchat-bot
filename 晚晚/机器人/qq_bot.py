@@ -34,11 +34,17 @@ import boundary
 
 # 助理系统（行为规律 / 日程 / 学习）：新模块异常绝不能阻断 bot 启动与聊天
 try:
+    import assistant_db as adb_assistant
     import behavior_profile
     import schedule_manager
+    import goal_manager
+    import study_session
 except Exception as _assistant_exc:  # noqa: BLE001
+    adb_assistant = None
     behavior_profile = None
     schedule_manager = None
+    goal_manager = None
+    study_session = None
     logging.getLogger(__name__).warning("助理系统加载失败，功能自动降级: %s", _assistant_exc)
 
 # 主动消息优先级（与 晚晚/助理/schedule_manager.py 的取值保持一致）
@@ -1130,6 +1136,36 @@ class QQGirlfriendBot:
                 longterm_memory.add_chat_history(user_id, "assistant", sent_text)
             await self._finish_typing(msg_type, user_id)
             return
+        # 学习目标：用户立目标（"我要过四级"）→ 建目标 + 拆每日任务，确认回复仍由人设生成
+        if (goal_manager is not None and not is_group and self._is_intimate_user(user_id)
+                and goal_manager.looks_like_goal(raw_message)):
+            created_goal = None
+            try:
+                created_goal = await goal_manager.create_goal(user_id, raw_message, self._llm_task.chat)
+            except Exception as exc:
+                logger.warning("学习目标创建失败，按普通对话处理 [%s]: %s", user_id, exc)
+            if created_goal:
+                self._memory.add_message(user_id, "user", raw_message)
+                longterm_memory.add_chat_history(user_id, "user", raw_message)
+                reply = await self._generate_goal_reply(raw_message, created_goal)
+                sent_text = await self._reply_split(
+                    msg_type, target_id, user_id, message_id, reply, force_voice=False,
+                    expected_revision=turn_revision,
+                )
+                if sent_text:
+                    self._memory.add_message(user_id, "assistant", sent_text)
+                    longterm_memory.add_chat_history(user_id, "assistant", sent_text)
+                await self._finish_typing(msg_type, user_id)
+                return
+        # 学习会话：开始 / 暂停 / 继续（语言类会真的用语音读给她听）
+        if (study_session is not None and goal_manager is not None and adb_assistant is not None
+                and not is_group and self._is_intimate_user(user_id)
+                and self._is_study_command(raw_message)):
+            handled = await self._handle_study_command(
+                msg_type, target_id, user_id, message_id, raw_message, turn_revision)
+            if handled:
+                await self._finish_typing(msg_type, user_id)
+                return
         # 日程：用户说出带时间的事 → 解析入库，确认回复仍由人设生成
         if (schedule_manager is not None and not is_group and self._is_intimate_user(user_id)
                 and schedule_manager.looks_like_schedule(raw_message)):
@@ -1649,6 +1685,160 @@ class QQGirlfriendBot:
                 continue
             await self._send_schedule_reminder(target, item)
             break  # 一轮只提醒一条，避免连发
+
+    # ============ 学习会话（Phase 3：目标 / 任务 / 会话 / 语音读词） ============
+
+    STUDY_START_WORDS = ("开始学习", "开始学", "学英语", "背单词", "背词", "练听力",
+                         "做阅读", "刷题", "学习吧", "来学习", "陪我学")
+    STUDY_PAUSE_WORDS = ("不学了", "先不学", "暂停", "等会儿学", "晚点学", "不背了", "休息下")
+    STUDY_RESUME_WORDS = ("继续学习", "接着学", "继续背", "继续吧", "接着背")
+
+    @classmethod
+    def _is_study_command(cls, text):
+        text = (text or "").strip()
+        if not text or len(text) > 30:
+            return False
+        return any(word in text for word in
+                   cls.STUDY_START_WORDS + cls.STUDY_PAUSE_WORDS + cls.STUDY_RESUME_WORDS)
+
+    async def _handle_study_command(self, msg_type, target_id, user_id, message_id, raw_message,
+                                    turn_revision):
+        """处理"开始学习 / 不学了 / 继续"；返回是否已处理（False 则交回普通对话）。"""
+        text = (raw_message or "").strip()
+        session = adb_assistant.get_open_session(user_id)
+        if any(word in text for word in self.STUDY_PAUSE_WORDS):
+            if not session:
+                return False
+            study_session.pause_session(session["id"])
+            reply = await self._study_persona_reply(
+                user_id, f"他刚说想先停下（这次学习了 {int(session.get('progress') or 0) * 100:.0f}%）。"
+                         "用你自己的语气答应他、并说下次接着来，一句话。")
+            await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                    force_voice=False, expected_revision=turn_revision)
+            return True
+        if any(word in text for word in self.STUDY_RESUME_WORDS):
+            if not session or session.get("status") != "paused":
+                return False
+            study_session.resume_session(session["id"])
+            goal = goal_manager.active_goal(user_id)
+            card = study_session.next_card(user_id, (goal or {}).get("id"))
+            if not card:
+                return False
+            await self._present_word_card(msg_type, target_id, user_id, message_id, card,
+                                          turn_revision, lead="接着上次的来")
+            return True
+        if not any(word in text for word in self.STUDY_START_WORDS):
+            return False
+        goal = goal_manager.active_goal(user_id)
+        if not goal:
+            return False  # 还没立目标 → 交给普通对话，让她自然回应
+        try:
+            cards = await study_session.ensure_word_pool(user_id, goal, self._llm_task.chat)
+        except Exception as exc:
+            logger.warning("词卡准备失败 [%s]: %s", user_id, exc)
+            cards = []
+        if not cards:
+            return False
+        session = study_session.start_session(user_id, goal)
+        if not session:
+            return False
+        minutes = int(session.get("planned_minutes") or 10)
+        reply = await self._study_persona_reply(
+            user_id,
+            f"他要开始学「{goal.get('title')}」了，你准备了 {len(cards)} 个词，"
+            f"这次打算陪他学 {minutes} 分钟。用你自己的语气开个头（一句话，别像老师点名），"
+            "然后你会先给他看第一个词、再用语音读给他听。",
+        )
+        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                       force_voice=False, expected_revision=turn_revision)
+        if sent:
+            self._memory.add_message(user_id, "assistant", sent)
+            longterm_memory.add_chat_history(user_id, "assistant", sent)
+        await self._present_word_card(msg_type, target_id, user_id, message_id, cards[0],
+                                      turn_revision)
+        return True
+
+    async def _study_persona_reply(self, user_id, instruction):
+        """学习相关文案统一走人设链路生成（学习模块只提供事实）。"""
+        try:
+            messages = [
+                {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER},
+                {"role": "user", "content": "（内部信息，不是他发的消息）" + instruction},
+            ]
+            reply = await self._deepseek.chat(messages, temperature=0.85, max_tokens=140)
+            reply = (reply or "").strip()
+            if reply:
+                return reply
+        except Exception as exc:
+            logger.warning("学习文案生成失败: %s", exc)
+        return "好呀，那我们开始吧~"
+
+    async def _present_word_card(self, msg_type, target_id, user_id, message_id, card,
+                                 turn_revision, lead=""):
+        """展示一个词：文字讲解（人设）+ 语音读例句 + 语音单独读词。"""
+        fact = study_session.describe_card(card)
+        instruction = (f"{lead}。你现在带着他学这一个词：{fact}。"
+                       "用你自己的语气说一两句（把例句也带出来），不要像老师念课本，也不要罗列格式。")
+        reply = await self._study_persona_reply(user_id, instruction)
+        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                       force_voice=False, expected_revision=turn_revision)
+        if sent:
+            self._memory.add_message(user_id, "assistant", sent)
+            longterm_memory.add_chat_history(user_id, "assistant", sent)
+        # 语音：先把例句读一遍，再把单词重读两遍（实测该顺序合成最清晰）
+        await self._speak_study_text(user_id, study_session.read_aloud_text(card))
+        word = card.get("content") or ""
+        if word:
+            await self._speak_study_text(
+                user_id, word, instruct=study_session.word_only_instruction())
+        try:
+            adb_assistant.update_knowledge(
+                card["id"], status="learning",
+                last_seen=time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as exc:
+            logger.debug("标记词卡状态失败: %s", exc)
+
+    async def _speak_study_text(self, user_id, text, instruct=""):
+        """用现有 TTS 合成并发送语音条（学习朗读专用：音色仍是她）。"""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        try:
+            import tts as tts_module
+            voice = (runtime.TTS_VOICE_DESCRIPTION or "").strip()
+            if instruct:
+                voice = ((voice + "。") if voice else "") + instruct
+            path = await tts_module.synthesize(text, voice_desc=voice,
+                                               model=runtime.TTS_MODEL, emotion="温柔")
+            if path:
+                await self._send_voice("private", user_id, user_id, path)
+            return path
+        except Exception as exc:
+            logger.warning("学习朗读失败 [%s]: %s", user_id, exc)
+            return ""
+
+    async def _generate_goal_reply(self, text, created_goal):
+        """用她的语气确认学习目标（不输出系统化计划表）。"""
+        tasks = "、".join(item["title"] for item in created_goal.get("tasks") or [])
+        fact = f"目标：{created_goal.get('title')}"
+        if tasks:
+            fact += f"；你打算每天陪他做：{tasks}"
+        if created_goal.get("deadline"):
+            fact += f"；期限 {created_goal['deadline']}"
+        try:
+            messages = [
+                {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER},
+                {"role": "user", "content": f"用户刚对你说：「{text}」。你已经把这件事当成你们的目标定下来了"
+                                            f"（{fact}）。请用一句符合你人设的话回应他，表示你会陪他一起，"
+                                            "不要罗列计划字段。"},
+            ]
+            reply = await self._deepseek.chat(messages, temperature=0.85, max_tokens=140)
+            reply = (reply or "").strip()
+            if reply:
+                return reply
+        except Exception as exc:
+            logger.warning("目标确认回复生成失败: %s", exc)
+        return "好呀，那我们说定了~"
 
     @staticmethod
     def _message_to_text(data):

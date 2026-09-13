@@ -760,10 +760,76 @@ class MainWindow(QMainWindow):
         outer.addStretch(1)
 
     def _build_assistant_study_page(self, sub):
-        self._build_assistant_placeholder(
-            sub, "学习",
-            "当前学习目标、阶段进度、连续学习天数、薄弱与待复习知识点、最近一次学习会显示在这里。",
-        )
+        page = QWidget()
+        sub.addTab(page, "学习")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        outer.addWidget(_label("学习", "PageTitle"))
+        outer.addWidget(_label("在 QQ 里对她说「我要过四级」「开始学习」就会用起来。", "Muted"))
+
+        goal_card, goal_lay = _card(page, "当前学习目标")
+        self._assistant_goal_label = _label("还没有目标——对她说一句「我要学英语」就行。", "GrowthBody")
+        self._assistant_goal_label.setWordWrap(True)
+        goal_lay.addWidget(self._assistant_goal_label)
+        self._assistant_goal_progress = _label("—", "GrowthMetricValue")
+        goal_lay.addWidget(self._assistant_goal_progress)
+        outer.addWidget(goal_card)
+
+        stat_card, stat_lay = _card(page, "学习状态")
+        self._assistant_study_stats = _label("正在读取…", "GrowthBody")
+        self._assistant_study_stats.setWordWrap(True)
+        stat_lay.addWidget(self._assistant_study_stats)
+        outer.addWidget(stat_card)
+
+        weak_card, weak_lay = _card(page, "薄弱与待复习")
+        self._assistant_study_weak = _label("暂无记录。", "GrowthBody")
+        self._assistant_study_weak.setWordWrap(True)
+        weak_lay.addWidget(self._assistant_study_weak)
+        outer.addWidget(weak_card)
+        outer.addStretch(1)
+
+    def _refresh_assistant_study(self, user_id):
+        try:
+            import goal_manager as gm
+            data = gm.overview(user_id)
+        except Exception as exc:
+            logger.warning("读取学习状态失败: %s", exc)
+            return
+        if not data.get("has_goal"):
+            self._assistant_goal_label.setText("还没有目标——对她说一句「我要学英语」就行。")
+            self._assistant_goal_progress.setText("—")
+        else:
+            goal = data.get("goal") or {}
+            progress = data.get("progress") or {}
+            self._assistant_goal_label.setText(
+                "%s（%s）%s" % (goal.get("title") or "", goal.get("category") or "通用",
+                               "· 期限 " + (goal.get("deadline") or "未定")))
+            self._assistant_goal_progress.setText(
+                "任务 %d/%d · 进度 %d%% · 累计 %d 分钟"
+                % (progress.get("done_tasks", 0), progress.get("total_tasks", 0),
+                   int(round(float(progress.get("progress") or 0) * 100)),
+                   int(progress.get("minutes") or 0)))
+        last = data.get("last_session") or {}
+        last_text = "—"
+        if last:
+            status_map = {"completed": "完成", "partial": "部分完成",
+                          "abandoned": "中断", "paused": "暂停", "active": "进行中"}
+            last_text = "%s（%s，实际 %s 分钟）" % (
+                last.get("started_at") or "", status_map.get(last.get("status"), last.get("status")),
+                last.get("actual_minutes") or 0)
+        self._assistant_study_stats.setText(
+            "连续学习 %d 天 · 最近一次：%s" % (int(data.get("streak") or 0), last_text))
+        weak = data.get("weak") or []
+        due = data.get("due") or []
+        lines = []
+        if weak:
+            lines.append("薄弱：" + "、".join(str(item.get("content")) for item in weak[:5]))
+        if due:
+            lines.append("待复习：" + "、".join(str(item.get("content")) for item in due[:5]))
+        if last.get("summary"):
+            lines.append("上次小结：" + str(last["summary"])[:80])
+        self._assistant_study_weak.setText("\n".join(lines) if lines else "暂无记录。")
 
     def _build_assistant_schedule_page(self, sub):
         page = QWidget()
@@ -942,6 +1008,7 @@ class MainWindow(QMainWindow):
             self._assistant_observations.setText(
                 "\n".join("· " + note for note in notes) if notes else "暂时还没有明显发现。")
             self._refresh_assistant_schedule(user_id)
+            self._refresh_assistant_study(user_id)
         except Exception as exc:
             logger.warning("读取行为规律失败: %s", exc)
             self._assistant_status.setText("读取失败，稍后会自动重试。")

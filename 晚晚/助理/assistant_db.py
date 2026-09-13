@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS knowledge_items (
     subject       TEXT DEFAULT '',
     content       TEXT NOT NULL,
     answer        TEXT DEFAULT '',
+    extra         TEXT,                       -- JSON：音标/例句等附加信息
     mastery       REAL DEFAULT 0,
     correct_count INTEGER DEFAULT 0,
     wrong_count   INTEGER DEFAULT 0,
@@ -217,6 +218,8 @@ def _migrate(conn: sqlite3.Connection, version: int):
         })
     if version < 2:
         _ensure_columns(conn, "schedules", {"reminded_at": "reminded_at TEXT"})
+    if version < 3:
+        _ensure_columns(conn, "knowledge_items", {"extra": "extra TEXT"})
     return SCHEMA_VERSION
 
 
@@ -616,6 +619,178 @@ def update_task(task_id: int, **fields) -> bool:
     columns = ", ".join("%s = ?" % key for key in updates)
     return execute("UPDATE tasks SET %s WHERE id = ?" % columns,
                    tuple(updates.values()) + (int(task_id),))
+
+
+# =============================================================================
+# 学习会话 / 知识点（Phase 3-4）
+# =============================================================================
+
+SESSION_FIELDS = ("goal_id", "task_id", "started_at", "ended_at", "planned_minutes",
+                  "actual_minutes", "status", "progress", "summary")
+
+
+def add_session(user_id: str, goal_id=None, task_id=None, planned_minutes: int = 10,
+                status: str = "active", started_at: str = ""):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _lock:
+            cur = conn.execute(
+                "INSERT INTO study_sessions (user_id, goal_id, task_id, started_at, "
+                "  planned_minutes, status, progress) VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (str(user_id), goal_id, task_id, started_at or now, int(planned_minutes), status),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("新建学习会话失败: %s", exc)
+        return None
+
+
+def update_session(session_id: int, **fields) -> bool:
+    updates = {k: v for k, v in fields.items() if k in SESSION_FIELDS}
+    if not updates:
+        return False
+    columns = ", ".join("%s = ?" % key for key in updates)
+    return execute("UPDATE study_sessions SET %s WHERE id = ?" % columns,
+                   tuple(updates.values()) + (int(session_id),))
+
+
+def get_session(session_id: int):
+    rows = query("SELECT * FROM study_sessions WHERE id = ?", (int(session_id),))
+    return dict(rows[0]) if rows else None
+
+
+def get_open_session(user_id: str):
+    """取当前未结束的会话（active / paused）。"""
+    rows = query(
+        "SELECT * FROM study_sessions WHERE user_id = ? AND status IN ('active','paused') "
+        "ORDER BY id DESC LIMIT 1", (str(user_id),))
+    return dict(rows[0]) if rows else None
+
+
+def list_sessions(user_id: str, limit: int = 10) -> list:
+    rows = query(
+        "SELECT * FROM study_sessions WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (str(user_id), max(1, int(limit))))
+    return [dict(row) for row in rows]
+
+
+def get_last_finished_session(user_id: str):
+    rows = query(
+        "SELECT * FROM study_sessions WHERE user_id = ? AND status IN ('completed','partial','abandoned') "
+        "ORDER BY id DESC LIMIT 1", (str(user_id),))
+    return dict(rows[0]) if rows else None
+
+
+# ---------------------------------------------------------------- 知识点
+
+def add_knowledge(user_id: str, content: str, answer: str = "", subject: str = "",
+                  goal_id=None, extra: dict = None):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _lock:
+            cur = conn.execute(
+                "INSERT INTO knowledge_items (user_id, goal_id, subject, content, answer, extra, "
+                "  status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'unknown', ?, ?)",
+                (str(user_id), goal_id, subject or "", (content or "").strip(), answer or "",
+                 json.dumps(extra, ensure_ascii=False) if extra else None, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("新建知识点失败: %s", exc)
+        return None
+
+
+def get_knowledge(knowledge_id: int):
+    rows = query("SELECT * FROM knowledge_items WHERE id = ?", (int(knowledge_id),))
+    if not rows:
+        return None
+    item = dict(rows[0])
+    item["extra"] = _loads(item.get("extra"), {})
+    return item
+
+
+def list_knowledge(user_id: str, goal_id=None, statuses=None, limit: int = 100) -> list:
+    sql = "SELECT * FROM knowledge_items WHERE user_id = ?"
+    params = [str(user_id)]
+    if goal_id is not None:
+        sql += " AND goal_id = ?"
+        params.append(int(goal_id))
+    if statuses:
+        sql += " AND status IN (%s)" % ",".join("?" for _ in statuses)
+        params.extend(list(statuses))
+    sql += " ORDER BY mastery ASC, id ASC LIMIT ?"
+    params.append(max(1, int(limit)))
+    out = []
+    for row in query(sql, tuple(params)):
+        item = dict(row)
+        item["extra"] = _loads(item.get("extra"), {})
+        out.append(item)
+    return out
+
+
+def update_knowledge(knowledge_id: int, **fields) -> bool:
+    allowed = ("mastery", "correct_count", "wrong_count", "last_seen", "next_review",
+               "status", "answer", "extra", "subject", "goal_id")
+    updates = {}
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        if key == "extra" and not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        updates[key] = value
+    if not updates:
+        return False
+    updates["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    columns = ", ".join("%s = ?" % key for key in updates)
+    return execute("UPDATE knowledge_items SET %s WHERE id = ?" % columns,
+                   tuple(updates.values()) + (int(knowledge_id),))
+
+
+def due_reviews(user_id: str, day: str = "", limit: int = 5) -> list:
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    rows = query(
+        "SELECT * FROM knowledge_items WHERE user_id = ? AND next_review IS NOT NULL "
+        "AND next_review <= ? ORDER BY next_review ASC LIMIT ?",
+        (str(user_id), day + " 23:59:59", max(1, int(limit))))
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["extra"] = _loads(item.get("extra"), {})
+        out.append(item)
+    return out
+
+
+def add_review_record(user_id: str, knowledge_id: int, result: str, interval_days: float = 0):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _lock:
+            conn.execute(
+                "INSERT INTO review_records (user_id, knowledge_id, result, interval_days, reviewed_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (str(user_id), int(knowledge_id), str(result), float(interval_days), now),
+            )
+            conn.commit()
+        return True
+    except sqlite3.Error as exc:
+        rollback_quietly(conn)
+        logger.warning("写入复习记录失败: %s", exc)
+        return False
+
+
+def study_days(user_id: str, limit: int = 60) -> list:
+    """有过学习会话的日期（倒序），用于计算连续学习天数。"""
+    rows = query(
+        "SELECT DISTINCT substr(started_at, 1, 10) AS day FROM study_sessions "
+        "WHERE user_id = ? AND status IN ('completed','partial') ORDER BY day DESC LIMIT ?",
+        (str(user_id), max(1, int(limit))))
+    return [row["day"] for row in rows if row["day"]]
 
 
 init_db()
