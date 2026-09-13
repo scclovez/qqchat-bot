@@ -42,6 +42,7 @@ try:
     import image_verifier
     import emotion_history
     import companion_strategy
+    import english_profile
 except Exception as _assistant_exc:  # noqa: BLE001
     adb_assistant = None
     behavior_profile = None
@@ -51,6 +52,7 @@ except Exception as _assistant_exc:  # noqa: BLE001
     image_verifier = None
     emotion_history = None
     companion_strategy = None
+    english_profile = None
     logging.getLogger(__name__).warning("助理系统加载失败，功能自动降级: %s", _assistant_exc)
 
 # 主动消息优先级（与 晚晚/助理/schedule_manager.py 的取值保持一致）
@@ -1211,6 +1213,15 @@ class QQGirlfriendBot:
             if handled:
                 await self._finish_typing(msg_type, user_id)
                 return
+        # 英语自然摸底：它不是学习会话里的判题，先于普通聊天接住回答；
+        # 但日常聊天与暂停意图仍交回正常的人设链路。
+        if (english_profile is not None and goal_manager is not None and not is_group
+                and self._is_intimate_user(user_id)):
+            handled = await self._handle_english_assessment(
+                msg_type, target_id, user_id, message_id, raw_message, turn_revision)
+            if handled:
+                await self._finish_typing(msg_type, user_id)
+                return
         # 学习图片：打卡截图 / 作业试卷 / 教材笔记 → 走学习图片逻辑（其余图片照旧）
         if (image_verifier is not None and adb_assistant is not None and not is_group
                 and self._is_intimate_user(user_id)):
@@ -1880,6 +1891,21 @@ class QQGirlfriendBot:
         goal = goal_manager.active_goal(user_id)
         if not goal:
             return False  # 还没立目标 → 交给普通对话，让她自然回应
+        # 第一次英语学习先用极短的自然摸底了解基础；没有连续发卷、没有直接开背词。
+        if goal.get("category") == "english" and english_profile is not None:
+            question = english_profile.pending_question(user_id)
+            if question:
+                reply = await self._study_persona_reply(
+                    user_id,
+                    "他想开始学英语。你在先了解他的基础，不要说测试、等级或系统。"
+                    "自然地像坐在他身边随口问一句，并且必须把这句话原样带出来："
+                    + question["text"], event="assessment")
+                sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                               force_voice=False, expected_revision=turn_revision)
+                if sent:
+                    self._memory.add_message(user_id, "assistant", sent)
+                    longterm_memory.add_chat_history(user_id, "assistant", sent)
+                return True
         try:
             cards = await study_session.ensure_word_pool(user_id, goal, self._llm_task.chat)
         except Exception as exc:
@@ -1904,6 +1930,53 @@ class QQGirlfriendBot:
             longterm_memory.add_chat_history(user_id, "assistant", sent)
         await self._present_word_card(msg_type, target_id, user_id, message_id, cards[0],
                                       turn_revision)
+        return True
+
+    async def _handle_english_assessment(self, msg_type, target_id, user_id, message_id, text,
+                                         turn_revision):
+        """处理一题自然摸底；明显是在聊天或想停下时绝不强行判成回答。"""
+        if not english_profile.has_pending_assessment(user_id):
+            return False
+        if schedule_manager is not None and schedule_manager.looks_like_schedule(text):
+            return False
+        if goal_manager is not None and goal_manager.looks_like_goal(text):
+            return False
+        pending_turn = (companion_strategy.classify_pending_turn(text)
+                        if companion_strategy is not None else None)
+        if (pending_turn is not None and pending_turn.kind != "answer"
+                and not english_profile.looks_like_pending_answer(user_id, text)):
+            return False
+        result = english_profile.grade_pending_answer(user_id, text)
+        if not result:
+            return False
+        try:
+            goal_manager.refresh_english_goal_plan(user_id, result.get("profile") or {})
+        except Exception as exc:
+            logger.debug("英语画像更新后调整计划失败 [%s]: %s", user_id, exc)
+        self._memory.add_message(user_id, "user", text)
+        longterm_memory.add_chat_history(user_id, "user", text)
+        score = float(result.get("score") or 0)
+        next_question = result.get("next_question") or {}
+        if next_question:
+            instruction = (
+                "他刚回答了你随口问的英语小问题。"
+                + ("他答得对，轻轻夸一下。" if score >= 0.8 else
+                   "他这题还不熟，别说答错，更别用考试口吻；给他一点安慰。")
+                + "接着自然问下一句，必须把这句话原样带出来：" + next_question["text"]
+            )
+        else:
+            profile = result.get("profile") or {}
+            focus = (profile.get("recommendation") or {}).get("focus_name") or "先稳住基础"
+            instruction = (
+                "你刚大概了解了他目前的英语基础。不要报分、不要给他贴等级标签。"
+                "用女友的方式告诉他：之后先" + focus + "，你会带着他慢慢来；一句到两句就好。"
+            )
+        reply = await self._study_persona_reply(user_id, instruction, event="assessment_result")
+        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                       force_voice=False, expected_revision=turn_revision)
+        if sent:
+            self._memory.add_message(user_id, "assistant", sent)
+            longterm_memory.add_chat_history(user_id, "assistant", sent)
         return True
 
     async def _handle_study_image(self, msg_type, target_id, user_id, message_id, data,
@@ -2139,6 +2212,12 @@ class QQGirlfriendBot:
         """用她的语气确认学习目标（不输出系统化计划表）。"""
         tasks = "、".join(item["title"] for item in created_goal.get("tasks") or [])
         fact = f"目标：{created_goal.get('title')}"
+        profile = created_goal.get("english_profile") or {}
+        if created_goal.get("category") == "english":
+            fact += "；你会先根据他已有的学习记录了解基础，再用几道很短的小问题确认，不会一上来就让他背词"
+            focus = (profile.get("recommendation") or {}).get("focus_name")
+            if focus:
+                fact += "；目前倾向于" + focus
         if tasks:
             fact += f"；你打算每天陪他做：{tasks}"
         if created_goal.get("deadline"):
@@ -2148,7 +2227,7 @@ class QQGirlfriendBot:
                 {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER},
                 {"role": "user", "content": f"用户刚对你说：「{text}」。你已经把这件事当成你们的目标定下来了"
                                             f"（{fact}）。请用一句符合你人设的话回应他，表示你会陪他一起，"
-                                            "不要罗列计划字段。"},
+                                            "英语目标要让他知道你会先了解他再带着他学；不要罗列计划字段。"},
             ]
             reply = await self._deepseek.chat(messages, temperature=0.85, max_tokens=140)
             reply = (reply or "").strip()

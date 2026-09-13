@@ -81,6 +81,7 @@ def test_schema():
     expected = {
         "behavior_evidence", "user_behavior_profile", "schedules", "goals", "tasks",
         "study_sessions", "knowledge_items", "review_records", "schema_meta",
+        "english_profiles", "english_assessment_events",
     }
     missing = expected - names
     assert not missing, f"缺少表: {missing}"
@@ -662,6 +663,38 @@ def test_emotion_history_and_block_log():
     assert stats["blocked"] == 1 and stats["sent"] == 0
 
 
+def test_english_profile_onboarding_and_adaptive_plan():
+    """英语先画像再学习：三题自然摸底后，AI 待办应按薄弱项改成第一周试运行计划。"""
+    import english_profile as ep
+    import goal_manager as gm
+    user = "test_english_profile"
+    created = asyncio.run(gm.create_goal(user, "我要过四级", llm_call=None))
+    assert created and created["category"] == "english"
+    assert created["tasks"][0]["title"] == "英语基础摸底", created["tasks"]
+    initial = adb.get_english_profile(user)
+    assert initial and initial["overall_level"] == "待评估"
+
+    first = ep.pending_question(user)
+    assert first["dimension"] == "vocabulary" and "borrow" in first["text"]
+    result = ep.grade_pending_answer(user, "不知道")
+    assert result["score"] == 0 and result["next_question"]["dimension"] == "grammar"
+    assert ep.grade_pending_answer(user, "went")["score"] == 1
+    assert ep.looks_like_pending_answer(user, "没赶上公交车，所以走路去学校"), \
+        "阅读题的正常回答不能被聊天保护误拦"
+    final = ep.grade_pending_answer(user, "没赶上公交车，所以走路去学校")
+    profile = final["profile"]
+    assert not final["next_question"], "三道核心小题后应停止，不拉成长测试"
+    assert profile["skills"]["vocabulary"]["score"] == 0
+    assert profile["skills"]["grammar"]["score"] == 1
+    assert profile["recommendation"]["focus"] == "vocabulary", profile["recommendation"]
+
+    changed = gm.refresh_english_goal_plan(user, profile, created["goal_id"])
+    tasks = adb.list_tasks(user, goal_id=created["goal_id"])
+    assert changed and tasks[0]["title"] == "核心词汇巩固", tasks
+    events = adb.list_english_assessment_events(user)
+    assert len(events) == 3 and {row["dimension"] for row in events} == set(ep.CORE_DIMENSIONS)
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -693,6 +726,7 @@ def run_into(check):
     check("活跃时段不覆盖全天", test_active_periods_not_all_day)
     check("小晚作息渐进靠近用户", test_own_routine_gradually_adapts_to_user)
     check("情绪曲线与压制原因账", test_emotion_history_and_block_log)
+    check("英语画像与自适应计划", test_english_profile_onboarding_and_adaptive_plan)
 
 
 def main():

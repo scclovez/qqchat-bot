@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 import assistant_db as adb
 import schedule_manager as sm
+import english_profile as ep
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ _PLAN_PROMPT = (
     "你是学习计划助手。请把目标拆成本周可执行的每日任务，输出 JSON 数组，不要解释。"
     "每个元素：{{\"title\": 任务名（≤14字）, \"minutes\": 每次分钟数, \"per_week\": 每周次数}}。"
     "用户一次能坚持约 {minutes} 分钟，请把单次任务控制在 5-45 分钟之间，宁可短而能坚持。"
-    "目标：{goal}（{category}），期限：{deadline}。最多 3 条。"
+    "目标：{goal}（{category}），期限：{deadline}。{profile_context}最多 3 条。"
 )
 
 _WORD_PROMPT = (
@@ -66,7 +67,7 @@ _WORD_PROMPT = (
     "输出 JSON 数组，不要解释。每个元素字段："
     "{{\"word\": 英文单词, \"phonetic\": 音标（含斜杠）, \"meaning\": 中文释义（≤10字）, "
     "\"example_en\": 一句地道的英文例句（6-12 词，必须包含该单词）, \"example_cn\": 例句中文翻译}}。"
-    "不要重复单词，难度贴合目标水平。"
+    "不要重复单词，难度贴合目标水平。{profile_context}"
 )
 
 
@@ -83,18 +84,20 @@ def _extract_json_list(raw: str):
 
 
 async def plan_tasks(goal_title: str, category: str, deadline: str, llm_call,
-                     comfortable_minutes: int = 0) -> list:
+                     comfortable_minutes: int = 0, english_profile: dict = None) -> list:
     """把目标拆成每日任务（LLM 结果必须通过本地校验，失败则用规则兜底）。"""
     minutes = comfortable_minutes or DEFAULT_SESSION_MINUTES
     minutes = max(MIN_SESSION_MINUTES, min(MAX_SESSION_MINUTES, int(minutes)))
-    fallback = _default_tasks(category, goal_title, minutes)
+    fallback = _default_tasks(category, goal_title, minutes, english_profile)
     if llm_call is None:
         return fallback
     try:
         raw = await llm_call(
             [{"role": "system", "content": _PLAN_PROMPT.format(
                 minutes=minutes, goal=goal_title, category=category or "通用",
-                deadline=deadline or "未指定")},
+                deadline=deadline or "未指定",
+                profile_context=("英语画像：" + ep.generation_context_from_profile(english_profile)
+                                 if category == "english" else ""))},
              {"role": "user", "content": goal_title}],
             temperature=0.3, max_tokens=400, disable_thinking=True,
         )
@@ -124,10 +127,9 @@ async def plan_tasks(goal_title: str, category: str, deadline: str, llm_call,
     return tasks or fallback
 
 
-def _default_tasks(category: str, goal_title: str, minutes: int) -> list:
+def _default_tasks(category: str, goal_title: str, minutes: int, english_profile: dict = None) -> list:
     if category == "english":
-        return [{"title": "背单词", "minutes": minutes, "per_week": 6},
-                {"title": "读一篇短文", "minutes": minutes + 5, "per_week": 3}]
+        return ep.recommended_tasks(english_profile or {}, minutes)
     if category == "japanese":
         return [{"title": "五十音/单词", "minutes": minutes, "per_week": 6},
                 {"title": "听力跟读", "minutes": minutes, "per_week": 3}]
@@ -159,7 +161,8 @@ async def create_goal(user_id: str, text: str, llm_call=None) -> dict:
     if goal_id is None:
         return {}
     minutes = comfortable_minutes(user_id)
-    tasks = await plan_tasks(title, category, deadline, llm_call, minutes)
+    profile = ep.prepare_profile(user_id, target=text) if category == "english" else {}
+    tasks = await plan_tasks(title, category, deadline, llm_call, minutes, profile)
     task_ids = []
     for item in tasks:
         task_id = adb.add_task(
@@ -171,7 +174,36 @@ async def create_goal(user_id: str, text: str, llm_call=None) -> dict:
             task_ids.append(task_id)
     return {"goal_id": goal_id, "title": title, "category": category,
             "deadline": deadline, "tasks": tasks, "task_ids": task_ids,
-            "minutes": minutes}
+            "minutes": minutes, "english_profile": profile}
+
+
+def refresh_english_goal_plan(user_id: str, profile: dict, goal_id: int = None) -> list:
+    """画像变化后，只调整尚未开始的 AI 英语任务；不改用户手工日程和已完成记录。"""
+    goal = active_goal(user_id)
+    if goal_id:
+        goal = next((item for item in adb.list_goals(user_id, statuses=("active",))
+                     if item.get("id") == goal_id), goal)
+    if not goal or goal.get("category") != "english":
+        return []
+    minutes = comfortable_minutes(user_id)
+    wanted = ep.recommended_tasks(profile, minutes)
+    pending = [item for item in adb.list_tasks(user_id, goal_id=goal["id"], statuses=("pending",))
+               if item.get("source") == "ai"]
+    changed = []
+    for index, item in enumerate(wanted):
+        title = item["title"]
+        description = "本周试运行，每周 %d 次；会按你的实际表现继续调整" % item["per_week"]
+        if index < len(pending):
+            adb.update_task(pending[index]["id"], title=title, planned_minutes=item["minutes"],
+                            description=description)
+            changed.append(pending[index]["id"])
+        else:
+            task_id = adb.add_task(
+                user_id, title, goal_id=goal["id"], planned_minutes=item["minutes"],
+                priority=sm.PRIORITY_STUDY_TASK, source="ai", movable=1, description=description)
+            if task_id:
+                changed.append(task_id)
+    return changed
 
 
 def _clean_goal_title(text: str) -> str:

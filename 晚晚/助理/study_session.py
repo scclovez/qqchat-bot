@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 import assistant_db as adb
 import goal_manager as gm
+import english_profile as ep
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +35,15 @@ def _extract_json_list(raw: str):
     return data if isinstance(data, list) else None
 
 
-async def generate_word_cards(goal_title: str, count: int, llm_call) -> list:
+async def generate_word_cards(goal_title: str, count: int, llm_call, profile_context: str = "") -> list:
     """生成词卡（LLM 结果逐字段校验，缺失例句的直接丢弃）。"""
     if llm_call is None:
         return []
     try:
         raw = await llm_call(
             [{"role": "system", "content": gm._WORD_PROMPT.format(
-                goal=goal_title or "英语", count=int(count))},
+                goal=goal_title or "英语", count=int(count),
+                profile_context=(profile_context or ""))},
              {"role": "user", "content": goal_title or "四级词汇"}],
             temperature=0.6, max_tokens=900, disable_thinking=True,
         )
@@ -77,8 +79,10 @@ async def ensure_word_pool(user_id: str, goal, llm_call, want: int = WORDS_PER_S
     unseen = [row for row in pool if row.get("status") == "unknown"]
     if len(unseen) >= want:
         return unseen[:want]
-    cards = await generate_word_cards((goal or {}).get("title") or "英语",
-                                      want - len(unseen) + 2, llm_call)
+    cards = await generate_word_cards(
+        (goal or {}).get("title") or "英语", want - len(unseen) + 2, llm_call,
+        profile_context=ep.generation_context(user_id),
+    )
     for card in cards:
         adb.add_knowledge(
             user_id, card["word"], answer=card["meaning"], subject=subject, goal_id=goal_id,
@@ -195,6 +199,9 @@ def record_answer(user_id: str, knowledge_id: int, correct: bool) -> dict:
                          status=status, next_review=next_review,
                          last_seen=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     adb.add_review_record(user_id, knowledge_id, "correct" if correct else "wrong", step)
+    if (item.get("subject") or "").lower() == "english":
+        # 词卡不是全部英语能力，但它是词汇维度的一条真实长期证据。
+        ep.record_practice_result(user_id, "vocabulary", correct, source="word_card")
     return {"mastery": round(mastery, 3), "status": status, "next_review": next_review,
             "correct_count": correct_count, "wrong_count": wrong_count}
 

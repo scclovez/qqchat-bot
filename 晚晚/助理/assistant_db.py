@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -225,6 +225,35 @@ CREATE TABLE IF NOT EXISTS proactive_blocks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_proactive_blocks_day ON proactive_blocks(user_id, day);
+
+-- 英语学习画像：只保存可追溯的分项结论；具体证据保留在 english_assessment_events。
+CREATE TABLE IF NOT EXISTS english_profiles (
+    user_id          TEXT PRIMARY KEY,
+    target           TEXT DEFAULT '',
+    overall_level    TEXT DEFAULT '待评估',
+    skills           TEXT DEFAULT '{}',      -- JSON：词汇/语法/阅读/听力/写作/口语/拼写
+    weak_points      TEXT DEFAULT '[]',
+    pending_dimensions TEXT DEFAULT '[]',
+    recommendation   TEXT DEFAULT '{}',
+    confidence       REAL DEFAULT 0,
+    evidence_count   INTEGER DEFAULT 0,
+    assessment_state TEXT DEFAULT '{}',      -- JSON：当前自然摸底题；不存聊天原文
+    last_assessed    TEXT,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS english_assessment_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     TEXT NOT NULL,
+    dimension   TEXT NOT NULL,
+    score       REAL NOT NULL,               -- 0-1，仅代表这一题/这一轮的表现
+    source      TEXT DEFAULT '',             -- history / onboarding / word_card / material
+    detail      TEXT DEFAULT '',             -- 极短说明，不保存用户原始聊天
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_english_assessment_user
+    ON english_assessment_events(user_id, dimension, id DESC);
 """
 
 
@@ -285,6 +314,21 @@ def _migrate(conn: sqlite3.Connection, version: int):
             " state TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
             "CREATE INDEX IF NOT EXISTS idx_proactive_blocks_day"
             " ON proactive_blocks(user_id, day);")
+    if version < 7:
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS english_profiles ("
+            " user_id TEXT PRIMARY KEY, target TEXT DEFAULT '', overall_level TEXT DEFAULT '待评估',"
+            " skills TEXT DEFAULT '{}', weak_points TEXT DEFAULT '[]',"
+            " pending_dimensions TEXT DEFAULT '[]', recommendation TEXT DEFAULT '{}',"
+            " confidence REAL DEFAULT 0, evidence_count INTEGER DEFAULT 0,"
+            " assessment_state TEXT DEFAULT '{}', last_assessed TEXT,"
+            " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+            "CREATE TABLE IF NOT EXISTS english_assessment_events ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, dimension TEXT NOT NULL,"
+            " score REAL NOT NULL, source TEXT DEFAULT '', detail TEXT DEFAULT '',"
+            " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+            "CREATE INDEX IF NOT EXISTS idx_english_assessment_user"
+            " ON english_assessment_events(user_id, dimension, id DESC);")
     return SCHEMA_VERSION
 
 
@@ -451,6 +495,75 @@ def history_users() -> list:
     """聊天记录里出现过的用户（回填时逐个处理）。"""
     rows = query("SELECT DISTINCT user_id FROM chat_history ORDER BY user_id")
     return [str(row["user_id"]) for row in rows if row["user_id"]]
+
+
+# =============================================================================
+# 英语学习画像
+# =============================================================================
+
+def get_english_profile(user_id: str):
+    """读取英语画像，并把 JSON 字段还原为结构化值。"""
+    rows = query("SELECT * FROM english_profiles WHERE user_id = ?", (str(user_id),))
+    if not rows:
+        return None
+    item = dict(rows[0])
+    for key, default in (("skills", {}), ("weak_points", []),
+                         ("pending_dimensions", []), ("recommendation", {}),
+                         ("assessment_state", {})):
+        item[key] = _loads(item.get(key), default)
+    return item
+
+
+def save_english_profile(user_id: str, target: str = "", overall_level: str = "待评估",
+                         skills: dict = None, weak_points: list = None,
+                         pending_dimensions: list = None, recommendation: dict = None,
+                         confidence: float = 0.0, evidence_count: int = 0,
+                         assessment_state: dict = None, last_assessed: str = "") -> bool:
+    """整份写回画像；唯一键保证同一用户始终只有一份当前结论。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return execute(
+        "INSERT INTO english_profiles (user_id, target, overall_level, skills, weak_points, "
+        "pending_dimensions, recommendation, confidence, evidence_count, assessment_state, "
+        "last_assessed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET target=excluded.target, "
+        "overall_level=excluded.overall_level, skills=excluded.skills, weak_points=excluded.weak_points, "
+        "pending_dimensions=excluded.pending_dimensions, recommendation=excluded.recommendation, "
+        "confidence=excluded.confidence, evidence_count=excluded.evidence_count, "
+        "assessment_state=excluded.assessment_state, last_assessed=excluded.last_assessed, "
+        "updated_at=excluded.updated_at",
+        (str(user_id), (target or "")[:80], (overall_level or "待评估")[:30],
+         json.dumps(skills or {}, ensure_ascii=False),
+         json.dumps(weak_points or [], ensure_ascii=False),
+         json.dumps(pending_dimensions or [], ensure_ascii=False),
+         json.dumps(recommendation or {}, ensure_ascii=False),
+         max(0.0, min(1.0, float(confidence))), max(0, int(evidence_count)),
+         json.dumps(assessment_state or {}, ensure_ascii=False), last_assessed or None, now, now),
+    )
+
+
+def add_english_assessment_event(user_id: str, dimension: str, score: float,
+                                 source: str = "", detail: str = "") -> bool:
+    """记录一条可回看、但不保存原始聊天内容的英语能力证据。"""
+    allowed = {"vocabulary", "grammar", "reading", "listening", "writing", "speaking", "spelling"}
+    if dimension not in allowed:
+        return False
+    return execute(
+        "INSERT INTO english_assessment_events (user_id, dimension, score, source, detail) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (str(user_id), dimension, max(0.0, min(1.0, float(score))),
+         (source or "")[:30], (detail or "")[:120]),
+    )
+
+
+def list_english_assessment_events(user_id: str, dimension: str = "", limit: int = 80) -> list:
+    sql = "SELECT * FROM english_assessment_events WHERE user_id = ?"
+    params = [str(user_id)]
+    if dimension:
+        sql += " AND dimension = ?"
+        params.append(str(dimension))
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+    return [dict(row) for row in query(sql, tuple(params))]
 
 
 # =============================================================================
