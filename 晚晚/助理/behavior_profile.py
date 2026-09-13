@@ -213,8 +213,8 @@ def _window_stats(user_id: str, window_days: int) -> dict:
         "wake_hour": wake_median, "wake_mad": wake_mad, "wake_n": wake_n,
         "wake_confidence": wake_conf,
         "activity_hours": activity_hist,
-        "active_periods": _ranges_from_histogram(activity_hist),
-        "busy_periods": _ranges_from_histogram(busy_hist, min_weight=2.0),
+        "active_periods": _active_ranges(activity_hist),
+        "busy_periods": _ranges_from_histogram(busy_hist, min_weight=2.0, min_ratio=0.5),
         "study_periods": _ranges_from_histogram(study_hist, min_weight=1.0),
         "night_said_hours": night_hist,
         "wake_hint_hours": wake_hist,
@@ -237,9 +237,18 @@ def _confidence(days: int, mad) -> float:
     return round(max(0.0, min(1.0, confidence)), 3)
 
 
-def _ranges_from_histogram(hist: dict, min_weight: float = 1.0, max_ranges: int = 3) -> list:
-    """把小时分布压成"时段区间"（连续小时合并），按权重从高到低取前几段。"""
-    hours = sorted(h for h, weight in (hist or {}).items() if weight >= min_weight)
+def _ranges_from_histogram(hist: dict, min_weight: float = 1.0, min_ratio: float = 0.0,
+                           max_ranges: int = 3) -> list:
+    """把小时分布压成"时段区间"（连续小时合并，跨零点合并），按权重从高到低取前几段。
+
+    min_ratio：相对阈值（占最高小时的比例）。聊天量大的用户几乎每个小时都有消息，
+    只按"有量"判断会把 0-24 全算成活跃，所以活跃时段必须用相对峰值来卡。
+    """
+    if not hist:
+        return []
+    peak = max(float(v) for v in hist.values())
+    threshold = max(float(min_weight), peak * max(0.0, float(min_ratio)))
+    hours = sorted(h for h, weight in hist.items() if float(weight) >= threshold)
     if not hours:
         return []
     groups = [[hours[0]]]
@@ -248,13 +257,30 @@ def _ranges_from_histogram(hist: dict, min_weight: float = 1.0, max_ranges: int 
             groups[-1].append(hour)
         else:
             groups.append([hour])
+    # 跨零点：0 点与 23 点都被选中时合并为一段（23:00-01:00 → end=25）
+    merged_cross = len(groups) > 1 and groups[0][0] == 0 and groups[-1][-1] == 23
+    if merged_cross:
+        groups[0] = groups.pop() + groups[0]
     scored = []
     for group in groups:
         weight = sum(float(hist.get(h, 0)) for h in group)
-        scored.append((weight, group[0], group[-1] + 1))
+        if merged_cross and group is groups[0]:
+            scored.append((weight, 23, 25))
+        else:
+            scored.append((weight, group[0], group[-1] + 1))
     scored.sort(reverse=True)
     return [{"start": start, "end": end, "weight": round(weight, 1)}
             for weight, start, end in scored[:max_ranges]]
+
+
+def _active_ranges(hist: dict) -> list:
+    """活跃时段：按峰值 60% 取，避免"每个小时都有消息"时显示成 0-24 点。"""
+    ranges = _ranges_from_histogram(hist, min_weight=2.0, min_ratio=0.6)
+    covered = sum(max(0, int(item["end"]) - int(item["start"])) for item in ranges)
+    if covered > 14 and hist:
+        # 兜底：仍然太宽 → 只保留权重最高的那一段
+        ranges = _ranges_from_histogram(hist, min_weight=2.0, min_ratio=0.85, max_ranges=1)
+    return ranges
 
 
 def recompute(user_id: str, force: bool = False) -> dict:

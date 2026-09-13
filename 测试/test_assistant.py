@@ -544,6 +544,26 @@ def test_history_backfill():
     assert after["messages"] == data["messages"], "重复回填不得让证据翻倍"
 
 
+def test_active_periods_not_all_day():
+    """聊天量大时"活跃时段"必须收敛到峰值附近，不能显示成 0-24 点。"""
+    import behavior_profile as bp
+    # 每个小时都有消息（低量），但 20-21 点明显是峰值
+    hist = {hour: 3.0 for hour in range(24)}
+    hist[20] = 40.0
+    hist[21] = 36.0
+    ranges = bp._active_ranges(hist)
+    assert ranges, ranges
+    covered = sum(int(item["end"]) - int(item["start"]) for item in ranges)
+    assert covered <= 14, "活跃时段不得覆盖全天：%s" % ranges
+    assert any(int(item["start"]) <= 20 < int(item["end"]) for item in ranges), ranges
+    assert not (len(ranges) == 1 and ranges[0]["start"] == 0 and ranges[0]["end"] == 24)
+    # 跨零点合并：23 点与 0 点都活跃 → 一段 23:00-01:00
+    late = {23: 30.0, 0: 28.0, 20: 6.0}
+    late_ranges = bp._ranges_from_histogram(late, min_weight=1.0, min_ratio=0.6)
+    merged = [item for item in late_ranges if item["start"] == 23]
+    assert merged and merged[0]["end"] == 25, late_ranges
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -570,6 +590,7 @@ def run_into(check):
     check("学习图片上下文判定", test_study_image_context_gate)
     check("作业纠错与教材解析", test_homework_and_material_parsing)
     check("历史聊天记录回填", test_history_backfill)
+    check("活跃时段不覆盖全天", test_active_periods_not_all_day)
 
 
 def main():
