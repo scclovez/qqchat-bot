@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """开发环境综合测试：一键验证所有模块可导入、配置可加载、成长系统正常、GUI 可构建。
 
-用法（在 开发 项目根运行）：
+用法（在项目根运行）：
     python 测试/test_all.py
 
 测试项：
-    1. 全部业务模块导入（config / memory / qq_bot / tts / image_gen ...）
+    1. 全部业务模块导入（config / memory / qq_bot / tts / image_gen / behavior_profile ...）
     2. 配置加载（.env 与 llm_providers.json 若存在则校验；纯开发版可跳过）
-    3. 成长系统（性格阶段 / 淫乱度档位 / 称号 计算不抛异常）
+    3. 成长系统（性格阶段 / 淫乱度档位 / 称号 / 生活线 / 对话策略 计算不抛异常）
     4. 提供商配置读写（llm_providers.json 可读写）
-    5. GUI 冒烟（PySide6 构建 7 个页面，校验素材删除边界并自动关闭）
+    5. GUI 冒烟（PySide6 构建 8 个页面，校验素材删除边界与「生活与学习」页并自动关闭）
+    6. 助理系统（行为规律推断：单次异常不形成结论、多日提高置信度、近期覆盖长期、智能静默优先级等）
 """
 import atexit
 import asyncio
@@ -79,6 +80,7 @@ def test_imports():
         "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
         "asr", "diary", "personality_state", "evolution", "evolution_db",
         "active_pull", "qzone", "interact_tools", "tray",
+        "assistant_db", "behavior_profile",
     ]
     for m in mods:
         __import__(m)
@@ -293,7 +295,7 @@ def test_providers():
 
 
 def test_gui():
-    """GUI 冒烟：构建 7 页，校验陪伴页与素材删除权限后自动退出。"""
+    """GUI 冒烟：构建 8 页，校验陪伴页与素材删除权限后自动退出。"""
     from PySide6.QtWidgets import QApplication, QFrame, QPushButton
     from PySide6.QtCore import QTimer
     import gui_qt
@@ -323,6 +325,12 @@ def test_gui():
                 card.maximumHeight() <= 155 for card in win._dashboard_status_cards
             )
             win._refresh_growth_stats()
+            # 助理系统：新一级页「生活与学习」及其四个子页签必须存在且可刷新
+            result["assistant_tabs"] = win._life_study_tabs.count()
+            result["assistant_metrics"] = len(win._assistant_metric_labels)
+            win._assistant_refresh_ts = 0.0
+            win._refresh_assistant_panel()
+            result["assistant_status"] = win._assistant_status.text()
 
             # 模拟接口已返回模型列表：选中下拉项应立即写入模块分派。
             provider_combo, model_combo = win._assign_vars["chat"]
@@ -384,11 +392,14 @@ def test_gui():
 
     QTimer.singleShot(1500, verify)
     app.exec()
-    assert result.get("tabs") == 7, "陪伴状态独立后应有 7 个顶级页"
+    assert result.get("tabs") == 8, "新增「生活与学习」后应有 8 个顶级页"
     assert result.get("growth") == 16, "16 项陪伴指标必须完整保留"
     assert result.get("growth_groups") == 7, "陪伴状态应归并为 7 张分组卡片"
     assert result.get("has_axes"), "性格轮廓应位于分组卡片内"
     assert result.get("compact_dashboard"), "首页三张运行状态卡应保持紧凑"
+    assert result.get("assistant_tabs") == 4, "「生活与学习」应有今日/学习/日程/她对你的了解四个子页签"
+    assert result.get("assistant_metrics") == 4, "「她对你的了解」应展示起床/睡觉/活跃/学习四项推断"
+    assert result.get("assistant_status"), "「她对你的了解」应给出观察状态说明"
     assert result.get("model_selectable"), "获取后的模型必须可选并立即保存"
     assert result.get("generated_delete_button"), "生成图片应显示删除按钮"
     assert result.get("audio_delete_button"), "语音缓存应显示删除按钮"
@@ -396,23 +407,31 @@ def test_gui():
     assert result.get("generated_deleted"), "生成图片删除功能应生效"
     assert result.get("audio_deleted"), "语音缓存删除功能应生效"
     assert result.get("appearance_protected"), "删除逻辑必须保护人设图片"
-    print("      GUI 7 页、紧凑首页、模型分派与素材删除权限 OK")
+    print("      GUI 8 页、紧凑首页、模型分派、素材删除权限与生活学习页 OK")
+
+
+def test_assistant():
+    """助理系统（行为规律 / 日程 / 学习）专项测试。"""
+    import test_assistant
+    test_assistant.run_into(check)
 
 
 def main():
     print("=" * 50)
     print("  AI 电子女友 · 开发环境测试")
     print("=" * 50)
-    print("[1/5] 模块导入")
+    print("[1/6] 模块导入")
     check("模块导入", test_imports)
-    print("[2/5] 配置加载")
+    print("[2/6] 配置加载")
     check("配置加载", test_config)
-    print("[3/5] 成长系统")
+    print("[3/6] 成长系统")
     check("成长系统", test_growth)
-    print("[4/5] 提供商配置")
+    print("[4/6] 提供商配置")
     check("提供商配置", test_providers)
-    print("[5/5] GUI 冒烟")
+    print("[5/6] GUI 冒烟")
     check("GUI 冒烟", test_gui)
+    print("[6/6] 助理系统（行为规律 / 日程 / 学习）")
+    check("助理系统", test_assistant)
     print("=" * 50)
     print(f"结果: {len(PASS)} 通过 / {len(FAIL)} 失败")
     if FAIL:

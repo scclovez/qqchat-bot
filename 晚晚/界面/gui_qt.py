@@ -514,6 +514,7 @@ class MainWindow(QMainWindow):
         self._build_dashboard_tab()
         self._build_personality_tab()
         self._build_companion_tab()
+        self._build_life_study_tab()
         self._build_media_tab()
         self._build_connection_tab()
         self._build_settings_tab()
@@ -707,6 +708,159 @@ class MainWindow(QMainWindow):
         outer.addWidget(growth, 1)
 
         self._refresh_growth_stats()
+
+    # ===================== 生活与学习（助理系统） =====================
+    def _build_life_study_tab(self):
+        """一级页「生活与学习」：今日 / 学习 / 日程 / 她对你的了解。"""
+        tab = QWidget()
+        self.tabs.addTab(tab, "生活与学习")
+        sub = QTabWidget(tab)
+        sub.setTabBar(CenterTabBar(sub))
+        self._life_study_tabs = sub
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(sub)
+        self._build_assistant_today_page(sub)
+        self._build_assistant_study_page(sub)
+        self._build_assistant_schedule_page(sub)
+        self._build_assistant_profile_page(sub)
+
+    def _build_assistant_placeholder(self, sub, title, hint):
+        """尚未开放的子页：明确说明归属阶段，不做成假界面。"""
+        page = QWidget()
+        sub.addTab(page, title)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+        lay.addWidget(_label(title, "PageTitle"))
+        body = _label(hint, "Muted")
+        body.setWordWrap(True)
+        lay.addWidget(body)
+        lay.addStretch(1)
+
+    def _build_assistant_today_page(self, sub):
+        self._build_assistant_placeholder(
+            sub, "今日",
+            "今天的安排、当前任务、完成状态与学习时长会显示在这里，随日程与学习系统一同开放。",
+        )
+
+    def _build_assistant_study_page(self, sub):
+        self._build_assistant_placeholder(
+            sub, "学习",
+            "当前学习目标、阶段进度、连续学习天数、薄弱与待复习知识点、最近一次学习会显示在这里。",
+        )
+
+    def _build_assistant_schedule_page(self, sub):
+        self._build_assistant_placeholder(
+            sub, "日程",
+            "今日 / 明日 / 本周 / 未来重要事项会显示在这里，并区分「你明确的安排」与「她帮你安排的」。",
+        )
+
+    def _build_assistant_profile_page(self, sub):
+        page = QWidget()
+        sub.addTab(page, "她对你的了解")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        outer.addWidget(_label("她对你的了解", "PageTitle"))
+        outer.addWidget(_label(
+            "这些结论是她从聊天时间与内容里自己总结的，不需要你填表；有偏差随时纠正她就好。", "Muted"))
+
+        card, cl = _card(page, "作息与活跃")
+        self._assistant_metric_labels = {}
+        for key, name in (("wake", "最近通常起床"), ("sleep", "最近通常睡觉"),
+                          ("active", "比较活跃"), ("study", "更容易学习")):
+            row = QHBoxLayout()
+            row.addWidget(_label(name + "：", "GrowthMetricName"))
+            row.addStretch(1)
+            value = _label("—", "GrowthMetricValue")
+            level = _label("", "Muted")
+            row.addWidget(value)
+            row.addWidget(level)
+            cl.addLayout(row)
+            self._assistant_metric_labels[key] = (value, level)
+        self._assistant_status = _label("正在读取…", "Muted")
+        self._assistant_status.setWordWrap(True)
+        cl.addWidget(self._assistant_status)
+        outer.addWidget(card)
+
+        obs_card, obs_lay = _card(page, "最近观察到")
+        self._assistant_observations = _label("还没有足够的观察，先多聊几天看看。", "GrowthBody")
+        self._assistant_observations.setWordWrap(True)
+        obs_lay.addWidget(self._assistant_observations)
+        outer.addWidget(obs_card)
+
+        fix_card, fix_lay = _card(page, "纠正她")
+        fix_lay.addWidget(_label("直接说一句就行，例如：我一般 12 点半睡、7 点起。", "Muted"))
+        row = QHBoxLayout()
+        self._assistant_correct_input = QLineEdit()
+        self._assistant_correct_input.setPlaceholderText("我一般 12 点半睡、7 点起")
+        row.addWidget(self._assistant_correct_input, 1)
+        row.addWidget(_btn("提交纠正", "Primary", self._submit_assistant_correction))
+        fix_lay.addLayout(row)
+        outer.addWidget(fix_card)
+        outer.addStretch(1)
+        self._refresh_assistant_panel()
+
+    def _refresh_assistant_panel(self):
+        """刷新「她对你的了解」；节流 15 秒，避免 GUI 高频查询。"""
+        labels = getattr(self, "_assistant_metric_labels", None)
+        if not labels:
+            return
+        now = time.time()
+        if now - getattr(self, "_assistant_refresh_ts", 0.0) < 15.0:
+            return
+        self._assistant_refresh_ts = now
+        try:
+            import behavior_profile as bp
+            user_id = str(getattr(runtime, "PROACTIVE_ONLY_USER_ID", "") or "").strip()
+            if not user_id:
+                for value, level in labels.values():
+                    value.setText("—")
+                    level.setText("")
+                self._assistant_status.setText(
+                    "还没有指定「只对指定 QQ 号主动发消息」，填上你的 QQ 号后她才会开始观察你。")
+                self._assistant_observations.setText("—")
+                return
+            data = bp.summarize(user_id)
+            for key, (value, level) in labels.items():
+                item = data.get(key) or {}
+                value.setText(item.get("text") or "—")
+                level.setText(item.get("level") or "")
+            if data.get("insufficient"):
+                self._assistant_status.setText(
+                    "已观察 %d 天，结论还在形成中（至少需要几天才作数）。" % int(data.get("evidence_days") or 0))
+            else:
+                self._assistant_status.setText(
+                    "已观察 %d 天 · 共 %d 条消息 · 最近更新 %s"
+                    % (int(data.get("evidence_days") or 0), int(data.get("messages") or 0),
+                       data.get("updated") or "—"))
+            notes = data.get("observations") or []
+            self._assistant_observations.setText(
+                "\n".join("· " + note for note in notes) if notes else "暂时还没有明显发现。")
+        except Exception as exc:
+            logger.warning("读取行为规律失败: %s", exc)
+            self._assistant_status.setText("读取失败，稍后会自动重试。")
+
+    def _submit_assistant_correction(self):
+        """把用户的一句纠正作为证据写入（不做手工画像配置页）。"""
+        text = self._assistant_correct_input.text().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "先说一句你的作息，例如：我一般 12 点半睡、7 点起。")
+            return
+        user_id = str(getattr(runtime, "PROACTIVE_ONLY_USER_ID", "") or "").strip()
+        if not user_id:
+            QMessageBox.information(self, "提示", "请先在「设置 → 互动 → 主动消息」里填上你的 QQ 号。")
+            return
+        try:
+            import behavior_profile as bp
+            bp.record_user_correction(user_id, text)
+            self._assistant_correct_input.clear()
+            self._assistant_refresh_ts = 0.0
+            self._refresh_assistant_panel()
+        except Exception as exc:
+            logger.warning("提交作息纠正失败: %s", exc)
+            QMessageBox.warning(self, "提示", "保存失败：%s" % exc)
 
     # ===================== 素材库 =====================
     def _build_media_tab(self):
@@ -2511,6 +2665,7 @@ class MainWindow(QMainWindow):
 
     def _growth_tick(self):
         self._refresh_growth_stats()
+        self._refresh_assistant_panel()
 
     # ===================== QQ 检测 =====================
     def _detect_qq(self):

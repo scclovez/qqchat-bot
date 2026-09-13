@@ -32,6 +32,13 @@ import qzone
 import liveness
 import boundary
 
+# 助理系统（行为规律 / 日程 / 学习）：新模块异常绝不能阻断 bot 启动与聊天
+try:
+    import behavior_profile
+except Exception as _assistant_exc:  # noqa: BLE001
+    behavior_profile = None
+    logging.getLogger(__name__).warning("助理系统（行为规律）加载失败，功能自动降级: %s", _assistant_exc)
+
 logger = logging.getLogger(__name__)
 
 # 拆分发送：只有确实需要分条时，消息之间停 1~2 秒，像正常打字后的补充。
@@ -986,6 +993,13 @@ class QQGirlfriendBot:
             except Exception as exc:
                 # 关系余温属于增强信息，数据库或状态模块异常不能阻断正常聊天。
                 logger.warning("关系状态记录失败，继续处理消息 [%s]: %s", user_id, exc)
+        # 行为规律采集（助理系统）：主对象私聊的「时间戳 + 内容」→ 作息/活跃/学习偏好推断。
+        # 失败只降级为少一条观察，绝不影响聊天。
+        if behavior_profile is not None and not is_group and self._is_intimate_user(user_id):
+            try:
+                behavior_profile.observe_inbound(user_id, raw_message, time.time())
+            except Exception as exc:
+                logger.debug("行为规律采集失败 [%s]: %s", user_id, exc)
         # 音乐分享卡片（网易云/QQ音乐等 json 卡片）→ 专门识别回应，不当普通文本
         music_share = self._extract_music_share(data)
         if music_share:

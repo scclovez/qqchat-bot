@@ -35,6 +35,7 @@ HIDDEN = [
     "deepseek_client", "llm_factory", "live_info", "life_state", "singleton", "tts",
     "asr", "diary", "personality_state", "evolution", "evolution_db",
     "active_pull", "qzone", "interact_tools", "sqlite_runtime", "tray",
+    "assistant_db", "behavior_profile",
     "语音.asr", "语音.tts", "图片.image_gen", "图片.comfyui_client",
     "配置.config", "配置.llm_providers", "界面.gui_qt", "界面.tray",
     "人设.personality", "人设.liveness", "人设.emotion_state", "人设.boundary",
@@ -44,6 +45,7 @@ HIDDEN = [
     "空间.qzone", "互动.interact_tools", "工具.sqlite_runtime", "外貌.appearance_ref",
     "成长.diary", "成长.personality_state", "成长.evolution",
     "成长.evolution_db", "成长.active_pull",
+    "助理.assistant_db", "助理.behavior_profile",
 ]
 
 DATAS = [
