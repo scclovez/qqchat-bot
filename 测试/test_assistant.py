@@ -441,6 +441,53 @@ def test_normal_chat_not_hijacked_in_study_mode():
     assert handled is False
 
 
+def test_companion_strategy_keeps_learning_from_hijacking_chat():
+    """学习途中：累了应暂停、日常聊天应放行，只有像答案的话才判分。"""
+    import companion_strategy as cs
+    assert cs.classify_pending_turn("今天好累，先聊会儿").kind == "pause"
+    assert cs.classify_pending_turn("你在干嘛？").kind == "chat"
+    assert cs.classify_pending_turn("咖啡").kind == "answer"
+    prompt = cs.learning_relationship_instruction("retry")
+    assert "首先始终是他的女友" in prompt
+    assert "别说“错了”" in prompt
+
+
+def test_active_study_pauses_for_user_state():
+    """进行中的学习里说累了，应实际暂停并交给女友式回应。"""
+    import companion_strategy  # 确保 qq_bot 能加载新增模块
+    import study_session as ss
+    from qq_bot import QQGirlfriendBot
+
+    user = "test_pause_for_state_user"
+    kid = adb.add_knowledge(user, "coffee", answer="咖啡", subject="english")
+    sid = adb.add_session(user, planned_minutes=10, status="active")
+    session = adb.get_session(sid)
+    ss.ask_question(sid, adb.get_knowledge(kid))
+
+    class Memory:
+        def add_message(self, *args, **kwargs):
+            pass
+
+    bot = object.__new__(QQGirlfriendBot)
+    bot._memory = Memory()
+    events = []
+
+    async def fake_persona(user_id, instruction, event=""):
+        events.append(event)
+        return "好，那先歇会"
+
+    async def fake_split(*args, **kwargs):
+        return "好，那先歇会"
+
+    bot._study_persona_reply = fake_persona
+    bot._reply_split = fake_split
+    handled = asyncio.run(bot._handle_study_answer(
+        "private", user, user, 0, "今天好累，先聊会儿", None))
+    assert handled is True
+    assert adb.get_session(sid)["status"] == "paused"
+    assert events == ["pause"]
+
+
 def test_checkin_verification_engine():
     """打卡由代码判定：低置信度不自动完成、日期不符不算、部分完成记进度。"""
     import image_verifier as iv
@@ -623,6 +670,8 @@ def run_into(check):
     check("引导式纠错流程", test_guided_grading_flow)
     check("复习优先与间隔递增", test_review_priority_and_interval_growth)
     check("普通聊天不被学习拦截", test_normal_chat_not_hijacked_in_study_mode)
+    check("陪学关系优先与聊天保护", test_companion_strategy_keeps_learning_from_hijacking_chat)
+    check("学习中按用户状态暂停", test_active_study_pauses_for_user_state)
     check("图片打卡校验引擎", test_checkin_verification_engine)
     check("学习图片上下文判定", test_study_image_context_gate)
     check("作业纠错与教材解析", test_homework_and_material_parsing)

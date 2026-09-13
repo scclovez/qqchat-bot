@@ -41,6 +41,7 @@ try:
     import study_session
     import image_verifier
     import emotion_history
+    import companion_strategy
 except Exception as _assistant_exc:  # noqa: BLE001
     adb_assistant = None
     behavior_profile = None
@@ -49,6 +50,7 @@ except Exception as _assistant_exc:  # noqa: BLE001
     study_session = None
     image_verifier = None
     emotion_history = None
+    companion_strategy = None
     logging.getLogger(__name__).warning("助理系统加载失败，功能自动降级: %s", _assistant_exc)
 
 # 主动消息优先级（与 晚晚/助理/schedule_manager.py 的取值保持一致）
@@ -1796,7 +1798,7 @@ class QQGirlfriendBot:
             study_session.pause_session(session["id"])
             reply = await self._study_persona_reply(
                 user_id, f"他刚说想先停下（这次学习了 {int(session.get('progress') or 0) * 100:.0f}%）。"
-                         "用你自己的语气答应他、并说下次接着来，一句话。")
+                         "答应他就好，别催他。", event="pause")
             await self._reply_split(msg_type, target_id, user_id, message_id, reply,
                                     force_voice=False, expected_revision=turn_revision)
             return True
@@ -1830,8 +1832,8 @@ class QQGirlfriendBot:
         reply = await self._study_persona_reply(
             user_id,
             f"他要开始学「{goal.get('title')}」了，你准备了 {len(cards)} 个词，"
-            f"这次打算陪他学 {minutes} 分钟。用你自己的语气开个头（一句话，别像老师点名），"
-            "然后你会先给他看第一个词、再用语音读给他听。",
+            f"这次大概陪他学 {minutes} 分钟。自然开个头，别像老师点名或宣布课程。",
+            event="start",
         )
         sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
                                        force_voice=False, expected_revision=turn_revision)
@@ -1915,6 +1917,27 @@ class QQGirlfriendBot:
             return False
         if goal_manager is not None and goal_manager.looks_like_goal(text):
             return False
+        # 学习中也仍然可以聊天。只有像答案的内容才交给判分器；累了、想停、
+        # 问日常问题时，先让她作为女友回应，而不是硬把消息判成错题。
+        pending_turn = (companion_strategy.classify_pending_turn(text)
+                        if companion_strategy is not None else None)
+        if pending_turn is not None and pending_turn.kind == "pause":
+            seen = study_session.session_seen(user_id, session)
+            study_session.pause_session(session["id"], done=len(seen),
+                                        total=study_session.WORDS_PER_SESSION)
+            reply = await self._study_persona_reply(
+                user_id, "他学习到一半说想先停下。答应他、关心一下，别催进度。",
+                event="pause")
+            self._memory.add_message(user_id, "user", text)
+            longterm_memory.add_chat_history(user_id, "user", text)
+            sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                           force_voice=False, expected_revision=turn_revision)
+            if sent:
+                self._memory.add_message(user_id, "assistant", sent)
+                longterm_memory.add_chat_history(user_id, "assistant", sent)
+            return True
+        if pending_turn is not None and pending_turn.kind == "chat":
+            return False
         try:
             verdict = await study_session.grade_answer(user_id, session, text, self._llm_task.chat)
         except Exception as exc:
@@ -1923,7 +1946,10 @@ class QQGirlfriendBot:
         if verdict.get("verdict") == "no_question":
             return False
         instruction = study_session.step_instruction(verdict)
-        reply = await self._study_persona_reply(user_id, f"他刚回答：{text}。{instruction}")
+        event = {"correct": "correct", "retry": "retry", "explain": "explain"}.get(
+            verdict.get("verdict"), "")
+        reply = await self._study_persona_reply(
+            user_id, f"他刚回答：{text}。{instruction}", event=event)
         self._memory.add_message(user_id, "user", text)
         longterm_memory.add_chat_history(user_id, "user", text)
         sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
@@ -1950,7 +1976,7 @@ class QQGirlfriendBot:
                 user_id,
                 f"这次学习结束了（过了 {len(seen)} 个词，状态 {result.get('status')}，"
                 f"实际约 {result.get('actual_minutes')} 分钟）。用你自己的语气收个尾，"
-                "夸他一句、说下次继续，一句话就好。")
+                "夸他一句、说下次继续，一句话就好。", event="finish")
             sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
                                            force_voice=False, expected_revision=turn_revision)
             if sent:
@@ -1971,20 +1997,23 @@ class QQGirlfriendBot:
         question = study_session.ask_question(session_id, card, mastery)
         reply = await self._study_persona_reply(
             user_id,
-            f"现在考他一个：{question}"
+            f"现在问他一个小问题：{question}"
             "用你自己的语气问他，一句话（可以带一点撒娇或调侃，别像考试系统），"
-            "问完就等他回答，先不要给答案。")
+            "问完就等他回答，先不要给答案。", event="question")
         await self._reply_split("private", user_id, user_id, 0, reply, force_voice=False)
         if reply:
             self._memory.add_message(user_id, "assistant", reply)
             longterm_memory.add_chat_history(user_id, "assistant", reply)
         return question
 
-    async def _study_persona_reply(self, user_id, instruction):
+    async def _study_persona_reply(self, user_id, instruction, event=""):
         """学习相关文案统一走人设链路生成（学习模块只提供事实）。"""
         try:
+            relationship = (companion_strategy.learning_relationship_instruction(event)
+                            if companion_strategy is not None else "")
             messages = [
-                {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER},
+                {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER
+                 + "\n\n" + relationship},
                 {"role": "user", "content": "（内部信息，不是他发的消息）" + instruction},
             ]
             reply = await self._deepseek.chat(messages, temperature=0.85, max_tokens=140)
@@ -1993,7 +2022,8 @@ class QQGirlfriendBot:
                 return reply
         except Exception as exc:
             logger.warning("学习文案生成失败: %s", exc)
-        return "好呀，那我们开始吧~"
+        return (companion_strategy.fallback_reply(event)
+                if companion_strategy is not None else "好呀，我陪你")
 
     async def _present_word_card(self, msg_type, target_id, user_id, message_id, card,
                                  turn_revision, lead=""):
@@ -2001,7 +2031,7 @@ class QQGirlfriendBot:
         fact = study_session.describe_card(card)
         instruction = (f"{lead}。你现在带着他学这一个词：{fact}。"
                        "用你自己的语气说一两句（把例句也带出来），不要像老师念课本，也不要罗列格式。")
-        reply = await self._study_persona_reply(user_id, instruction)
+        reply = await self._study_persona_reply(user_id, instruction, event="present")
         sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
                                        force_voice=False, expected_revision=turn_revision)
         if sent:
