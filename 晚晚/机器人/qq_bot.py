@@ -1166,6 +1166,14 @@ class QQGirlfriendBot:
             if handled:
                 await self._finish_typing(msg_type, user_id)
                 return
+        # 学习作答：会话进行中且有待答题目时，这条消息按"回答"处理（引导式纠错）
+        if (study_session is not None and adb_assistant is not None and not is_group
+                and self._is_intimate_user(user_id)):
+            handled = await self._handle_study_answer(
+                msg_type, target_id, user_id, message_id, raw_message, turn_revision)
+            if handled:
+                await self._finish_typing(msg_type, user_id)
+                return
         # 日程：用户说出带时间的事 → 解析入库，确认回复仍由人设生成
         if (schedule_manager is not None and not is_group and self._is_intimate_user(user_id)
                 and schedule_manager.looks_like_schedule(raw_message)):
@@ -1758,6 +1766,82 @@ class QQGirlfriendBot:
                                       turn_revision)
         return True
 
+    async def _handle_study_answer(self, msg_type, target_id, user_id, message_id, text,
+                                   turn_revision):
+        """学习中的回答：判分 → 先提示再让他试 → 必要时解释 → 进入下一步。"""
+        session = adb_assistant.get_open_session(user_id)
+        if not session or session.get("status") != "active" or not session.get("pending_knowledge_id"):
+            return False
+        # 说日程/立目标时不算作答，交给后面的分支
+        if schedule_manager is not None and schedule_manager.looks_like_schedule(text):
+            return False
+        if goal_manager is not None and goal_manager.looks_like_goal(text):
+            return False
+        try:
+            verdict = await study_session.grade_answer(user_id, session, text, self._llm_task.chat)
+        except Exception as exc:
+            logger.warning("学习判分失败，按普通对话处理 [%s]: %s", user_id, exc)
+            return False
+        if verdict.get("verdict") == "no_question":
+            return False
+        instruction = study_session.step_instruction(verdict)
+        reply = await self._study_persona_reply(user_id, f"他刚回答：{text}。{instruction}")
+        self._memory.add_message(user_id, "user", text)
+        longterm_memory.add_chat_history(user_id, "user", text)
+        sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                       force_voice=False, expected_revision=turn_revision)
+        if sent:
+            self._memory.add_message(user_id, "assistant", sent)
+            longterm_memory.add_chat_history(user_id, "assistant", sent)
+        if verdict.get("verdict") in ("correct", "explain"):
+            await self._advance_study(msg_type, target_id, user_id, message_id, turn_revision)
+        return True
+
+    async def _advance_study(self, msg_type, target_id, user_id, message_id, turn_revision):
+        """推进到下一个内容；本次会话的内容过完就收尾（一次只推进一步）。"""
+        session = adb_assistant.get_open_session(user_id)
+        if not session:
+            return
+        goal = goal_manager.active_goal(user_id)
+        seen = study_session.session_seen(user_id, session)
+        if len(seen) >= study_session.WORDS_PER_SESSION:
+            result = study_session.finish_session(
+                session["id"], done=len(seen), total=study_session.WORDS_PER_SESSION,
+                summary="本次共过 %d 个词" % len(seen))
+            reply = await self._study_persona_reply(
+                user_id,
+                f"这次学习结束了（过了 {len(seen)} 个词，状态 {result.get('status')}，"
+                f"实际约 {result.get('actual_minutes')} 分钟）。用你自己的语气收个尾，"
+                "夸他一句、说下次继续，一句话就好。")
+            sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
+                                           force_voice=False, expected_revision=turn_revision)
+            if sent:
+                self._memory.add_message(user_id, "assistant", sent)
+                longterm_memory.add_chat_history(user_id, "assistant", sent)
+            return
+        card = study_session.pick_next_for_session(user_id, session, (goal or {}).get("id"))
+        if not card:
+            study_session.finish_session(session["id"], done=len(seen),
+                                         total=max(1, len(seen)), summary="内容已过完")
+            return
+        await self._present_word_card(msg_type, target_id, user_id, message_id, card,
+                                      turn_revision, lead="下一个")
+
+    async def _ask_word(self, user_id, card, session_id):
+        """提出问题（用她自己的语气问，一次只问一个）。"""
+        mastery = float(card.get("mastery") or 0)
+        question = study_session.ask_question(session_id, card, mastery)
+        reply = await self._study_persona_reply(
+            user_id,
+            f"现在考他一个：{question}"
+            "用你自己的语气问他，一句话（可以带一点撒娇或调侃，别像考试系统），"
+            "问完就等他回答，先不要给答案。")
+        await self._reply_split("private", user_id, user_id, 0, reply, force_voice=False)
+        if reply:
+            self._memory.add_message(user_id, "assistant", reply)
+            longterm_memory.add_chat_history(user_id, "assistant", reply)
+        return question
+
     async def _study_persona_reply(self, user_id, instruction):
         """学习相关文案统一走人设链路生成（学习模块只提供事实）。"""
         try:
@@ -1797,6 +1881,10 @@ class QQGirlfriendBot:
                 last_seen=time.strftime("%Y-%m-%d %H:%M:%S"))
         except Exception as exc:
             logger.debug("标记词卡状态失败: %s", exc)
+        # 讲完立刻考他一个（引导式：一次只推进一步）
+        session = adb_assistant.get_open_session(user_id)
+        if session:
+            await self._ask_word(user_id, card, session["id"])
 
     async def _speak_study_text(self, user_id, text, instruct=""):
         """用现有 TTS 合成并发送语音条（学习朗读专用：音色仍是她）。"""

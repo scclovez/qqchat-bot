@@ -378,6 +378,69 @@ def test_record_answer_updates_mastery():
     assert final["next_review"] and final["last_seen"]
 
 
+def test_guided_grading_flow():
+    """引导式纠错：答错先提示（不泄露答案）→ 再试 → 两次后才解释。"""
+    import study_session as ss
+    import goal_manager as gm
+    user = "test_guided_user"
+    created = asyncio.run(gm.create_goal(user, "我要学英语", llm_call=None))
+    goal = gm.active_goal(user)
+    kid = adb.add_knowledge(user, "coffee", answer="咖啡", subject="english", goal_id=goal["id"],
+                            extra={"example_en": "I would like a coffee.", "example_cn": "我想要杯咖啡。"})
+    session = ss.start_session(user, goal, planned_minutes=10)
+    card = adb.get_knowledge(kid)
+    question = ss.ask_question(session["id"], card)
+    assert "coffee" in question or "咖啡" in question
+
+    first = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "奶茶"))
+    assert first["verdict"] == "retry", first
+    instruction = ss.step_instruction(first)
+    assert "不要" in instruction and "咖啡" not in instruction, \
+        "第一次答错只能给提示，不能把答案说出来"
+    assert first["result"]["wrong_count"] == 1 and first["result"]["next_review"]
+
+    second = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "还是不知道"))
+    assert second["verdict"] == "explain", second
+    explain = ss.step_instruction(second)
+    assert "咖啡" in explain, "两次之后才可以把答案讲清楚"
+    assert not adb.get_session(session["id"])["pending_knowledge_id"]
+
+    ss.ask_question(session["id"], adb.get_knowledge(kid))
+    ok = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "咖啡"))
+    assert ok["verdict"] == "correct" and ok["result"]["correct_count"] >= 1
+    assert not adb.get_session(session["id"])["pending_knowledge_id"]
+
+
+def test_review_priority_and_interval_growth():
+    """复习优先：到期的先复习；连续答对逐步延长复习间隔。"""
+    import study_session as ss
+    user = "test_review_user"
+    due_id = adb.add_knowledge(user, "apple", answer="苹果", subject="english")
+    new_id = adb.add_knowledge(user, "banana", answer="香蕉", subject="english")
+    adb.update_knowledge(due_id, status="learning", mastery=0.2,
+                         next_review=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert [row["id"] for row in ss.review_queue(user)] == [due_id], "到期的先复习"
+    session = ss.start_session(user, {"id": None}, planned_minutes=10)
+    picked = ss.pick_next_for_session(user, session, None)
+    assert picked["id"] == due_id, "会话应优先安排到期的复习"
+    intervals = []
+    for _ in range(3):
+        ss.record_answer(user, due_id, correct=True)
+        intervals.append(adb.get_knowledge(due_id)["next_review"])
+    assert intervals == sorted(intervals), "连续答对复习间隔必须递增"
+    assert adb.get_knowledge(due_id)["mastery"] > 0.2
+    assert adb.get_knowledge(new_id)["status"] == "unknown"
+
+
+def test_normal_chat_not_hijacked_in_study_mode():
+    """没有进行中的会话时，普通消息绝不被当成学习作答。"""
+    from qq_bot import QQGirlfriendBot
+    bot = object.__new__(QQGirlfriendBot)
+    handled = asyncio.run(bot._handle_study_answer(
+        "private", "nobody", "no_session_user", 0, "今天好累啊", None))
+    assert handled is False
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -397,6 +460,9 @@ def run_into(check):
     check("学习会话可暂停续做", test_study_session_lifecycle)
     check("词卡校验与朗读顺序", test_word_cards_and_aloud_text)
     check("掌握度与复习安排", test_record_answer_updates_mastery)
+    check("引导式纠错流程", test_guided_grading_flow)
+    check("复习优先与间隔递增", test_review_priority_and_interval_growth)
+    check("普通聊天不被学习拦截", test_normal_chat_not_hijacked_in_study_mode)
 
 
 def main():

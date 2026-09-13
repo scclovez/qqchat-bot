@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS study_sessions (
     status          TEXT DEFAULT 'active',    -- active / paused / completed / abandoned / partial
     progress        REAL DEFAULT 0,
     summary         TEXT DEFAULT '',
+    pending_knowledge_id INTEGER,             -- 当前正在问他/等回答的知识点
+    ask_attempts    INTEGER DEFAULT 0,        -- 同一题已提示几次（引导式纠错用）
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_study_sessions_user ON study_sessions(user_id, started_at);
@@ -220,6 +222,11 @@ def _migrate(conn: sqlite3.Connection, version: int):
         _ensure_columns(conn, "schedules", {"reminded_at": "reminded_at TEXT"})
     if version < 3:
         _ensure_columns(conn, "knowledge_items", {"extra": "extra TEXT"})
+    if version < 4:
+        _ensure_columns(conn, "study_sessions", {
+            "pending_knowledge_id": "pending_knowledge_id INTEGER",
+            "ask_attempts": "ask_attempts INTEGER DEFAULT 0",
+        })
     return SCHEMA_VERSION
 
 
@@ -626,7 +633,8 @@ def update_task(task_id: int, **fields) -> bool:
 # =============================================================================
 
 SESSION_FIELDS = ("goal_id", "task_id", "started_at", "ended_at", "planned_minutes",
-                  "actual_minutes", "status", "progress", "summary")
+                  "actual_minutes", "status", "progress", "summary",
+                  "pending_knowledge_id", "ask_attempts")
 
 
 def add_session(user_id: str, goal_id=None, task_id=None, planned_minutes: int = 10,
