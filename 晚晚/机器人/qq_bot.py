@@ -167,6 +167,13 @@ SHORT_REPLY_REMINDER = (
     "套路化催睡或滥用省略号；不用波浪号（~、～），语气和句式自然变化。"
 )
 
+# 学习文案的硬约束：真机事故里，出场文案把 improve 讲成了 accept、讲解时还冒出 insight，
+# 所以事实句必须原样出现，且不许自己另加单词。
+STRICT_FACT_REMINDER = (
+    "\n\n【再强调一次】上面那条【必须原样出现】的内容，一个字都不能改，"
+    "也不要在里面换词、增词或删词；除此之外不要提任何别的英文单词。"
+)
+
 
 # 语音模式：本次回复将转为语音时追加到 system prompt，要求输出情感标签
 VOICE_INSTRUCTION = (
@@ -526,6 +533,7 @@ class QQGirlfriendBot:
         # 用于跨系统防轰炸；不再使用固定的"道晚安静默"变量，作息改由时间戳+内容推断。
         self._last_proactive_any = {}
         self._schedule_task = None
+        self._study_stall_task = None
         self._routine_task = None
         self._diary_task = None
         self._pstate_task = None
@@ -814,6 +822,9 @@ class QQGirlfriendBot:
         # 行为规律历史回填：启动时把已有聊天记录读一遍，让"她对你的了解"立刻有真实结论
         self._backfill_task = asyncio.create_task(self._behavior_backfill_startup()) \
             if behavior_profile is not None else None
+        # 学习会话静置收尾：他走开了（默认半小时没动静）就按实际进度结束，不留挂着的会话
+        self._study_stall_task = asyncio.create_task(self._study_stalled_loop()) \
+            if study_session is not None else None
         retry_delay = 1
         while self._running:
             try:
@@ -865,7 +876,8 @@ class QQGirlfriendBot:
         for task in (self._diary_task, self._pstate_task, self._evolution_task,
                      self._pull_task, self._qzone_task, self._catchup_task,
                      self._ritual_task, self._murmur_task, self._idle_murmur_task,
-                     self._routine_task, self._schedule_task, self._backfill_task):
+                     self._routine_task, self._schedule_task, self._backfill_task,
+                     self._study_stall_task):
             if task:
                 task.cancel()
         self._diary_task = self._pstate_task = self._evolution_task = None
@@ -873,6 +885,7 @@ class QQGirlfriendBot:
         self._ritual_task = self._murmur_task = self._idle_murmur_task = None
         self._routine_task = self._schedule_task = None
         self._backfill_task = None
+        self._study_stall_task = None
         # 停止/重启前：把内存中所有用户的对话上下文全量落盘，
         # 保证下次启动能接上（消息已实时落盘，这里是双保险，覆盖异常路径）
         try:
@@ -1789,6 +1802,48 @@ class QQGirlfriendBot:
             await self._send_schedule_reminder(target, item)
             break  # 一轮只提醒一条，避免连发
 
+    async def _study_stalled_loop(self):
+        """每 5 分钟扫一次：把静置太久的学习会话按实际进度收尾。"""
+        while True:
+            await asyncio.sleep(5 * 60)
+            try:
+                await self._study_stalled_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("学习会话静置检查异常:\n%s", traceback.format_exc())
+
+    async def _study_stalled_tick(self):
+        closed = await asyncio.to_thread(study_session.sweep_stalled_sessions)
+        for item in closed:
+            session = item.get("session") or {}
+            result = item.get("result") or {}
+            user_id = session.get("user_id") or ""
+            done = int(result.get("done") or 0)
+            total = int(result.get("total") or 0) or study_session.WORDS_PER_SESSION
+            minutes = int(result.get("actual_minutes") or 0)
+            logger.info("学习会话静置收尾 [%s] %d/%d，约 %d 分钟（状态 %s）",
+                        user_id, done, total, minutes, result.get("status"))
+            if not user_id or user_id in self._dead_users:
+                continue
+            # 温和收尾：像"这次先到这儿"，不做好像在追责的缺勤提醒
+            instruction = (f"他这次学习过了 {done}/{total} 个内容就先离开去忙了，"
+                            f"大概学了 {minutes} 分钟。用你自己的语气轻轻收个尾："
+                            "先肯定他已经过的部分，说你会记着，等他回来接着来；"
+                            "不要催、不要提完成率或分数，一句话。")
+            try:
+                reply = await self._study_persona_reply(user_id, instruction, event="finish")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("静置收尾文案失败 [%s]: %s", user_id, exc)
+                continue
+            if not reply:
+                continue
+            sent = await self._reply_split(
+                "private", user_id, user_id, 0, reply, force_voice=False,
+                expected_revision=None)
+            if sent:
+                logger.info("学习会话静置收尾已通知 [%s]", user_id)
+
     async def _own_routine_loop(self):
         """每分钟检查她自己的起床、睡前生活事件，不参考用户作息。"""
         while True:
@@ -1921,16 +1976,20 @@ class QQGirlfriendBot:
         except Exception as exc:
             logger.warning("词卡准备失败 [%s]: %s", user_id, exc)
             cards = []
+        logger.info("学习内容准备 [%s] 方向=%s 可用=%d 张", user_id, focus, len(cards))
         if not cards:
             return False
         session = study_session.start_session(user_id, goal)
         if not session:
             return False
         study_session.set_session_focus(session["id"], focus)
+        study_session.clear_question(session["id"])
         session = adb_assistant.get_session(session["id"]) or session
         minutes = int(session.get("planned_minutes") or 10)
         focus_name = {"vocabulary": "词汇", "grammar": "语法", "reading": "阅读", "listening": "听力",
                       "writing": "写作", "speaking": "口语"}.get(focus, "英语")
+        logger.info("学习开始 [%s] 目标=%s 方向=%s 词卡=%d 计划=%d 分钟", user_id,
+                    goal.get("title"), focus_name, len(cards), minutes)
         reply = await self._study_persona_reply(
             user_id,
             f"他要开始学「{goal.get('title')}」了，你这次准备带他练 {focus_name}，"
@@ -2096,10 +2155,18 @@ class QQGirlfriendBot:
         if verdict.get("verdict") == "no_question":
             return False
         instruction = study_session.step_instruction(verdict)
-        event = {"correct": "correct", "retry": "retry", "explain": "explain"}.get(
-            verdict.get("verdict"), "")
-        reply = await self._study_persona_reply(
-            user_id, f"他刚回答：{text}。{instruction}", event=event)
+        card = verdict.get("card") or {}
+        event = {"correct": "correct", "retry": "retry", "explain": "explain",
+                 "repeat": "explain"}.get(verdict.get("verdict"), "")
+        instruction = f"他刚回答：{text}。{instruction}"
+        asked = (study_session.build_question(card, float(card.get("mastery") or 0))
+                 if event in ("correct", "explain") else "")
+        reply = await self._study_reply_with_facts(
+            user_id, instruction, event=event, card=card,
+            facts=self._verdict_fact(card, verdict), asked=asked,
+            hint=verdict.get("hint") or "")
+        if not reply:
+            reply = study_session.present_template(card) if event == "explain" else ""
         self._memory.add_message(user_id, "user", text)
         longterm_memory.add_chat_history(user_id, "user", text)
         sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
@@ -2107,9 +2174,22 @@ class QQGirlfriendBot:
         if sent:
             self._memory.add_message(user_id, "assistant", sent)
             longterm_memory.add_chat_history(user_id, "assistant", sent)
-        if verdict.get("verdict") in ("correct", "explain"):
+        logger.info("学习作答 [%s] 词=%s 判分=%s 已回复=%s", user_id,
+                    card.get("content"), verdict.get("verdict"), bool(sent))
+        if verdict.get("verdict") in ("correct", "explain", "repeat"):
             await self._advance_study(msg_type, target_id, user_id, message_id, turn_revision)
         return True
+
+    @staticmethod
+    def _verdict_fact(card, verdict):
+        """这一轮必须出现的事实（答对时不必报答案，答错/讲解时才需要）。"""
+        if not card:
+            return ""
+        if verdict.get("verdict") == "retry":
+            return study_session.fact_line(card).split(" | ")[0]
+        if verdict.get("verdict") == "correct":
+            return ""
+        return study_session.fact_line(card)
 
     async def _advance_study(self, msg_type, target_id, user_id, message_id, turn_revision):
         """推进到下一个内容；本次会话的内容过完就收尾（一次只推进一步）。"""
@@ -2121,7 +2201,7 @@ class QQGirlfriendBot:
         if len(seen) >= study_session.WORDS_PER_SESSION:
             result = study_session.finish_session(
                 session["id"], done=len(seen), total=study_session.WORDS_PER_SESSION,
-                summary="本次共过 %d 个词" % len(seen))
+                summary="本次共过 %d 个内容" % len(seen))
             reply = await self._study_persona_reply(
                 user_id,
                 f"这次学习结束了（过了 {len(seen)} 个词，状态 {result.get('status')}，"
@@ -2132,29 +2212,72 @@ class QQGirlfriendBot:
             if sent:
                 self._memory.add_message(user_id, "assistant", sent)
                 longterm_memory.add_chat_history(user_id, "assistant", sent)
+            logger.info("学习会话完成 [%s] 过了 %d 个内容", user_id, len(seen))
             return
         card = study_session.pick_next_for_session(user_id, session, (goal or {}).get("id"))
         if not card:
             study_session.finish_session(session["id"], done=len(seen),
                                          total=max(1, len(seen)), summary="内容已过完")
             return
+        # 先清掉上一题的待答标记，再进下一张卡：中间这段时间不该继续判上一题
+        study_session.clear_question(session["id"])
         await self._present_word_card(msg_type, target_id, user_id, message_id, card,
                                       turn_revision, lead="下一个")
 
     async def _ask_word(self, user_id, card, session_id):
-        """提出问题（用她自己的语气问，一次只问一个）。"""
+        """提出问题（问题原文由学习模块产出，逐字带出，绝不改写）。"""
         mastery = float(card.get("mastery") or 0)
         question = study_session.ask_question(session_id, card, mastery)
-        reply = await self._study_persona_reply(
+        extra = card.get("extra") or {}
+        if extra.get("learning_focus"):
+            brief = ("刚讲过的%s小练习，让他自己填。"
+                     % {"grammar": "语法", "reading": "阅读", "listening": "听力"}.get(
+                         extra.get("learning_focus"), "英语"))
+        else:
+            brief = "刚讲过的这个词，让他自己说意思。"
+        lead = await self._study_context_line(
             user_id,
-            f"现在问他一个小问题：{question}"
-            "用你自己的语气问他，一句话（可以带一点撒娇或调侃，别像考试系统），"
-            "问完就等他回答，先不要给答案。", event="question")
-        await self._reply_split("private", user_id, user_id, 0, reply, force_voice=False)
-        if reply:
-            self._memory.add_message(user_id, "assistant", reply)
-            longterm_memory.add_chat_history(user_id, "assistant", reply)
+            f"{brief}请用你自己的语气催他答题，一句话，不要给答案、不要换词、不要提关卡或分数。",
+            event="question")
+        text = study_session.question_template(question, lead)
+        word = card.get("content") or ""
+        if word and word.lower() in question.lower() and (card.get("answer") or "") in question:
+            # 问题里同时出现词形和释义就等于送答案，退回不带释义的问法
+            text = study_session.question_template(
+                "这个词用英语怎么说？" if mastery >= 0.5 else "这个词是什么意思？", lead)
+        await self._reply_split("private", user_id, user_id, 0, text, force_voice=False)
+        self._memory.add_message(user_id, "assistant", text)
+        longterm_memory.add_chat_history(user_id, "assistant", text)
+        logger.info("学习提问 [%s] kb=%s 词=%s", user_id, card.get("id"), word)
         return question
+
+    async def _study_context_line(self, user_id, instruction, event=""):
+        """只生成一句"语气话"（短、不含事实），失败就返回空串由模板兜底。"""
+        text = await self._study_persona_reply(user_id, instruction, event=event)
+        lead = study_session.clean_lead(study_session.lead_tail(text))
+        if not lead or re.search(r"[A-Za-z]{3,}", lead):
+            return ""
+        return lead
+
+    async def _study_reply_with_facts(self, user_id, instruction, event, card, facts="",
+                                      asked="", hint=""):
+        """学习文案发布链路：事实必须原样出现，否则重生成一次，再不行用模板。
+
+        真机事故就出在这一步：模型把 improve 讲成 accept / insight，还在答错时直接报答案。
+        """
+        guard = study_session.study_fact_instruction(facts)
+        for attempt in (1, 2):
+            reply = await self._study_persona_reply(
+                user_id, instruction + guard + (STRICT_FACT_REMINDER if attempt == 2 else ""),
+                event=event)
+            ok, reason, leaked = study_session.check_reply(card, reply, event=event, asked=asked)
+            if ok:
+                return reply
+            logger.warning("学习文案不可用（第 %d 次）[%s] %s：%s",
+                           attempt, user_id, "泄露答案" if leaked else "事实不符", reason)
+        lead = await self._study_context_line(
+            user_id, "用你自己的语气说一句很短的话（不要提这个词，也别报答案）。", event=event)
+        return study_session.fallback_template(card, event=event, lead=lead, hint=hint)
 
     async def _study_persona_reply(self, user_id, instruction, event=""):
         """学习相关文案统一走人设链路生成（学习模块只提供事实）。"""
@@ -2177,26 +2300,33 @@ class QQGirlfriendBot:
 
     async def _present_word_card(self, msg_type, target_id, user_id, message_id, card,
                                  turn_revision, lead=""):
-        """展示一个词：文字讲解（人设）+ 语音读例句 + 语音单独读词。"""
-        fact = study_session.describe_card(card)
+        """展示一个词：文字讲解（人设 + 事实校验）+ 语音读例句 + 语音单独读词。"""
         extra = card.get("extra") or {}
         focus = extra.get("learning_focus") or ""
+        word = card.get("content") or ""
+        lead_text = study_session.lead_tail(lead)
         if focus:
-            focus_name = {"grammar": "语法", "reading": "阅读", "listening": "听力"}.get(focus, "英语")
-            instruction = (f"{lead}。你现在带他练一个{focus_name}小内容：{fact}。"
-                           "先自然地陪他看题，不要提前给答案，不要像老师念讲义；问完就等他。")
+            focus_name = {"reading": "阅读", "listening": "听力"}.get(focus, "语法")
+            instruction = (f"{lead_text}。你现在带他练一个{focus_name}小内容，先自然地陪他看题，"
+                           "不要提前给答案，不要像老师念讲义；问完就等他。")
+            facts = study_session.fact_line(card)
         else:
-            instruction = (f"{lead}。你现在带着他学这一个词：{fact}。"
-                           "用你自己的语气说一两句（把例句也带出来），不要像老师念课本，也不要罗列格式。")
-        reply = await self._study_persona_reply(user_id, instruction, event="present")
+            instruction = (f"{lead_text}。你现在带着他学这一个词："
+                           "先把它的音标和例句自然地带出来（例句就是下面这条里给的），"
+                           "释义先不说；用你自己的语气说一两句，不要像老师念课本，也不要罗列格式。")
+            facts = study_session.fact_line(card).split(" | 释义")[0] if card.get("answer") \
+                else study_session.fact_line(card)
+        reply = await self._study_reply_with_facts(
+            user_id, instruction, event="present", card=card, facts=facts)
         sent = await self._reply_split(msg_type, target_id, user_id, message_id, reply,
                                        force_voice=False, expected_revision=turn_revision)
         if sent:
             self._memory.add_message(user_id, "assistant", sent)
             longterm_memory.add_chat_history(user_id, "assistant", sent)
+        logger.info("学习出场 [%s] kb=%s 词=%s 已发送=%s", user_id, card.get("id"), word,
+                    bool(sent))
         # 语音：先把例句读一遍，再把单词重读两遍（实测该顺序合成最清晰）
         await self._speak_study_text(user_id, study_session.read_aloud_text(card))
-        word = card.get("content") or ""
         if word and not focus:
             await self._speak_study_text(
                 user_id, word, instruct=study_session.word_only_instruction())

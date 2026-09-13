@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 # 表结构版本：以后加列/加表时递增，并在 _MIGRATIONS 里登记迁移步骤。
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # 「活跃日」起点：凌晨 0-4 点发的消息算作前一天（否则跨零点会把一次熬夜
 # 拆成两天的数据，作息推断随之失真）。
@@ -147,6 +147,8 @@ CREATE TABLE IF NOT EXISTS study_sessions (
     summary         TEXT DEFAULT '',
     pending_knowledge_id INTEGER,             -- 当前正在问他/等回答的知识点
     ask_attempts    INTEGER DEFAULT 0,        -- 同一题已提示几次（引导式纠错用）
+    last_judged_text TEXT DEFAULT '',         -- 上一次判过的原话（同一条消息重放时不重复扣分）
+    last_active_at  TEXT DEFAULT '',          -- 最后一次真实互动时间（静置会话自动收尾用）
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_study_sessions_user ON study_sessions(user_id, started_at);
@@ -333,6 +335,12 @@ def _migrate(conn: sqlite3.Connection, version: int):
     if version < 8:
         _ensure_columns(conn, "english_profiles", {
             "history_context": "history_context TEXT DEFAULT '{}'",
+        })
+    if version < 9:
+        # 学习会话补两列：上次判过的原话（防重复扣分）、最后互动时间（静置自动收尾）
+        _ensure_columns(conn, "study_sessions", {
+            "last_judged_text": "last_judged_text TEXT DEFAULT ''",
+            "last_active_at": "last_active_at TEXT DEFAULT ''",
         })
     return SCHEMA_VERSION
 
@@ -1057,7 +1065,8 @@ def update_task(task_id: int, **fields) -> bool:
 
 SESSION_FIELDS = ("goal_id", "task_id", "started_at", "ended_at", "planned_minutes",
                   "actual_minutes", "status", "progress", "summary",
-                  "pending_knowledge_id", "ask_attempts")
+                  "pending_knowledge_id", "ask_attempts", "last_judged_text",
+                  "last_active_at")
 
 
 def add_session(user_id: str, goal_id=None, task_id=None, planned_minutes: int = 10,
@@ -1113,6 +1122,19 @@ def get_last_finished_session(user_id: str):
         "SELECT * FROM study_sessions WHERE user_id = ? AND status IN ('completed','partial','abandoned') "
         "ORDER BY id DESC LIMIT 1", (str(user_id),))
     return dict(rows[0]) if rows else None
+
+
+def open_sessions_before(cutoff: str, limit: int = 20) -> list:
+    """还没结束、且最后有动静的时间早于 cutoff 的会话（静置收尾用）。
+
+    以"最后一次判分/推进的时间"为准，没有就退回会话开始时间。
+    """
+    rows = query(
+        "SELECT * FROM study_sessions WHERE status IN ('active','paused') "
+        "AND CASE WHEN last_active_at IS NULL OR last_active_at = '' "
+        "  THEN started_at ELSE last_active_at END < ? "
+        "ORDER BY id ASC LIMIT ?", (str(cutoff), max(1, int(limit))))
+    return [dict(row) for row in rows]
 
 
 # ---------------------------------------------------------------- 知识点

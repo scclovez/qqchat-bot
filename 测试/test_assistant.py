@@ -713,6 +713,122 @@ def test_english_profile_onboarding_and_adaptive_plan():
     assert profile["skills"]["grammar"]["confidence"] > 0
 
 
+def test_study_facts_never_leak_or_swap_words():
+    """回归：出场/讲解文案必须锁死在当前卡片上，答错时绝不能把答案说出来。
+
+    对应真机事故（2026-09-13 22:47）：提示词是 improve，她却问 accept；
+    他说"不知道"，她当场报出释义；接着又编出"这个词是名词、首字母 I（insight）"。
+    """
+    import study_session as ss
+    user = "test_fact_guard_user"
+    card = {
+        "id": 9001, "content": "improve", "answer": "改善，提高", "subject": "english",
+        "extra": {"phonetic": "/ɪmˈpruːv/", "example_en": "I want to improve my English.",
+                  "example_cn": "我想提高我的英语。"},
+    }
+    fact = ss.fact_line(card)
+    assert "improve" in fact and "ɪmˈpruːv" in fact and "I want to improve my English." in fact
+    assert "改善" in fact, "事实句给模型用，必须带释义"
+    present = ss.present_template(card)
+    assert "improve" in present, "出场文案必须带这个词"
+    assert "改善" not in present and "提高" not in present, "出场时不能先给答案"
+
+    # 1) 换词（真机事故：问到 accept / 讲到 insight）→ 文案作废
+    ok, reason, leaked = ss.check_reply(card, "宝宝，先来第一个，accept，啥意思", event="present")
+    assert not ok and not leaked and "accept" in reason
+    ok, reason, _ = ss.check_reply(
+        card, "动词才是提高，这题问的名词，insight，洞察力", event="retry")
+    assert not ok, "另一个单词绝不能出现在讲解里"
+    # 2) 答错时泄露答案 → 判定为泄露（走模板兜底，不发给用户）
+    ok, reason, leaked = ss.check_reply(
+        card, "宝宝，improve就是“变好、提高”的意思。", event="retry")
+    assert not ok and leaked, "还没答对就先报答案必须被拦下"
+    ok, _, leaked = ss.check_reply(
+        card, "improve 这个词，improve 再想想？", event="retry")
+    assert not ok and leaked, "答错时把词再念一遍也是报答案"
+    # 3) 正常文案（只给线索、不再重复这个词）应当通过；带上例句就等于又念了一遍词
+    ok, reason, _ = ss.check_reply(card, "再听一遍刚才那句话的开头，想想它是啥意思", event="retry")
+    assert ok, reason
+    ok, _, leaked = ss.check_reply(
+        card, "improve 这个词你刚才听过例句了：I want to improve my English.", event="retry")
+    assert not ok and leaked, "答错时再把这个词念一遍同样是报答案"
+    ok, _, _ = ss.check_reply(
+        card, "improve /ɪmˈpruːv/ 例句 I want to improve my English.",
+        event="present", asked="「improve」是什么意思？")
+    assert ok
+
+    # 4) 提示只从卡片本地派生：首字母必须对得上，不再由判分模型编
+    hint = ss.derive_hint(card)
+    assert "i" in hint and "improve" not in hint and "洞察" not in hint
+    noun_card = dict(card, content="insight", answer="名词：洞察力")
+    assert "名词" in ss.derive_hint(noun_card)
+    for text in ("不知道", "我不会", "没学过", "i don't know"):
+        assert ss.know_nothing(text), text
+
+    # 5) 提问不得同时暴露词形与释义
+    assert "改善" not in ss.build_question(card, 0.0)
+    assert ss.build_question(card, 0.6) == "「改善，提高」用英语怎么说？"
+
+    # 6) 他说不会 → 直接讲解，而不是再让他猜一次
+    kid = adb.add_knowledge(user, card["content"], answer=card["answer"], subject="english",
+                            extra=card["extra"])
+    session = ss.start_session(user, {"id": None}, planned_minutes=10)
+    ss.ask_question(session["id"], adb.get_knowledge(kid))
+    verdict = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "不知道"))
+    assert verdict["verdict"] == "explain", verdict
+    assert verdict.get("reason") == "said_dont_know"
+    assert not adb.get_session(session["id"])["pending_knowledge_id"], "讲解后必须清掉待答"
+    instruction = ss.step_instruction(verdict)
+    assert "改善" in instruction, "这时才允许把答案讲清楚"
+
+    # 7) 同一句话重放不再第二次扣掌握度
+    ss.ask_question(session["id"], adb.get_knowledge(kid))
+    first_wrong = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "奶茶"))
+    assert first_wrong["verdict"] == "retry", first_wrong
+    before = adb.get_knowledge(kid)["wrong_count"]
+    again = asyncio.run(ss.grade_answer(user, adb.get_session(session["id"]), "奶茶"))
+    assert again["verdict"] == "repeat", again
+    assert adb.get_knowledge(kid)["wrong_count"] == before, "重放的消息不能再扣一次"
+
+
+def test_study_session_never_stays_stuck():
+    """回归：他中途走开时，会话不能一直挂着 active（真机会话卡了两天）。"""
+    import study_session as ss
+    user = "test_stalled_session_user"
+    kid = adb.add_knowledge(user, "borrow", answer="借", subject="english")
+    stale = (datetime.now() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    session_id = adb.add_session(user, planned_minutes=10, status="active", started_at=stale)
+    ss.ask_question(session_id, adb.get_knowledge(kid))
+    adb.update_session(session_id, last_active_at=stale)  # 模拟他在三小时前就走开了
+    closed = ss.sweep_stalled_sessions(minutes=30)
+    assert any(item["session"]["id"] == session_id for item in closed), closed
+    session = adb.get_session(session_id)
+    assert session["status"] == "partial", "过了内容就该按部分完成收尾"
+    assert session["ended_at"] and session["progress"] > 0
+    # 刚开始的会话不该被误收尾
+    fresh_id = adb.add_session(user, planned_minutes=10, status="active")
+    ss.sweep_stalled_sessions(minutes=30)
+    assert adb.get_session(fresh_id)["status"] == "active"
+    ss.finish_session(fresh_id, done=0, total=5, summary="测试收尾")
+
+
+def test_word_pool_drops_meta_vocabulary():
+    """回归：词池只留能教的实词，并记录被丢弃的内容（原来会存进 practice/subject）。"""
+    import study_session as ss
+
+    async def fake_llm(messages, **kwargs):
+        return ('[{"word":"practice","meaning":"练习",'
+                '"example_en":"She practices every day.","example_cn":"她每天练习。"},'
+                '{"word":"subject","meaning":"主语","example_en":"The subject is a noun.","example_cn":"主语是名词。"},'
+                '{"word":"borrow","meaning":"借","example_en":"Can I borrow your pen?","example_cn":"我能借你的笔吗？"},'
+                '{"word":"the","meaning":"这个","example_en":"The book is here.","example_cn":"书在这里。"}]')
+
+    cards = asyncio.run(ss.generate_word_cards("四级词汇", 4, fake_llm))
+    assert [c["word"] for c in cards] == ["borrow"], cards
+    assert ss.usable_word("borrow") and not ss.usable_word("practice")
+    assert not ss.usable_word("verb") and not ss.usable_word("the")
+
+
 def run_into(check):
     """供 测试/test_all.py 调用的统一入口。"""
     check("助理库建表与迁移", test_schema)
@@ -745,6 +861,9 @@ def run_into(check):
     check("小晚作息渐进靠近用户", test_own_routine_gradually_adapts_to_user)
     check("情绪曲线与压制原因账", test_emotion_history_and_block_log)
     check("英语画像与自适应计划", test_english_profile_onboarding_and_adaptive_plan)
+    check("学习文案不换词不泄露", test_study_facts_never_leak_or_swap_words)
+    check("学习会话不悬空", test_study_session_never_stays_stuck)
+    check("词池剔除元词汇", test_word_pool_drops_meta_vocabulary)
 
 
 def main():
