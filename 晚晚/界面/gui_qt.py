@@ -107,7 +107,7 @@ GROWTH_HINTS = {
     "schedule_next": "下一项安排是什么、还有多久",
     "study_today": "学习：连续学习天数与今天待复习的内容数",
     "memory_book": "长期记忆账本：关于你的事实 / 偏好 / 情景（进行中·已完成），以及下一次回访时间",
-    "sleep_wake": "她观察到的作息：最近通常几点起床、几点睡觉，以及这条结论的确定程度",
+    "sleep_wake": "她观察到你的作息：你最近通常几点起床、几点睡觉，以及这条结论的确定程度",
     "coverage": "这些观察建立在多少天的数据上（启动时会自动读一遍已有聊天记录）",
     "emotion_bars": "持续情绪强度：会随时间自然衰减，不是只看这一句话的关键词（数值 0-100）",
     "heatmap": "近 7 天 × 24 小时的聊天活跃分布（按活跃日，凌晨 0-4 点算前一天）",
@@ -1151,8 +1151,8 @@ class MainWindow(QMainWindow):
 
         card, cl = _card(page, "作息与活跃")
         self._assistant_metric_labels = {}
-        for key, name in (("wake", "最近通常起床"), ("sleep", "最近通常睡觉"),
-                          ("active", "比较活跃"), ("study", "更容易学习")):
+        for key, name in (("wake", "你通常起床"), ("sleep", "你通常睡觉"),
+                          ("active", "你比较活跃"), ("study", "你更适合学习")):
             row = QHBoxLayout()
             row.addWidget(_label(name + "：", "GrowthMetricName"))
             row.addStretch(1)
