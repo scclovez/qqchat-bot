@@ -12,6 +12,7 @@
     5. GUI 冒烟（PySide6 构建 7 个页面，校验素材删除边界并自动关闭）
 """
 import atexit
+import asyncio
 import os
 import pathlib
 import shutil
@@ -93,6 +94,7 @@ def test_config():
 
 def test_growth():
     from datetime import datetime, timedelta
+    from config import runtime
     import personality_state as pstate
     import liveness
     import emotion_state
@@ -142,6 +144,53 @@ def test_growth():
         {"raw_message": "第二句", "message_id": 2},
     ])
     assert merged["raw_message"] == "第一句\n第二句" and merged["message_id"] == 2
+    # 回复版本：重复事件不推进轮次；新消息会让旧回答在发送前失效。
+    turn_bot = object.__new__(QQGirlfriendBot)
+    turn_bot._seen_message_ids = {}
+    turn_bot._inbound_revisions = {}
+    event1 = {"message_type": "private", "user_id": "turn_user", "message_id": 101}
+    assert turn_bot._claim_message_id(event1)
+    prepared1 = turn_bot._register_inbound_turn(event1)
+    assert prepared1["_turn_revision"] == 1
+    assert not turn_bot._claim_message_id(event1)
+    assert turn_bot._inbound_revisions["turn_user"] == 1
+    event2 = {"message_type": "private", "user_id": "turn_user", "message_id": 102}
+    assert turn_bot._claim_message_id(event2)
+    prepared2 = turn_bot._register_inbound_turn(event2)
+    assert prepared2["_turn_revision"] == 2
+    assert turn_bot._turn_is_stale("turn_user", prepared1["_turn_revision"])
+    assert not turn_bot._turn_is_stale("turn_user", prepared2["_turn_revision"])
+    assert asyncio.run(turn_bot._reply_split(
+        "private", "turn_user", "turn_user", 101, "旧回答",
+        expected_revision=prepared1["_turn_revision"],
+    )) == ""
+    sent_calls = []
+
+    async def fake_reply(msg_type, target_id, user_id, message_id, text):
+        sent_calls.append(text)
+        # 模拟第一条刚发完，对方立刻补发了一条新消息。
+        turn_bot._inbound_revisions["turn_user"] = 3
+        return 11
+
+    turn_bot._reply = fake_reply
+    turn_bot._observe_life_reply = lambda *args: None
+    old_liveness = runtime.LIVENESS_ENABLED
+    old_cd_min = runtime.REPLY_COOLDOWN_MIN
+    old_cd_max = runtime.REPLY_COOLDOWN_MAX
+    try:
+        runtime.LIVENESS_ENABLED = False
+        runtime.REPLY_COOLDOWN_MIN = 0
+        runtime.REPLY_COOLDOWN_MAX = 0
+        actually_sent = asyncio.run(turn_bot._reply_split(
+            "private", "turn_user", "turn_user", 102,
+            "第一条。\n第二条。", force_voice=False,
+            expected_revision=prepared2["_turn_revision"],
+        ))
+    finally:
+        runtime.LIVENESS_ENABLED = old_liveness
+        runtime.REPLY_COOLDOWN_MIN = old_cd_min
+        runtime.REPLY_COOLDOWN_MAX = old_cd_max
+    assert sent_calls == ["第一条。"] and actually_sent == "第一条。"
     assert MESSAGE_DEBOUNCE_SECONDS == 6.0
     assert liveness.debounce_seconds_for("晚晚") == 6.0
     assert liveness.debounce_seconds_for("你在吗？") < 6.0

@@ -427,6 +427,7 @@ class QQGirlfriendBot:
         self._locks = {}
         self._media_locks = {}  # user_id -> asyncio.Lock：图片/自拍等慢任务串行（防同用户并发双生图扣费）
         self._message_batches = {}  # user_id -> {items, task}，私聊连续文本的收束队列
+        self._inbound_revisions = {}  # user_id -> 最新私聊轮次；新消息到达即让旧回复失效
         # 自动插图（"我画了X/给你看X"）频控：每用户每日生成上限 + 同主题短时去重
         # （真人不会一天画几十张给同一个人看；也防模型回复反复带出同一句"我画了X"触发刷图）
         self._auto_draw_day = {}  # user_id -> "YYYY-MM-DD"
@@ -465,6 +466,41 @@ class QQGirlfriendBot:
         if user_id not in self._locks:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
+
+    def _claim_message_id(self, data) -> bool:
+        """认领消息事件；同一 message_id 的短时重推只处理一次。"""
+        message_id = data.get("message_id", 0)
+        if not message_id:
+            return True
+        now = time.time()
+        last = self._seen_message_ids.get(message_id)
+        if last and now - last < 60:
+            logger.debug("跳过重复消息 message_id=%s", message_id)
+            return False
+        self._seen_message_ids[message_id] = now
+        if len(self._seen_message_ids) > 200:
+            self._seen_message_ids = {
+                key: ts for key, ts in self._seen_message_ids.items() if now - ts < 60
+            }
+        return True
+
+    def _register_inbound_turn(self, data):
+        """给私聊消息分配单调递增轮次，供生成和发送阶段判断是否过期。"""
+        prepared = dict(data)
+        prepared["_message_claimed"] = True
+        if prepared.get("message_type") != "private":
+            return prepared
+        user_id = str(prepared.get("user_id", ""))
+        revision = self._inbound_revisions.get(user_id, 0) + 1
+        self._inbound_revisions[user_id] = revision
+        prepared["_turn_revision"] = revision
+        return prepared
+
+    def _turn_is_stale(self, user_id, expected_revision) -> bool:
+        """本轮之后又收到过同一用户的新私聊时，旧轮次即为过期。"""
+        if expected_revision is None:
+            return False
+        return self._inbound_revisions.get(str(user_id), 0) != expected_revision
 
     @staticmethod
     def _is_intimate_user(user_id) -> bool:
@@ -660,6 +696,16 @@ class QQGirlfriendBot:
 
     async def _handle_message(self, data):
         """消息处理入口：私聊连续文本先收束，其他事件即时处理。"""
+        if data.get("self_id"):
+            self._self_id = str(data.get("self_id"))
+        user_id = str(data.get("user_id", ""))
+        if self._self_id and user_id == self._self_id:
+            logger.debug("收到机器人自身消息（self_id=%s），跳过防回环", self._self_id)
+            return
+        # 必须先去重再推进轮次；否则 WS 重推会无故废弃正在生成的正常回复。
+        if not self._claim_message_id(data):
+            return
+        data = self._register_inbound_turn(data)
         if self._is_debounce_candidate(data):
             self._queue_debounced_message(data)
             return
@@ -733,14 +779,16 @@ class QQGirlfriendBot:
                 msg_type = data.get("message_type")
                 user_id = str(data.get("user_id", ""))
                 target_id = str(data.get("group_id", "")) if msg_type == "group" else user_id
-                await self._reply(msg_type, target_id, user_id,
-                                  data.get("message_id", 0), "呜…我这边出了点小问题，等一会儿再聊嘛~")
+                if not self._turn_is_stale(user_id, data.get("_turn_revision")):
+                    await self._reply(msg_type, target_id, user_id,
+                                      data.get("message_id", 0), "呜…我这边出了点小问题，等一会儿再聊嘛~")
             except Exception:
                 pass
 
     async def _handle_message_inner(self, data):
         msg_type = data.get("message_type")
         user_id = str(data.get("user_id", ""))
+        turn_revision = data.get("_turn_revision")
         # 记录机器人自己的 QQ 号（空间功能排除自己用）
         if data.get("self_id"):
             self._self_id = str(data.get("self_id"))
@@ -781,17 +829,9 @@ class QQGirlfriendBot:
                     except Exception as e:
                         logger.warning("语音识别异常 [%s]: %s", user_id, e)
         message_id = data.get("message_id", 0)
-        # 消息去重：同一 message_id 60 秒内不重复处理（WS 重连/事件重推会导致重复触发，如生成两张图）
-        now = time.time()
-        if message_id:
-            last = self._seen_message_ids.get(message_id)
-            if last and now - last < 60:
-                logger.debug("跳过重复消息 message_id=%s", message_id)
-                return
-            self._seen_message_ids[message_id] = now
-            if len(self._seen_message_ids) > 200:
-                self._seen_message_ids = {k: v for k, v in self._seen_message_ids.items()
-                                          if now - v < 60}
+        # 正常入口已在入队前认领；保留此兜底，兼容测试或内部直接调用。
+        if not data.get("_message_claimed") and not self._claim_message_id(data):
+            return
         group_id = str(data.get("group_id", "")) if msg_type == "group" else ""
         if not raw_message:
             return
@@ -883,9 +923,13 @@ class QQGirlfriendBot:
             self._memory.add_message(user_id, "user", raw_message)
             longterm_memory.add_chat_history(user_id, "user", raw_message)
             reply = await self._generate_remember_reply(raw_message, mem_info)
-            await self._reply_split(msg_type, target_id, user_id, message_id, reply, force_voice=False)
-            self._memory.add_message(user_id, "assistant", reply)
-            longterm_memory.add_chat_history(user_id, "assistant", reply)
+            sent_text = await self._reply_split(
+                msg_type, target_id, user_id, message_id, reply, force_voice=False,
+                expected_revision=turn_revision,
+            )
+            if sent_text:
+                self._memory.add_message(user_id, "assistant", sent_text)
+                longterm_memory.add_chat_history(user_id, "assistant", sent_text)
             await self._finish_typing(msg_type, user_id)
             return
         # 图片生成：用户想看bot长相 → 按外貌设定生成自拍；说"画一张xxx"→ 按描述生成
@@ -930,6 +974,10 @@ class QQGirlfriendBot:
             await self._memory.compress(user_id, self._deepseek)
             self._memory.trim(user_id)
             self._memory.add_message(user_id, "user", raw_message)
+            if self._turn_is_stale(user_id, turn_revision):
+                longterm_memory.add_chat_history(user_id, "user", raw_message)
+                logger.info("旧回复已废弃 [%s]: 等待最新连续消息统一回复", user_id)
+                return
             messages = self._memory.get_messages(user_id)
             # 将长期记忆注入 system prompt（替换默认的纯人设 prompt）
             messages[0]["content"] = longterm_memory.build_system_prompt_with_memory(
@@ -1094,6 +1142,12 @@ class QQGirlfriendBot:
                     tool_action_taken = interact.action_taken
                 else:
                     reply_text = await self._deepseek.chat(messages)
+            # 模型思考期间若又收到了新消息，这份回答已经缺少最新上下文。
+            # 用户原话仍进入历史，回答本身直接丢弃，交给最新收束轮次统一回应。
+            if self._turn_is_stale(user_id, turn_revision):
+                longterm_memory.add_chat_history(user_id, "user", raw_message)
+                logger.info("旧回复已废弃 [%s]: 生成期间收到新消息", user_id)
+                return
             # 空回复兜底（模型未返回内容时）
             if not reply_text.strip():
                 reply_text = "嗯嗯"
@@ -1142,11 +1196,9 @@ class QQGirlfriendBot:
                 mem_text = cleaned
             if emotion:
                 growth_diary.add_mood_tag(emotion)
-            self._memory.add_message(user_id, "assistant", mem_text)
 
         # 持久化到 SQLite（轻量写操作，不放锁内）
         longterm_memory.add_chat_history(user_id, "user", raw_message)
-        longterm_memory.add_chat_history(user_id, "assistant", mem_text)
 
         # 多模态联动：重要时刻（晚安/纪念日/道歉）→ 文字+语音一起发。
         # 但真人不会每次都这样——按概率触发；平时普通私聊也有小概率顺手补一句语音。
@@ -1159,13 +1211,29 @@ class QQGirlfriendBot:
                           or any(w in raw_message for w in boundary.SOOTHE_WORDS))
             _dual = random.random() < (
                 liveness.DUAL_VOICE_PROB if _important else liveness.DUAL_VOICE_RANDOM_PROB)
-        await self._reply_split(msg_type, target_id, user_id, message_id, reply_text,
-                                force_voice=use_voice, dual_voice=_dual,
-                                context_text=raw_message, turn_plan=turn_plan)
+        sent_text = await self._reply_split(
+            msg_type, target_id, user_id, message_id, reply_text,
+            force_voice=use_voice, dual_voice=_dual,
+            context_text=raw_message, turn_plan=turn_plan,
+            expected_revision=turn_revision,
+        )
+        if not sent_text:
+            if self._turn_is_stale(user_id, turn_revision):
+                logger.info("旧回复已废弃 [%s]: 等待或发送前收到新消息", user_id)
+            return
+        # 只记住真正发出去的内容；被新消息截断的后半段不会污染上下文。
+        stored_reply = self._strip_action_marks(sent_text) or mem_text
+        self._memory.add_message(user_id, "assistant", stored_reply)
+        longterm_memory.add_chat_history(user_id, "assistant", stored_reply)
         # 成长系统：正常对话 → 亲密度 +1
         if self._is_intimate_user(user_id):
             pstate.add_affection(1)
             growth_diary.add_affection_delta(1)
+
+        # 主回复发出后若又收到新消息，不再追加图片、表情或回马枪干扰下一轮。
+        if self._turn_is_stale(user_id, turn_revision):
+            logger.info("回复后续动作已取消 [%s]: 已进入更新一轮", user_id)
+            return
 
         # 配图机制：模型自主判断的插图（优先）；未触发时再走"我画了X"正则机制
         illustrated = False
@@ -2433,7 +2501,7 @@ class QQGirlfriendBot:
 
     async def _reply_split(self, msg_type, target_id, user_id, message_id, text,
                            force_voice=None, dual_voice=False, context_text="",
-                           turn_plan=None):
+                           turn_plan=None, expected_revision=None):
         """将回复按空行拆分为多条消息逐条发送。
 
         - 发送前按输入/回复长度和语境计算阅读、思考、打字时间
@@ -2441,7 +2509,10 @@ class QQGirlfriendBot:
         - 分条消息之间按情绪和上一条长度动态停顿
         - 开启语音回复时，把回复拆成多条语音条逐条发送（更像真人）
         - dual_voice=True：文字发完后，整条内容再合成一条语音发出（重要时刻双模态）
+        - expected_revision：私聊回复所属轮次；有更新消息时立即停止旧回复
         """
+        if self._turn_is_stale(user_id, expected_revision):
+            return ""
         # 兜底过滤：模型偶尔输出的括号/星号动作描写（人设禁止），发送前一律去掉，
         # 避免"（把脸埋进被子）"这种动作被当成语音条/文字发出去
         text = self._strip_action_marks(text)
@@ -2449,12 +2520,12 @@ class QQGirlfriendBot:
         # 当成回复说出来——这是系统记录格式，绝不能发给对方 → 整行剥离
         text = re.sub(r"^【我刚把一张(?:自己的照片|图片)发给你了】[^\n]*\n?", "", text.strip()).strip()
         if not text:
-            return
+            return ""
         # 防御性剥离【插图】标记：配图指令只加在正常回复的 prompt 里，
         # 但主动消息/追问/撩人等路径的回复万一带出标记，也不让它作为文字发出去
         _, text = self._extract_illustration_tag(text)
         if not text:
-            return
+            return ""
         # 语音回复：按概率发语音条；force_voice 由调用方预判（已让模型带情感标签）
         if force_voice is None:
             force_voice = self._should_use_voice(user_id)
@@ -2481,15 +2552,26 @@ class QQGirlfriendBot:
                 await self._simulate_typing(user_id, cooldown)
             else:
                 await asyncio.sleep(cooldown)
+        if self._turn_is_stale(user_id, expected_revision):
+            return ""
+        sent_parts = []
         if force_voice:
             # 语音前的情感冗余：偶尔先发一句"算了，我还是说吧……"再发语音（犹豫感）
             if (runtime.LIVENESS_ENABLED and msg_type == "private"
                     and random.random() < liveness.VOICE_HESITATE_PROB):
-                await self._reply(msg_type, target_id, user_id, 0, "算了，我还是说吧……")
+                sent_id = await self._reply(msg_type, target_id, user_id, 0, "算了，我还是说吧……")
+                if sent_id:
+                    sent_parts.append("算了，我还是说吧……")
                 await asyncio.sleep(random.uniform(1.2, 2.0))
-            if await self._maybe_send_voice(msg_type, target_id, user_id, text):
-                self._observe_life_reply(msg_type, user_id, text)
-                return
+                if self._turn_is_stale(user_id, expected_revision):
+                    return "\n".join(sent_parts)
+            voice_sent = await self._maybe_send_voice(
+                msg_type, target_id, user_id, text,
+                expected_revision=expected_revision,
+            )
+            if voice_sent:
+                self._observe_life_reply(msg_type, user_id, voice_sent)
+                return voice_sent
             # 语音合成失败：回退文字时去掉情感标签，避免把【撒娇】读出来/显示出来
             text, _ = self._split_emotion_tag(text)
         parts = split_reply_text(
@@ -2499,15 +2581,18 @@ class QQGirlfriendBot:
             max_parts=(turn_plan.max_parts if turn_plan is not None else MAX_REPLY_PARTS),
         )
         if not parts:
-            return
+            return "\n".join(sent_parts)
         # 不自动加“嗯/……”之类的无信息前导；若模型确实分条，才留出正常打字停顿。
-        sent_parts = []
         for i, part in enumerate(parts):
+            if self._turn_is_stale(user_id, expected_revision):
+                return "\n".join(sent_parts)
             if i > 0:
                 gap = (liveness.split_gap_seconds(parts[i - 1], user_id)
                        if runtime.LIVENESS_ENABLED and msg_type == "private"
                        else random.uniform(SPLIT_INTERVAL_MIN, SPLIT_INTERVAL_MAX))
                 await asyncio.sleep(gap)
+            if self._turn_is_stale(user_id, expected_revision):
+                return "\n".join(sent_parts)
             sent_id = await self._reply(
                 msg_type, target_id, user_id, message_id if i == 0 else 0, part,
             )
@@ -2518,16 +2603,20 @@ class QQGirlfriendBot:
         # 多模态联动：dual_voice —— 文字发完后，再补一句"语音小尾巴"
         # （重要时刻：晚安/纪念日/道歉等，真人会"文字+语音"一起表达；
         #   但语音不会把文字念一遍，而是补一句更亲密的心里话）
-        if dual_voice and runtime.LIVENESS_ENABLED and msg_type == "private":
+        if (dual_voice and runtime.LIVENESS_ENABLED and msg_type == "private"
+                and not self._turn_is_stale(user_id, expected_revision)):
             try:
                 supplement = await self._dual_voice_supplement(user_id, text)
-                if supplement:
-                    if not await self._maybe_send_voice(msg_type, target_id, user_id, supplement):
+                if supplement and not self._turn_is_stale(user_id, expected_revision):
+                    if not await self._maybe_send_voice(
+                            msg_type, target_id, user_id, supplement,
+                            expected_revision=expected_revision):
                         logger.warning("双模态语音合成失败（文字已发送）")
                 else:
                     logger.info("双模态：语音小尾巴为空（避免与文字重复），仅发文字")
             except Exception as e:
                 logger.warning("双模态语音发送失败: %s", e)
+        return "\n".join(sent_parts)
 
     def _observe_life_reply(self, msg_type, user_id, text):
         """只把已经成功发出的明确生活陈述接入生活线。"""
@@ -2736,12 +2825,13 @@ class QQGirlfriendBot:
                        * liveness.grudge_voice_factor(user_id))
         return random.random() < prob
 
-    async def _maybe_send_voice(self, msg_type, target_id, user_id, text):
-        """把 DS 生成的文本拆成多条语音条，逐条合成发送；成功返回 True。
+    async def _maybe_send_voice(self, msg_type, target_id, user_id, text,
+                                expected_revision=None):
+        """把 DS 生成的文本拆成多条语音条，逐条合成发送；返回实际发送文本。
 
         真人发语音通常是一条条录、一条条发，中间有停顿：
         复用 split_reply_text 的拆分规则切成短条，每条之间随机停顿；
-        某条合成失败只跳过该条，全部失败才返回 False（回退文字）。
+        某条合成失败只跳过该条，全部失败返回空串（回退文字）。
         """
         try:
             text, emotion = self._split_emotion_tag(text)
@@ -2749,32 +2839,38 @@ class QQGirlfriendBot:
             from 语音.tts import synthesize
             parts = split_reply_text(text)
             if not parts:
-                return False
+                return ""
             # 语音末尾的情感冗余：最后一条语音补一句"……嗯"等自然收尾（避免结束太干净）
             if runtime.LIVENESS_ENABLED and random.random() < liveness.VOICE_TRAIL_PROB:
                 parts[-1] = parts[-1] + random.choice(liveness.VOICE_TRAIL_WORDS)
             # 条数上限：超出部分并入最后一条，避免一次性刷屏
             if len(parts) > MAX_VOICE_CLIPS:
                 parts = parts[:MAX_VOICE_CLIPS - 1] + ["".join(parts[MAX_VOICE_CLIPS - 1:])]
-            sent = 0
+            sent_parts = []
             for i, part in enumerate(parts):
+                if self._turn_is_stale(user_id, expected_revision):
+                    break
                 if i > 0:
                     # 真人录制语音条之间会有停顿
                     await asyncio.sleep(random.uniform(VOICE_GAP_MIN, VOICE_GAP_MAX))
+                    if self._turn_is_stale(user_id, expected_revision):
+                        break
                 path = await synthesize(part, model=runtime.TTS_MODEL, emotion=emotion)
                 if not path:
                     logger.warning("TTS 合成失败，跳过该条: %s", part[:30])
                     continue
+                # 合成期间收到新消息时保留缓存，但不再把过期语音发出去。
+                if self._turn_is_stale(user_id, expected_revision):
+                    break
                 await self._send_voice(msg_type, target_id, user_id, path)
-                sent += 1
+                sent_parts.append(part)
                 self._last_voice_sent[user_id] = time.time()
-                logger.info("已发送语音条 [%s] %d/%d: %s", user_id, sent, len(parts), part[:20])
-            if sent == 0:
-                return False
-            return True
+                logger.info("已发送语音条 [%s] %d/%d: %s",
+                            user_id, len(sent_parts), len(parts), part[:20])
+            return "\n".join(sent_parts)
         except Exception as e:
             logger.warning("语音发送异常: %s", e)
-            return False
+            return ""
 
     async def _send_face(self, msg_type, target_id, user_id, face_id):
         """发送一个 QQ 原生表情（零配置，无需任何图库）。"""
