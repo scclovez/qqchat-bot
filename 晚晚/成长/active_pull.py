@@ -146,6 +146,7 @@ async def check_and_run(bot, user_id) -> bool:
         await bot._reply_split("private", user_id, user_id, 0, reply, force_voice=False)
         # 记录：供追问机制使用 + 计入当日次数 + 依赖度
         bot._last_proactive_msg[user_id] = time.time()
+        bot._persist_interaction_state()
         _increment_count()
         personality_state.add_dependency(2)
         logger.info("主动撩人 [%s]: %s", user_id, reply[:30])

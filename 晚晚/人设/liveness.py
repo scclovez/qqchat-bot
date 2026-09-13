@@ -4,6 +4,7 @@
 所有"当天状态"存 SQLite（liveness_state 表），重启不丢、不重复。
 """
 import logging
+import json
 import os
 import random
 import re
@@ -21,6 +22,7 @@ DB_PATH = data_path("晚晚", "数据", "bot_memory.db")
 
 _lock = BOT_DB_LOCK
 _conn = None
+_INTERACTION_RUNTIME_KEY = "interaction_runtime:v1"
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -74,6 +76,31 @@ def _set_many(items) -> bool:
             raise
         logger.warning("活人感状态写入遇到数据库占用，本轮跳过（聊天继续）")
         return False
+
+
+def load_interaction_runtime_state() -> dict:
+    """读取 Bot 会话节奏快照；损坏或旧格式数据安全降级为空状态。"""
+    raw = _get(_INTERACTION_RUNTIME_KEY, "")
+    if not raw:
+        return {}
+    try:
+        state = json.loads(raw)
+        return state if isinstance(state, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        logger.warning("互动运行态快照无法解析，已忽略")
+        return {}
+
+
+def save_interaction_runtime_state(state: dict) -> bool:
+    """原子保存 Bot 会话节奏快照，不包含密钥、配置或媒体内容。"""
+    if not isinstance(state, dict):
+        return False
+    try:
+        payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        logger.warning("互动运行态快照无法序列化，已跳过")
+        return False
+    return _set(_INTERACTION_RUNTIME_KEY, payload)
 
 
 # =============================================================================

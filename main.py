@@ -39,7 +39,7 @@ def main_cli():
         sys.exit(1)
 
     logger.info("=" * 40)
-    logger.info("   AI 电子女友 — bot 启动中...")
+    logger.info("   AI 电子女友 — 小晚 启动中...")
     logger.info("=" * 40)
     logger.info("DeepSeek 模型: %s", config.DEEPSEEK_MODEL)
     logger.info("OneBot 地址: %s", config.ONEBOT_WS_URL)
@@ -62,7 +62,7 @@ def main_cli():
             pass
         finally:
             await bot.stop()
-            logger.info("bot已下线，晚安~")
+            logger.info("小晚已下线，晚安~")
 
     asyncio.run(run())
 

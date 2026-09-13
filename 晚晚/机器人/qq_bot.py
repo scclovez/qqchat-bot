@@ -72,18 +72,9 @@ QZONE_TICK_PERIOD = 6
 
 # 追加在 system prompt 末尾的短回复提醒（模型对 prompt 末尾注意力最强，对抗长对话稀释）
 SHORT_REPLY_REMINDER = (
-    "【最后提醒】把每次回复当成一次自然聊天，不是在写小作文："
-    "先说最想回应的那一句，通常是 6~24 个字、完整但简短；"
-    "只有确实有补充、转折或情绪递进时才另起一条，每条都要有实际内容。"
-    "不要把一句完整的话硬拆开，不要先单独发“嗯/好吧/哼”再堆一长段；"
-    "想说很多时只挑最重要的一点，剩下的留给对方下一句再聊。"
-    "不要连续写三段以上，也不要把多句解释一次性倾倒出来。"
-    "别再滥用省略号：不要用“……”开头、不要把每句话都用省略号断开——"
-    "真人聊天一口气说一句是一句，只有欲言又止时才偶尔用一个省略号。"
-    "句式也要自然多变：不要每条都走“哼→嘴硬→心软→催睡/明天见”的老套路，"
-    "有时直接应、有时撒娇、有时就回一两个字，长短结构都随意点。"
-    "他还在兴头上就顺着聊，别一个劲催他睡。"
-    "不要使用半角或全角波浪号（~、～）卖萌，句尾用正常标点或直接收住。"
+    "【通用表达】像即时聊天，不写小作文；先回最重要的一句，确有补充才分条。"
+    "若有本轮对话策略，具体长度与条数以它为准。不要无信息前导、连环追问、动作括号、"
+    "套路化催睡或滥用省略号；不用波浪号（~、～），语气和句式自然变化。"
 )
 
 
@@ -196,6 +187,7 @@ SLOW_GENERATE_ASIDE = (
 # 插图标记正则：【插图：xxx】/【插图】xxx / [配图: xxx]（兼容中英文括号、可省冒号；
 # 尾部 [】\]]? 消费描述后的闭合括号，保证剥离后不留残留）
 ILLUSTRATION_TAG_RE = re.compile(r"[【\[](?:插图|配图)[】\]]?\s*[:：]?\s*([^【】\[\]\n]{1,60})[】\]]?")
+IMAGE_SUMMARY_TAG_RE = re.compile(r"[【\[]图片摘要\s*[:：]\s*([^【】\[\]\n]{2,60})[】\]]")
 
 # 无效插图描述：不是画面内容（语气词/时间词/指代词），提取到这些就丢弃，
 # 避免"照片内容：现在"这种垃圾描述被当成图片内容去生成
@@ -459,6 +451,8 @@ class QQGirlfriendBot:
         self._dead_users = set()
         # 机器人自己的 QQ 号（从消息事件的 self_id 更新；空间功能用于排除自己）
         self._self_id = ""
+        self._resumed_pending_messages = []
+        self._restore_interaction_state()
         # 注入长期记忆模块的 LLM 桥接（在后台线程中使用，创建独立 event loop）
         longterm_memory.set_llm_caller(self._sync_llm_bridge)
 
@@ -501,6 +495,141 @@ class QQGirlfriendBot:
         if expected_revision is None:
             return False
         return self._inbound_revisions.get(str(user_id), 0) != expected_revision
+
+    @staticmethod
+    def _restored_number_map(value) -> dict:
+        if not isinstance(value, dict):
+            return {}
+        restored = {}
+        for key, raw in value.items():
+            try:
+                restored[str(key)] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        return restored
+
+    def _restore_interaction_state(self):
+        """恢复重启前的聊天节奏、主动互动冷却和未收束文本。"""
+        try:
+            state = liveness.load_interaction_runtime_state()
+            for attr in (
+                "_last_user_msg", "_last_outgoing", "_last_proactive_msg",
+                "_last_voice_sent", "_last_night_said",
+            ):
+                setattr(self, attr, self._restored_number_map(state.get(attr[1:], {})))
+            texts = state.get("last_proactive_text", {})
+            if isinstance(texts, dict):
+                self._last_proactive_text = {
+                    str(key): str(value)[:300] for key, value in texts.items()
+                }
+            counts = state.get("proactive_followups", {})
+            if isinstance(counts, dict):
+                self._proactive_followups = {
+                    str(key): max(0, int(value)) for key, value in counts.items()
+                    if str(value).lstrip("-").isdigit()
+                }
+            fired = state.get("silence_fired", {})
+            if isinstance(fired, dict):
+                self._silence_fired = {
+                    str(key): set(value) for key, value in fired.items()
+                    if isinstance(value, list)
+                }
+            now = time.time()
+            for row in state.get("seen_message_ids", []):
+                if not isinstance(row, list) or len(row) != 2:
+                    continue
+                message_id, ts = row
+                try:
+                    ts = float(ts)
+                except (TypeError, ValueError):
+                    continue
+                if now - ts < 120:
+                    self._seen_message_ids[message_id] = ts
+            pending = state.get("pending_messages", [])
+            if isinstance(pending, list):
+                self._resumed_pending_messages = [
+                    item for item in pending[-50:]
+                    if isinstance(item, dict) and str(item.get("raw_message", "")).strip()
+                ]
+            restored_count = sum(bool(getattr(self, attr)) for attr in (
+                "_last_user_msg", "_last_outgoing", "_last_proactive_msg",
+                "_last_night_said", "_silence_fired",
+            ))
+            if restored_count or self._resumed_pending_messages:
+                logger.info("已恢复互动状态：状态组=%d 待收束消息=%d",
+                            restored_count, len(self._resumed_pending_messages))
+        except Exception as exc:
+            logger.warning("恢复互动运行态失败，使用新会话节奏: %s", exc)
+
+    def _interaction_state_snapshot(self) -> dict:
+        """生成可 JSON 化的轻量快照；不保存密钥、模型配置或媒体。"""
+        now = time.time()
+        pending = []
+        for user_id, batch in self._message_batches.items():
+            for item in batch.get("items", []):
+                raw = str(item.get("raw_message", "") or "").strip()
+                if not raw:
+                    continue
+                pending.append({
+                    "user_id": str(user_id),
+                    "message_id": item.get("message_id", 0),
+                    "self_id": str(item.get("self_id", "") or ""),
+                    "raw_message": raw,
+                })
+        return {
+            "version": 1,
+            "saved_at": now,
+            "last_user_msg": self._last_user_msg,
+            "last_outgoing": self._last_outgoing,
+            "last_proactive_msg": self._last_proactive_msg,
+            "last_proactive_text": self._last_proactive_text,
+            "proactive_followups": self._proactive_followups,
+            "last_voice_sent": self._last_voice_sent,
+            "last_night_said": self._last_night_said,
+            "silence_fired": {
+                str(key): sorted(value) for key, value in self._silence_fired.items()
+            },
+            "seen_message_ids": [
+                [message_id, ts] for message_id, ts in self._seen_message_ids.items()
+                if now - ts < 120
+            ],
+            "pending_messages": pending[-50:],
+        }
+
+    def _persist_interaction_state(self):
+        """尽力保存互动运行态；数据库忙时由 liveness 安全降级。"""
+        try:
+            liveness.save_interaction_runtime_state(self._interaction_state_snapshot())
+        except Exception as exc:
+            logger.warning("保存互动运行态失败，聊天继续: %s", exc)
+
+    async def _resume_pending_interaction(self):
+        """WebSocket 重连后把重启前尚在收束期的私聊重新放回队列。"""
+        pending = self._resumed_pending_messages
+        if not pending:
+            return
+        self._resumed_pending_messages = []
+        restored = 0
+        for item in pending:
+            user_id = str(item.get("user_id", ""))
+            raw = str(item.get("raw_message", "") or "").strip()
+            if not user_id or not raw:
+                continue
+            event = {
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": user_id,
+                "self_id": str(item.get("self_id", "") or ""),
+                "message_id": item.get("message_id", 0),
+                "raw_message": raw,
+                "message": [{"type": "text", "data": {"text": raw}}],
+            }
+            event = self._register_inbound_turn(event)
+            self._queue_debounced_message(event)
+            restored += 1
+        self._persist_interaction_state()
+        if restored:
+            logger.info("已恢复 %d 条重启前未收束的私聊消息", restored)
 
     @staticmethod
     def _is_intimate_user(user_id) -> bool:
@@ -606,6 +735,7 @@ class QQGirlfriendBot:
                     self._ws = ws
                     retry_delay = 1
                     logger.info("OneBot WebSocket 连接成功")
+                    await self._resume_pending_interaction()
                     await self._event_loop(ws)
                     logger.info("事件循环正常退出")
             except asyncio.CancelledError:
@@ -621,6 +751,8 @@ class QQGirlfriendBot:
 
     async def stop(self):
         self._running = False
+        # 先保存再取消收束任务，保证刚收到但尚未进入模型的消息重启后仍能继续。
+        self._persist_interaction_state()
         for batch in self._message_batches.values():
             task = batch.get("task")
             if task and not task.done():
@@ -742,6 +874,7 @@ class QQGirlfriendBot:
         batch["task"] = asyncio.create_task(
             self._flush_debounced_messages(user_id, delay)
         )
+        self._persist_interaction_state()
 
     @staticmethod
     def _merge_debounced_messages(items):
@@ -760,6 +893,8 @@ class QQGirlfriendBot:
             batch = self._message_batches.pop(user_id, None)
             if not batch or not batch.get("items"):
                 return
+            # 从持久快照移除已取出的批次；即使后续生成失败也不会在下次重启重复发送。
+            self._persist_interaction_state()
             merged = self._merge_debounced_messages(batch["items"])
             if len(batch["items"]) > 1:
                 logger.info("连续消息已收束 [%s]: %d 条", user_id, len(batch["items"]))
@@ -863,6 +998,7 @@ class QQGirlfriendBot:
             self._last_night_said[user_id] = time.time()
             hours = float(runtime.NIGHT_SILENCE_HOURS or 0)
             logger.info("用户道晚安，进入 %s 小时静默期 [%s]", hours, user_id)
+        self._persist_interaction_state()
         # 成长系统：用户提及"别人/别的女生" → 醋意倾向 +2
         if (self._is_intimate_user(user_id)
                 and any(k in raw_message for k in ("别人", "别的女生", "别的女人", "别的朋友", "她是谁"))):
@@ -1057,15 +1193,6 @@ class QQGirlfriendBot:
                 _b_inj = boundary.build_injection(user_id, raw_message)
                 if _b_inj:
                     messages[0]["content"] += _b_inj
-            # 真实时间锚点放到 system prompt 最末尾（模型对 prompt 末尾注意力最强），
-            # 避免被长上下文/其他指令稀释导致答错时间（如中午说成"天亮了"）
-            messages[0]["content"] += (
-                f"\n（【当前真实时间】{live_info.now_text()}。无论之前的剧情如何，"
-                "回答任何关于时间/几点/日期/星期几/白天还是晚上/现在几点的问题时，"
-                "一律以这个真实时间为准，禁止说错时间。"
-                "日常对话中也自然地体现当前时间（如'都一点多了''中午了'），"
-                "不要说不符合当前时间的剧情时间（如中午说'天亮了'）。）"
-            )
             # 消息里带图片 → 调用图片识别模型（视觉模型仅接受 user 消息带图）
             image_seg = self._first_image_seg(data)
             use_vision = False
@@ -1086,45 +1213,32 @@ class QQGirlfriendBot:
                     use_vision = True
                 else:
                     logger.warning("图片读取失败，降级为纯文本回复")
-            # 紧贴回复位置再补一次真实时间提示（模型对消息列表末尾注意力最强），
-            # 明确当前时段并校准剧情：模型容易把"睡觉/亲昵"场景说成"今晚/天亮了"
+            if use_vision:
+                messages[0]["content"] += (
+                    "\n【看图输出】正常回复后另起一行写【图片摘要：20字内客观画面】，"
+                    "摘要只供内部记忆，不要在正常回复里解释这个格式。"
+                )
+            # 所有动态约束集中到唯一的末尾区块，避免多条 system 消息相互争抢。
             _h = time.localtime().tm_hour
             _period = ("深夜" if _h < 5 else "凌晨" if _h < 7 else "早上" if _h < 9
                        else "上午" if _h < 12 else "中午" if _h < 14 else "下午" if _h < 18
                        else "傍晚" if _h < 20 else "晚上")
-            messages.append({
-                "role": "system",
-                "content": (
-                    f"（注意：现在是 {live_info.now_text()}，{_period}时段。"
-                    "无论之前聊过什么剧情，你现在说话必须符合当前真实时间："
-                    "不要说'今晚/晚上/天黑了/天亮了'等与当前时段矛盾的表述；"
-                    "若剧情里涉及睡觉休息，那是午睡/小憩，不是夜晚。"
-                    "回答时间类问题一律以这个真实时间为准。）"
-                    + turn_plan.injection()
-                ),
-            })
+            messages[0]["content"] += (
+                f"\n\n【本轮执行优先级】1.安全与明确事实；2.当前真实时间 "
+                f"{live_info.now_text()}（{_period}）；3.本轮对话策略；4.持续情绪与生活状态；"
+                "5.一般人设风格。低优先级只影响语气，不能推翻高优先级事实。"
+                "不要主动报时；只有话题相关时才自然体现时段。"
+                + turn_plan.injection()
+            )
             if use_vision:
                 reply_text = await self._llm_vision.chat(
                     messages, model=config.DEEPSEEK_VISION_MODEL,
                 )
-                # 多模态联动：把图片内容写入长期记忆（供"翻旧账"等以后自然提起）
-                if runtime.LIVENESS_ENABLED and b64:
-                    try:
-                        img_desc = await self._llm_vision.chat(
-                            [{"role": "user", "content": [
-                                {"type": "text", "text": "用一句话描述这张图片的内容（20字以内）"},
-                                {"type": "image_url",
-                                 "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                            ]}],
-                            model=config.DEEPSEEK_VISION_MODEL, max_tokens=40,
-                            disable_thinking=True,
-                        )
-                        img_desc = (img_desc or "").strip()
-                        if 4 <= len(img_desc) <= 60:
-                            longterm_memory.add_user_fact(user_id, f"他发过一张图片：{img_desc}")
-                            logger.info("多模态联动：记住他发的图片 %r", img_desc[:40])
-                    except Exception as e:
-                        logger.warning("图片记忆失败: %s", e)
+                # 同一次视觉请求同时产出回复与内部摘要，避免为记图再调用一次模型。
+                img_desc, reply_text = self._extract_image_summary_tag(reply_text)
+                if runtime.LIVENESS_ENABLED and img_desc:
+                    longterm_memory.add_user_fact(user_id, f"他发过一张图片：{img_desc}")
+                    logger.info("多模态联动：记住他发的图片 %r", img_desc[:40])
             else:
                 # 自主互动工具：模型可决定戳一戳/回表情/点赞/改状态/换签名
                 # （仅普通文本对话；视觉/语音模式不接工具，避免标签冲突）
@@ -1155,25 +1269,8 @@ class QQGirlfriendBot:
             # 让模型按真实时间修正重生成一次（只对含矛盾词的回复触发，成本可控）
             conflict = self._time_conflict(reply_text)
             if conflict:
-                try:
-                    corrected = await self._deepseek.chat(
-                        [
-                            {"role": "system", "content": build_system_prompt() + "\n\n" + SHORT_REPLY_REMINDER},
-                            {"role": "user", "content": (
-                                f"现在是 {live_info.now_text()}。你刚才的回复里说'{conflict}'，"
-                                "这与当前真实时间矛盾。请保持原来的语气和内容，"
-                                "只把与当前时间不符的表述改掉（例如把'今晚'改成符合当前时段的话），"
-                                "直接输出修改后的完整回复，不要解释。\n原回复：\n" + reply_text
-                            )},
-                        ],
-                        temperature=0.7, max_tokens=300,
-                    )
-                    corrected = (corrected or "").strip()
-                    if corrected:
-                        reply_text = corrected
-                        logger.info("回复时间表述矛盾（%s），已按真实时间修正", conflict)
-                except Exception as e:
-                    logger.warning("时间修正失败（保留原回复）: %s", e)
+                reply_text = self._repair_time_conflict(reply_text, conflict)
+                logger.info("回复时间表述矛盾（%s），已本地修正", conflict)
             # 配图机制：剥离模型自主输出的【插图：画面描述】标记，
             # 标记不进入记忆/发送文本，只在文字发完后按描述生成并发图
             illustration_desc = ""
@@ -1641,18 +1738,15 @@ class QQGirlfriendBot:
         return ""
 
     async def _inject_live_context(self, messages, user_text="", user_id=""):
-        """把当前时间/天气/联网搜索结果注入 system prompt（失败静默，不影响回复）。"""
-        extra = [(
-            f"（【当前真实时间】{live_info.now_text()}。回答任何关于时间/几点/日期/星期几/"
-            "白天还是晚上/现在在做什么的问题时，一律以此为准，不要凭剧情、记忆或猜测回答时间。）"
-        )]
+        """按需注入天气/联网结果；统一时间锚点由本轮最高优先级区块添加。"""
+        extra = []
         try:
             # 用户提到时间相关词（现在/之前/几点/在干嘛等）：
             # 注入"此刻bot在做什么"的动态描述，让回复能基于当前时刻自圆其说
             if user_text and any(k in user_text for k in live_info.TIME_TRIGGERS):
                 extra.append(
-                    f"（用户提到了时间/此刻相关话题。现在是【{live_info.now_text()}】，"
-                    "你按最近对话自然说自己此刻在做什么/现在几点即可，不要提及这段提示词。）"
+                    "（用户提到了时间/此刻相关话题；结合本轮时间锚点与生活线直接回答，"
+                    "不要凭旧剧情猜测，也不要提及这段提示。）"
                 )
             if user_text and self._is_weather_query(user_text):
                 city = runtime.WEATHER_CITY or "南昌"
@@ -1673,7 +1767,8 @@ class QQGirlfriendBot:
                         )
         except Exception as e:
             logger.warning("注入实时信息失败: %s", e)
-        messages[0]["content"] += "\n" + "\n".join(extra)
+        if extra:
+            messages[0]["content"] += "\n" + "\n".join(extra)
 
     # ===================== 图片生成（通义万相） =====================
 
@@ -2157,6 +2252,19 @@ class QQGirlfriendBot:
             return requirement
 
     @staticmethod
+    def _extract_image_summary_tag(text):
+        """提取视觉模型同次返回的内部图片摘要，并保证标记不会发给用户。"""
+        value = text or ""
+        match = IMAGE_SUMMARY_TAG_RE.search(value)
+        summary = re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+        cleaned = IMAGE_SUMMARY_TAG_RE.sub("", value).strip()
+        # 模型格式略有偏差时也剥离该行，宁可不记图也不能暴露内部标记。
+        cleaned = re.sub(r"(?m)^\s*[【\[]?图片摘要\s*[:：].*$", "", cleaned).strip()
+        if not (4 <= len(summary) <= 60):
+            summary = ""
+        return summary, cleaned
+
+    @staticmethod
     def _extract_illustration_tag(text):
         """从回复文本里提取配图描述（【插图：X】或"照片内容：X/图片内容：X"）。
 
@@ -2635,33 +2743,27 @@ class QQGirlfriendBot:
         """为双模态联动生成一句"语音小尾巴"：不重复文字内容，而是补一句更亲密的心里话。
 
         真人"文字+语音"一起发时，语音通常不会把文字念一遍，
-        而是顺着情绪补一句更私人、更口语的话。生成失败或与原文几乎一样 → 返回空串
-        （调用方放弃语音，避免一模一样地重复）。
+        而是顺着情绪补一句更私人、更口语的话。这里用本地语境池，不再额外调用模型。
         """
-        try:
-            voice_text, _ = self._split_emotion_tag(text)
-            voice_text = (voice_text or "").strip()
-            if not voice_text:
-                return ""
-            prompt = (
-                f"你刚用文字给他发了这条消息：\n「{voice_text[:100]}」\n"
-                "现在你要再用语音补一句。注意：绝对不要重复刚才那句话的内容，"
-                "而是顺着这条消息的情绪，补一句更亲密的心里话/小尾巴"
-                "（比如哄他、撒娇、认真回应、道晚安），一两句话，口语化，"
-                "像真的在语音里小声补了一句。"
-            )
-            line = await self._deepseek.chat(
-                [{"role": "system", "content": build_system_prompt()},
-                 {"role": "user", "content": prompt}],
-                max_tokens=80, disable_thinking=True,
-            )
-            line = (line or "").strip()
-            if not line or self._texts_too_similar(line, voice_text):
-                return ""
-            return line
-        except Exception as e:
-            logger.warning("语音小尾巴生成失败: %s", e)
+        voice_text, emotion = self._split_emotion_tag(text)
+        voice_text = (voice_text or "").strip()
+        if not voice_text:
             return ""
+        if any(word in voice_text for word in ("晚安", "睡吧", "困了", "做个好梦")):
+            candidates = ["睡吧，我小声陪你一会儿", "好好睡，醒了再来找我"]
+        elif any(word in voice_text for word in ("对不起", "原谅", "没事", "别难过")):
+            candidates = ["我没真想推开你", "慢慢来，我还在听"]
+        elif any(word in voice_text for word in ("喜欢", "爱你", "想你", "抱抱")):
+            candidates = ["反正你听见我声音就知道啦", "这个只说给你听"]
+        elif emotion in ("委屈", "难过", "伤心", "生气", "疲惫"):
+            candidates = ["让我缓一小会儿就好", "你先听我把这句说完"]
+        else:
+            candidates = ["反正我就是想让你听见", "就想再亲口跟你说一声"]
+        random.shuffle(candidates)
+        for line in candidates:
+            if not self._texts_too_similar(line, voice_text):
+                return line
+        return ""
 
     @staticmethod
     def _texts_too_similar(a, b):
@@ -2707,6 +2809,7 @@ class QQGirlfriendBot:
         mid = int(data.get("message_id") or 0)
         if mid:
             self._last_outgoing[user_id] = time.time()  # 记录"我最后说的话"（空闲碎碎念防打扰）
+            self._persist_interaction_state()
         return mid
 
     # ===================== 表情包 =====================
@@ -2757,15 +2860,16 @@ class QQGirlfriendBot:
     def _time_conflict(text):
         """检测回复中的时间表述是否与当前真实时段矛盾。
 
-        返回矛盾的时间词（如"今晚"）；无矛盾返回 None。
-        只处理最明显的"当前场景"时间词误用：白天（6-19点）说今晚/天黑了，
+        返回矛盾的时间词（如"天黑了"）；无矛盾返回 None。
+        只处理最明显的"当前场景"时间词误用：白天（6-19点）说天黑了，
         夜间说天亮了/早上好。
         """
         import re
         text = text or ""
         h = time.localtime().tm_hour
         if 6 <= h < 19:  # 白天
-            m = re.search(r"(今晚|天黑了|大晚上的)", text)
+            # “今晚”可以是在白天谈未来，不属于矛盾；只修正已经发生式表述。
+            m = re.search(r"(天黑了|大晚上的)", text)
             if m:
                 return m.group(1)
         else:  # 夜间
@@ -2773,6 +2877,18 @@ class QQGirlfriendBot:
             if m:
                 return m.group(1)
         return None
+
+    @staticmethod
+    def _repair_time_conflict(text, conflict):
+        """本地修正少量明确的时段口误，避免为一两个词再次调用模型。"""
+        replacements = {
+            "天黑了": "天还亮着",
+            "大晚上的": "这会儿",
+            "天亮了": "天还没亮",
+            "早上好": "还没睡呀",
+            "早安": "还没睡呀",
+        }
+        return (text or "").replace(conflict, replacements.get(conflict, conflict))
 
     @staticmethod
     def _strip_action_marks(text):
@@ -2865,6 +2981,7 @@ class QQGirlfriendBot:
                 await self._send_voice(msg_type, target_id, user_id, path)
                 sent_parts.append(part)
                 self._last_voice_sent[user_id] = time.time()
+                self._persist_interaction_state()
                 logger.info("已发送语音条 [%s] %d/%d: %s",
                             user_id, len(sent_parts), len(parts), part[:20])
             return "\n".join(sent_parts)
@@ -3115,6 +3232,7 @@ class QQGirlfriendBot:
                     return
                 fired.add(level)
                 self._silence_fired[target] = fired
+                self._persist_interaction_state()
                 liveness._set(skey, str(scnt + 1))
                 path = self._pick_sticker()
                 if path:
@@ -3135,6 +3253,7 @@ class QQGirlfriendBot:
                     return
                 fired.add(level)
                 self._silence_fired[target] = fired
+                self._persist_interaction_state()
                 await self._reply_split("private", target, target, 0, text, force_voice=False)
                 liveness.mark_idle_murmur(target)
                 logger.info("活人感：冷场20分钟 废话 %r", text[:40])
@@ -3153,6 +3272,7 @@ class QQGirlfriendBot:
                     return
                 fired.add(level)
                 self._silence_fired[target] = fired
+                self._persist_interaction_state()
                 liveness._set(lkey, str(lcnt + 1))
                 await self._send_light_image(target)
                 return
@@ -3160,6 +3280,7 @@ class QQGirlfriendBot:
                 # 60 分钟：带醋意的话
                 fired.add(level)
                 self._silence_fired[target] = fired
+                self._persist_interaction_state()
                 await self._reply_split("private", target, target, 0,
                                         random.choice(liveness.JEALOUS_LINES), force_voice=False)
                 logger.info("活人感：冷场60分钟 醋意 [%s]", target)
@@ -3173,6 +3294,7 @@ class QQGirlfriendBot:
                     return
                 fired.add(level)
                 self._silence_fired[target] = fired
+                self._persist_interaction_state()
                 liveness._set("miss_you:heavy:" + today, "1")
                 await self._reply_split("private", target, target, 0,
                                         random.choice(liveness.SOFTEN_LINES), force_voice=False)
@@ -3456,10 +3578,13 @@ class QQGirlfriendBot:
             if self._is_in_night_silence(user_id):
                 continue  # 用户道晚安后静默期内，不撩人（对方已睡）
             # 发语音后超过 30 分钟未回复 → 醋意倾向 +1（每个语音只计一次）
-            vs = self._last_voice_sent.pop(user_id, None)
-            if vs and time.time() - vs > 1800 and self._last_user_msg.get(user_id, 0) < vs:
-                pstate.add_jealousy(1)
-                logger.info("发语音后久未回复，醋意 +1 [%s]", user_id)
+            vs = self._last_voice_sent.get(user_id)
+            if vs and time.time() - vs > 1800:
+                if self._last_user_msg.get(user_id, 0) < vs:
+                    pstate.add_jealousy(1)
+                    logger.info("发语音后久未回复，醋意 +1 [%s]", user_id)
+                self._last_voice_sent.pop(user_id, None)
+                self._persist_interaction_state()
             # 下雨天问候（进化版"今天过得怎么样"）：一天一次，且他有一会儿没说话才发。
             # 不问"怎么样"，而是用"带伞了吗"的细节让他自己说；后半句仅限亲密阶段。
             if runtime.WEATHER_CITY and random.random() < 0.3:
@@ -3531,6 +3656,7 @@ class QQGirlfriendBot:
             try:
                 await self._send_proactive(user_id)
                 self._last_proactive_msg[user_id] = time.time()
+                self._persist_interaction_state()
                 # 成长系统：主动发消息 → 依赖度+2；深夜主动（懂事不打扰）→ -1
                 pstate.add_dependency(2)
                 if pull._is_night():
@@ -3646,6 +3772,7 @@ class QQGirlfriendBot:
                 return
             mem_text, _ = self._split_emotion_tag(reply_text) if use_voice else (reply_text, "")
             self._last_proactive_text[user_id] = mem_text
+            self._persist_interaction_state()
             self._memory.add_message(user_id, "assistant", mem_text)
 
         longterm_memory.add_chat_history(user_id, "assistant", mem_text)
@@ -3727,6 +3854,7 @@ class QQGirlfriendBot:
                 self._memory.add_message(user_id, "assistant", reply)
                 longterm_memory.add_chat_history(user_id, "assistant", reply)
                 self._proactive_followups[user_id] = self._proactive_followups.get(user_id, 0) + 1
+                self._persist_interaction_state()
             await self._reply_split("private", user_id, user_id, 0, reply)
             # 成长系统：追问 → 依赖度+1 + 情绪标签"追问"
             pstate.add_dependency(1)
